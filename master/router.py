@@ -308,6 +308,11 @@ async def cfg_menu(c: CallbackQuery):
         rows = [
             [("📮 Предложка: " + ("вкл" if cb.accept_suggestions else "выкл"),
               f"cyc_sugg:{bot_id}")],
+            # БАГ (недостающая фича): child/posting.py уже умеет слать
+            # cfg.welcome_text/welcome_photo в /start, но пункта настройки
+            # приветствия в меню постинг-ботов не было вообще (был только
+            # у feedback-ботов выше) — владелец физически не мог его задать.
+            [("👋 Приветствие", f"welcome:{bot_id}")],
             [("🎨 Шаблон поста", f"template:{bot_id}"), ("🔘 Кнопки шаблона", f"tplbtn:{bot_id}")],
             [("📡 Канал", f"channel:{bot_id}"), ("🏠 Чат админов", f"admchat:{bot_id}")],
             [("🧵 Топики в чате админов: " + ("вкл" if cb.use_topics else "выкл"),
