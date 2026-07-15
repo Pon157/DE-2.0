@@ -41,22 +41,12 @@ def build_feedback_router() -> Router:
                        if cfg.always_new_ticket else
                        f"{em('check')} Обращение продолжено.")
 
-    @r.callback_query(F.data == "open_ticket")
-    async def cb_open(c: CallbackQuery, bot: Bot, bot_db_id: int):
-        cfg = await _cfg(bot_db_id)
-        await open_ticket(bot, cfg, c.from_user.id, force_new=True)
-        await c.answer("Обращение открыто! Напишите сообщение.", show_alert=True)
-
-    @r.callback_query(F.data.startswith("trg:"))
-    async def cb_trigger(c: CallbackQuery, bot_db_id: int):
-        async with Session() as s:
-            b = await s.get(BotButton, int(c.data.split(":")[1]))
-        if b and b.response_text:
-            if b.response_photo:
-                await c.message.answer_photo(b.response_photo, caption=b.response_text)
-            else:
-                await c.message.answer(b.response_text)
-        await c.answer()
+    # БАГ (перенесено): "open_ticket" и "trg:" раньше обрабатывались только
+    # здесь, из-за чего в постинг-ботах те же самые кнопки (их рисует общий
+    # build_keyboards() в child/common.py) оставались без обработчика.
+    # Теперь оба хендлера — в child/common.py::build_common_router(), он
+    # подключается ко всем ботам. Здесь их удаляем, чтобы не регистрировать
+    # дважды на один и тот же callback_data.
 
     @r.message(F.chat.type == "private", F.text.startswith("/"))
     async def custom_command(m: Message, bot_db_id: int):
