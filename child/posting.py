@@ -201,11 +201,19 @@ def build_posting_router() -> Router:
 
     async def _publish_post(bot: Bot, cfg: ChildBot, p: Post):
         group = json.loads(p.media_group_json) if p.media_group_json else None
+        # БАГ: раньше здесь было жёстко use_template=False — шаблон поста,
+        # настроенный владельцем, для постов из /newpost НЕ применялся
+        # никогда, а для одобренных предложок (decide() ниже) применялся
+        # ВСЕГДА, независимо от режима пересылки в канал. Из-за этого
+        # поведение "шаблон/нет" зависело от того, откуда пришёл пост, а не
+        # от настройки "📬 Публикация в канал" (copy/template). Теперь оба
+        # места решают одинаково — по cfg.channel_delivery_mode.
         await publish(bot, cfg, html_text=p.html_text, file_id=p.media_file_id,
                       media_type=p.media_type, media_group=group,
                       origin_chat_id=p.origin_chat_id, origin_message_id=p.origin_message_id,
                       origin_message_ids=p.origin_message_ids,
-                      use_template=False, buttons_json=p.buttons_json)
+                      use_template=(cfg.channel_delivery_mode != "copy"),
+                      buttons_json=p.buttons_json)
 
     # ================= /start =================
     @r.message(CommandStart(), F.chat.type == "private")
@@ -558,11 +566,14 @@ def build_posting_router() -> Router:
                 return
             try:
                 group = json.loads(sg.media_group_json) if sg.media_group_json else None
+                # см. комментарий в _publish_post() выше — use_template теперь
+                # зависит только от режима пересылки, а не от источника поста.
                 await publish(bot, cfg, html_text=sg.html_text, file_id=sg.media_file_id,
                              media_type=sg.media_type, media_group=group,
                              origin_chat_id=sg.origin_chat_id,
                              origin_message_id=sg.origin_message_id,
-                             origin_message_ids=sg.origin_message_ids)
+                             origin_message_ids=sg.origin_message_ids,
+                             use_template=(cfg.channel_delivery_mode != "copy"))
             except Exception as e:
                 # БАГ: раньше ошибка публикации утекала только в логи, ни
                 # админ, ни автор поста об этом не узнавали.
