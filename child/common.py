@@ -108,9 +108,20 @@ async def send_with_keyboards(m: Message, text: str, ikb, rkb, photo: str | None
     только у бота была хоть одна инлайн-кнопка. Если нужны оба вида —
     отправляем инлайн с текстом/фото, а следом отдельным сообщением
     выставляем reply-клавиатуру.
+
+    БАГ: у caption к фото лимит Telegram — 1024 символа (у обычного текста —
+    4096). Приветствие с фото + реклама/приписка платформы легко превышали
+    1024 символа, и `answer_photo` падал с TelegramBadRequestError —
+    "стартовое сообщение с фото падает с ошибкой". Теперь если текст не
+    влезает в caption — шлём фото отдельно, а текст отдельным сообщением.
     """
+    PHOTO_CAPTION_LIMIT = 1024
     if photo:
-        msg = await m.answer_photo(photo, caption=text, reply_markup=ikb or rkb)
+        if len(text) <= PHOTO_CAPTION_LIMIT:
+            msg = await m.answer_photo(photo, caption=text, reply_markup=ikb or rkb)
+        else:
+            await m.answer_photo(photo)
+            msg = await m.answer(text, reply_markup=ikb or rkb)
     else:
         msg = await m.answer(text, reply_markup=ikb or rkb)
     if ikb and rkb:
@@ -295,5 +306,32 @@ def build_common_router() -> Router:
             return
         await c.message.answer(f"{em('star')} Введите количество звёзд для доната (1–10000):")
         await c.answer()
+
+    # ---------- триггер-кнопки и кнопка "открыть обращение" ----------
+    # БАГ: раньше эти два хендлера жили только в child/feedback.py, хотя
+    # клавиатуру с этими же callback_data строит ОБЩИЙ build_keyboards()
+    # (выше в этом файле) для ОБОИХ типов ботов. bot_manager подключает на
+    # бота либо feedback-роутер, либо posting-роутер — никогда оба сразу.
+    # В итоге в постинг-ботах кнопка рисовалась, а обработчика на её
+    # callback_data не было вообще ни у одного роутера — Telegram видел
+    # "необработанный" callback (эффект "0 мс / ошибка"). Перенесены сюда,
+    # в build_common_router(), который подключается ко ВСЕМ ботам.
+    @r.callback_query(F.data.startswith("trg:"))
+    async def cb_trigger(c: CallbackQuery, bot_db_id: int):
+        async with Session() as s:
+            b = await s.get(BotButton, int(c.data.split(":")[1]))
+        if b and b.response_text:
+            if b.response_photo:
+                await c.message.answer_photo(b.response_photo, caption=b.response_text)
+            else:
+                await c.message.answer(b.response_text)
+        await c.answer()
+
+    @r.callback_query(F.data == "open_ticket")
+    async def cb_open_ticket(c: CallbackQuery, bot: Bot, bot_db_id: int):
+        async with Session() as s:
+            cfg = await s.get(ChildBot, bot_db_id)
+        await open_ticket(bot, cfg, c.from_user.id, force_new=True)
+        await c.answer("Обращение открыто! Напишите сообщение.", show_alert=True)
 
     return r
