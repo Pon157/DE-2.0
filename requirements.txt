@@ -1,0 +1,6 @@
+aiogram>=3.15
+SQLAlchemy[asyncio]>=2.0
+asyncpg>=0.29
+Pillow>=10.0
+python-dotenv>=1.0
+yookassa>=3.5
