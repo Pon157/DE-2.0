@@ -37,9 +37,13 @@ class ChildBot(Base):
     # ---- настройки feedback ----
     open_mode: Mapped[OpenMode] = mapped_column(Enum(OpenMode), default=OpenMode.first_message)
     forward_mode: Mapped[ForwardMode] = mapped_column(Enum(ForwardMode), default=ForwardMode.forward)
-    copy_header: Mapped[str] = mapped_column(Text, default="{name} | @{username} | <code>{id}</code>")
+    copy_header: Mapped[str] = mapped_column(Text, default="{name} | @{username} | <code>{id}</code> · {anon_id}")
     admin_chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)  # куда слать
     use_topics: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Как шапка попадает в админ-чат: отдельным сообщением / слитно с сообщением юзера / выкл
+    header_mode: Mapped[str] = mapped_column(String(16), default="separate")  # separate|merge|off
+    # Шаблон имени топика. Переменные: {name} {username} {id} {anon_id}
+    topic_name_template: Mapped[str] = mapped_column(Text, default="✉️ {name} · {id}")
     welcome_text: Mapped[str] = mapped_column(Text, default="Привет! Напишите ваше сообщение.")
     welcome_photo: Mapped[str | None] = mapped_column(String(256), nullable=True)  # file_id
     warn_limit: Mapped[int] = mapped_column(Integer, default=3)
@@ -121,12 +125,15 @@ class MessageLog(Base):
 
 
 class MsgMap(Base):
-    """Связь: сообщение в админ-чате ↔ юзер (для ответов reply)."""
+    """Связь: сообщение в админ-чате ↔ юзер (для ответов reply) + связь с
+    исходным сообщением юзера (для reply-контекста и зеркалирования реакций)."""
     __tablename__ = "msg_map"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     bot_id: Mapped[int] = mapped_column(Integer, index=True)
     admin_chat_msg_id: Mapped[int] = mapped_column(BigInteger, index=True)
     user_id: Mapped[int] = mapped_column(BigInteger)
+    # id исходного сообщения в ЛС юзера (None для служебных сообщений — шапок и т.п.)
+    user_chat_msg_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
 
 class Suggestion(Base):
@@ -161,6 +168,8 @@ class Post(Base):
     origin_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     origin_message_ids: Mapped[str | None] = mapped_column(Text, nullable=True)  # альбом: "1,2,3"
     buttons_json: Mapped[str | None] = mapped_column(Text, nullable=True)  # [[{text,url,style,icon}]]
+    # Источник кнопок для поста: кнопки шаблона / свои / оба / без кнопок
+    buttons_mode: Mapped[str] = mapped_column(String(16), default="both")  # both|template|custom|none
     publish_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
     published: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
