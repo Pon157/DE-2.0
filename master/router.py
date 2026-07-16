@@ -17,6 +17,7 @@ from services import payments as pay_service
 from services import referrals
 from services import moderation as mod
 from utils.emoji import em, styled_button
+from child.common import RESERVED_COMMANDS
 import config
 import json
 from config import SUPER_ADMIN_ID, MASTER_BOT_TOKEN, AD_MAX_LEN, AD_BROADCAST_COOLDOWN_DAYS
@@ -33,6 +34,7 @@ class St(StatesGroup):
     set_admin_chat = State()
     set_header = State()
     set_template = State()
+    set_topic_name = State()
     add_admin = State()
     btn_kind = State()
     btn_text = State()
@@ -43,7 +45,7 @@ class St(StatesGroup):
     set_warn_limit = State()
     ad_reject_reason = State()
     ap_bc_content = State()
-    # /ads (покупка рекламы) — теперь работает в МАСТЕР-боте, а не в дочерних
+    # /ads (покупка рекламы) — работает в МАСТЕР-боте, а не в дочерних
     ads_pick_kind = State()
     ads_pick_bot = State()
     ads_text = State()
@@ -53,6 +55,13 @@ class St(StatesGroup):
     ticket_btn_style = State()
     ticket_btn_icon = State()
     tpl_btn_edit = State()
+
+
+HEADER_MODE_LABELS = {
+    "separate": "отдельным сообщением",
+    "merge": "слитно с сообщением",
+    "off": "выкл",
+}
 
 
 def kb(rows):
@@ -65,11 +74,24 @@ def kb(rows):
     return InlineKeyboardMarkup(inline_keyboard=[[_btn(item) for item in row] for row in rows])
 
 
+def nav_kb(bot_id: int, back_data: str | None = None):
+    """Клавиатура ПОСЛЕ сохранения настройки.
+
+    БАГ UX: раньше после каждого «Сохранено!» не было ни одной кнопки —
+    чтобы продолжить настройку, приходилось заново заходить в меню бота с
+    самого начала. Теперь после каждого сохранения есть быстрый возврат.
+    """
+    rows = []
+    if back_data:
+        rows.append([("⬅️ Назад", back_data)])
+    rows.append([("⚙️ Настройки", f"cfg:{bot_id}")])
+    rows.append([("🤖 Меню бота", f"bot:{bot_id}")])
+    return kb(rows)
+
+
 def capture_media(m: Message):
     """Достаёт (file_id, media_type) из сообщения — поддержка ВСЕХ основных
-    типов медиа для рассылок (раньше поддерживались только photo/video/
-    animation/document, из-за чего голосовые/аудио/кружки/стикеры в рассылке
-    просто терялись)."""
+    типов медиа для рассылок."""
     if m.photo:
         return m.photo[-1].file_id, "photo"
     if m.video:
@@ -96,8 +118,7 @@ async def _access(bot_id: int, user_id: int) -> tuple[ChildBot | None, bool]:
         if not cb:
             return None, False
         if cb.owner_id == user_id or (SUPER_ADMIN_ID and user_id == SUPER_ADMIN_ID):
-            # Супер-админ платформы получает полный доступ к любому боту —
-            # нужно для админ-панели (вкл/выкл, статистика, настройки).
+            # Супер-админ платформы получает полный доступ к любому боту.
             return cb, True
         adm = await s.scalar(select(BotAdmin).where(
             BotAdmin.bot_id == bot_id, BotAdmin.user_id == user_id))
@@ -107,15 +128,34 @@ async def _access(bot_id: int, user_id: int) -> tuple[ChildBot | None, bool]:
 async def delete_previous(m: Message, state: FSMContext):
     """Вспомогательная функция для удаления сообщения пользователя и прошлого промпта бота"""
     data = await state.get_data()
-    try: 
+    try:
         await m.delete()
-    except Exception: 
+    except Exception:
         pass
-    
+
     if "last_msg_id" in data:
-        try: 
+        try:
             await m.bot.delete_message(m.chat.id, data["last_msg_id"])
-        except Exception: 
+        except Exception:
+            pass
+
+
+async def _child_bot_can_access(token: str, chat_id: int) -> bool:
+    """Проверяем, что ДОЧЕРНИЙ бот реально имеет доступ к чату/каналу, ПЕРЕД
+    тем как сохранить id.
+
+    БАГ: id сохранялся вслепую — опечатка или «бот не добавлен в чат»
+    обнаруживались только когда сообщения молча не доходили."""
+    test = Bot(token)
+    try:
+        await test.get_chat(chat_id)
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            await test.session.close()
+        except Exception:
             pass
 
 
@@ -167,11 +207,7 @@ async def buy_pro(c: CallbackQuery):
 
 
 async def show_main(m: Message, edit: bool = False, user_id: int | None = None):
-    # БАГ: раньше сюда передавали c.message при возврате "⬅️ Назад", а
-    # c.message.from_user — это САМ БОТ, а не человек, который нажал кнопку.
-    # Из-за этого список ботов владельца обнулялся, а проверка супер-админа
-    # никогда не срабатывала при переходе через кнопку "Назад". Теперь id
-    # пользователя передаётся явным параметром.
+    # user_id передаётся явно: c.message.from_user — это бот, а не человек.
     uid = user_id if user_id is not None else m.from_user.id
     async with Session() as s:
         own = (await s.scalars(select(ChildBot).where(
@@ -184,13 +220,13 @@ async def show_main(m: Message, edit: bool = False, user_id: int | None = None):
     rows.append([(f"➕ Создать бота", "newbot")])
     if uid == SUPER_ADMIN_ID and SUPER_ADMIN_ID:
         rows.append([(f"{em('gear')} Админ-панель", "ap")])
-    
+
     text = (f"{em('sparkles')} <b>Dialogue Engine — конструктор ботов</b>\n\n"
             f"{em('speech')} Фидбек-боты — обращения, ответы, модерация\n"
             f"{em('megaphone')} Постинг-боты — каналы, предложка, посты\n\n"
             "Выберите бота или создайте нового:")
     markup = kb(rows)
-    
+
     if edit:
         await m.edit_text(text, reply_markup=markup)
     else:
@@ -226,7 +262,14 @@ async def newbot_type(c: CallbackQuery, state: FSMContext):
 @router.message(St.add_token)
 async def newbot_token(m: Message, state: FSMContext):
     await delete_previous(m, state)
-    
+
+    # БАГ: при не-текстовом сообщении (фото/стикер) m.text is None ->
+    # AttributeError и молчание.
+    if not m.text:
+        msg = await m.answer(f"{em('cross')} Нужен токен текстом. Попробуйте снова.")
+        await state.update_data(last_msg_id=msg.message_id)
+        return
+
     token = m.text.strip()
     try:
         validate_token(token)
@@ -237,7 +280,7 @@ async def newbot_token(m: Message, state: FSMContext):
         msg = await m.answer(f"{em('cross')} Неверный токен, попробуйте снова.")
         await state.update_data(last_msg_id=msg.message_id)
         return
-        
+
     data = await state.get_data()
     async with Session() as s:
         exists = await s.scalar(select(ChildBot).where(ChildBot.token == token))
@@ -245,13 +288,13 @@ async def newbot_token(m: Message, state: FSMContext):
             msg = await m.answer("Этот бот уже добавлен.")
             await state.update_data(last_msg_id=msg.message_id)
             return
-            
+
         cb = ChildBot(owner_id=m.from_user.id, token=token, bot_tg_id=me.id,
                       username=me.username, bot_type=BotType(data["bot_type"]))
         s.add(cb)
         await s.commit()
         await s.refresh(cb)
-        
+
     await manager.start_bot(cb)
     await state.clear()
     await m.answer(f"{em('party')} Бот @{me.username} создан и запущен!\n"
@@ -289,13 +332,16 @@ async def cfg_menu(c: CallbackQuery):
     cb, is_owner = await _access(bot_id, c.from_user.id)
     if not cb or not is_owner:
         await c.answer("Только владелец", show_alert=True); return
+    header_label = HEADER_MODE_LABELS.get(cb.header_mode or "separate", "отдельным сообщением")
     if cb.bot_type == BotType.feedback:
         rows = [
             [("✉️ Открытие обращений: " + cb.open_mode.value, f"cyc_open:{bot_id}")],
             [("📨 Метод: " + cb.forward_mode.value, f"cyc_fwd:{bot_id}")],
-            [("🧵 Топики: " + ("вкл" if cb.use_topics else "выкл"), f"cyc_topics:{bot_id}")],
+            [("🧵 Топики: " + ("вкл" if cb.use_topics else "выкл"), f"cyc_topics:{bot_id}"),
+             ("🧵 Имя топика", f"topicname:{bot_id}")],
             [("👋 Приветствие", f"welcome:{bot_id}"),
-             ("🏷 Шапка copy", f"header:{bot_id}")],
+             ("🏷 Шаблон шапки", f"header:{bot_id}")],
+            [(f"🏷 Шапка: {header_label}", f"cyc_header:{bot_id}")],
             [("🏠 Чат админов", f"admchat:{bot_id}"),
              (f"⚠️ Лимит варнов: {cb.warn_limit}", f"warnlim:{bot_id}")],
             [("⭐️ Донат: " + ("вкл" if cb.donate_enabled else "выкл"), f"cyc_donate:{bot_id}")],
@@ -308,15 +354,14 @@ async def cfg_menu(c: CallbackQuery):
         rows = [
             [("📮 Предложка: " + ("вкл" if cb.accept_suggestions else "выкл"),
               f"cyc_sugg:{bot_id}")],
-            # БАГ (недостающая фича): child/posting.py уже умеет слать
-            # cfg.welcome_text/welcome_photo в /start, но пункта настройки
-            # приветствия в меню постинг-ботов не было вообще (был только
-            # у feedback-ботов выше) — владелец физически не мог его задать.
             [("👋 Приветствие", f"welcome:{bot_id}")],
             [("🎨 Шаблон поста", f"template:{bot_id}"), ("🔘 Кнопки шаблона", f"tplbtn:{bot_id}")],
             [("📡 Канал", f"channel:{bot_id}"), ("🏠 Чат админов", f"admchat:{bot_id}")],
+            [("📨 Метод пересылки: " + cb.forward_mode.value, f"cyc_fwd:{bot_id}")],
+            [(f"🏷 Шапка: {header_label}", f"cyc_header:{bot_id}"),
+             ("🏷 Шаблон шапки", f"header:{bot_id}")],
             [("🧵 Топики в чате админов: " + ("вкл" if cb.use_topics else "выкл"),
-              f"cyc_topics:{bot_id}")],
+              f"cyc_topics:{bot_id}"), ("🧵 Имя топика", f"topicname:{bot_id}")],
             [("📬 Публикация в канал: " + cb.channel_delivery_mode, f"cyc_delivery:{bot_id}")],
             [(f"⚠️ Лимит варнов: {cb.warn_limit}", f"warnlim:{bot_id}")],
         ]
@@ -335,6 +380,8 @@ CYCLES = {
     "cyc_sugg": ("accept_suggestions", [False, True]),
     "cyc_newticket": ("always_new_ticket", [False, True]),
     "cyc_delivery": ("channel_delivery_mode", ["template", "copy"]),
+    # шапка в админ-чате: отдельным сообщением / слитно с сообщением / выкл
+    "cyc_header": ("header_mode", ["separate", "merge", "off"]),
 }
 
 
@@ -349,10 +396,11 @@ async def cycle(c: CallbackQuery):
     async with Session() as s:
         obj = await s.get(ChildBot, bot_id)
         cur = getattr(obj, attr)
-        setattr(obj, attr, values[(values.index(cur) + 1) % len(values)])
+        setattr(obj, attr, values[(values.index(cur) + 1) % len(values)]
+                if cur in values else values[0])
         await s.commit()
-    
-    # ИСПРАВЛЕНИЕ: Копируем модель, чтобы избежать ошибки Frozen Instance
+
+    # Копируем модель, чтобы избежать ошибки Frozen Instance
     c_new = c.model_copy(update={"data": f"cfg:{bot_id}"})
     await cfg_menu(c_new)
 
@@ -364,7 +412,8 @@ async def welcome(c: CallbackQuery, state: FSMContext):
     await state.update_data(bot_id=int(c.data.split(":")[1]), last_msg_id=c.message.message_id)
     await c.message.edit_text(
         f"{em('pencil')} Пришлите приветственный текст (можно с фото).\n"
-        "Форматирование и премиум-эмодзи сохранятся как есть!")
+        "Форматирование и премиум-эмодзи сохранятся как есть!\n"
+        "<i>Чтобы убрать фото — пришлите текст без фото.</i>")
     await c.answer()
 
 
@@ -372,17 +421,18 @@ async def welcome(c: CallbackQuery, state: FSMContext):
 async def welcome_save(m: Message, state: FSMContext):
     data = await state.get_data()
     await delete_previous(m, state)
-    
+
     async with Session() as s:
         obj = await s.get(ChildBot, data["bot_id"])
         obj.welcome_text = m.html_text or ""          # html_text сохраняет tg-emoji!
         obj.welcome_photo = m.photo[-1].file_id if m.photo else None
         await s.commit()
+    bot_id = data["bot_id"]
     await state.clear()
-    await m.answer(f"{em('check')} Приветствие сохранено!")
+    await m.answer(f"{em('check')} Приветствие сохранено!", reply_markup=nav_kb(bot_id))
 
 
-# --- чат админов / канал / шапка / шаблон / лимит варнов ---
+# --- чат админов / канал ---
 @router.callback_query(F.data.startswith(("admchat:", "channel:")))
 async def set_chat(c: CallbackQuery, state: FSMContext):
     kind, bot_id = c.data.split(":")
@@ -398,14 +448,29 @@ async def set_chat(c: CallbackQuery, state: FSMContext):
 @router.message(St.set_admin_chat)
 async def set_chat_save(m: Message, state: FSMContext):
     await delete_previous(m, state)
+    if not m.text:
+        msg = await m.answer("Нужен ID чата числом. Попробуйте еще раз.")
+        await state.update_data(last_msg_id=msg.message_id)
+        return
     try:
         chat_id = int(m.text.strip())
     except ValueError:
         msg = await m.answer("Нужно число. Попробуйте еще раз.")
         await state.update_data(last_msg_id=msg.message_id)
         return
-        
+
     data = await state.get_data()
+    async with Session() as s:
+        obj = await s.get(ChildBot, data["bot_id"])
+        token = obj.token
+    if not await _child_bot_can_access(token, chat_id):
+        msg = await m.answer(
+            f"{em('cross')} Бот не имеет доступа к этому чату.\n"
+            "Добавьте дочернего бота в чат/канал (в канал — как администратора) "
+            "и пришлите ID ещё раз.")
+        await state.update_data(last_msg_id=msg.message_id)
+        return
+
     async with Session() as s:
         obj = await s.get(ChildBot, data["bot_id"])
         if data["kind"] == "admchat":
@@ -414,16 +479,20 @@ async def set_chat_save(m: Message, state: FSMContext):
             obj.channel_id = chat_id
         await s.commit()
     await state.clear()
-    await m.answer(f"{em('check')} Сохранено!")
+    await m.answer(f"{em('check')} Сохранено!", reply_markup=nav_kb(data["bot_id"]))
 
 
+# --- шапка (шаблон текста) ---
 @router.callback_query(F.data.startswith("header:"))
 async def header(c: CallbackQuery, state: FSMContext):
     await state.set_state(St.set_header)
     await state.update_data(bot_id=int(c.data.split(":")[1]), last_msg_id=c.message.message_id)
     await c.message.edit_text(
         "Пришлите шаблон шапки для режима copy.\n"
-        "Переменные: <code>{name}</code>, <code>{username}</code>, <code>{id}</code>")
+        "Переменные: <code>{name}</code>, <code>{username}</code>, <code>{id}</code>, "
+        "<code>{anon_id}</code> — можно все вместе или по одной.\n\n"
+        "КАК шапка попадает в чат (отдельно/слитно/выкл) переключается кнопкой "
+        "«🏷 Шапка» в настройках.")
     await c.answer()
 
 
@@ -431,13 +500,65 @@ async def header(c: CallbackQuery, state: FSMContext):
 async def header_save(m: Message, state: FSMContext):
     data = await state.get_data()
     await delete_previous(m, state)
-    
+
+    if not m.text:
+        msg = await m.answer("Нужен текст шаблона. Попробуйте еще раз.")
+        await state.update_data(last_msg_id=msg.message_id)
+        return
+    # БАГ: шаблон с неизвестной переменной сохранялся, а падал потом — при
+    # КАЖДОМ сообщении пользователя (релей умирал с KeyError).
+    try:
+        m.html_text.format(name="Тест", username="test", id=1, anon_id="#abcd1234")
+    except Exception:
+        msg = await m.answer(f"{em('warn')} Неизвестная переменная в шаблоне. "
+                             "Доступны: {name}, {username}, {id}, {anon_id}")
+        await state.update_data(last_msg_id=msg.message_id)
+        return
+
     async with Session() as s:
         obj = await s.get(ChildBot, data["bot_id"])
         obj.copy_header = m.html_text
         await s.commit()
     await state.clear()
-    await m.answer(f"{em('check')} Шапка сохранена!")
+    await m.answer(f"{em('check')} Шапка сохранена!", reply_markup=nav_kb(data["bot_id"]))
+
+
+# --- имя топика (шаблон) ---
+@router.callback_query(F.data.startswith("topicname:"))
+async def topicname(c: CallbackQuery, state: FSMContext):
+    await state.set_state(St.set_topic_name)
+    await state.update_data(bot_id=int(c.data.split(":")[1]), last_msg_id=c.message.message_id)
+    await c.message.edit_text(
+        f"{em('pencil')} Пришлите шаблон имени топика.\n"
+        "Переменные: <code>{name}</code>, <code>{username}</code>, <code>{id}</code>, "
+        "<code>{anon_id}</code> — можно все вместе или по одной.\n"
+        "Пример: <code>✉️ {name} · {anon_id}</code>")
+    await c.answer()
+
+
+@router.message(St.set_topic_name)
+async def topicname_save(m: Message, state: FSMContext):
+    data = await state.get_data()
+    await delete_previous(m, state)
+
+    if not m.text or not m.text.strip():
+        msg = await m.answer("Нужен текст шаблона. Попробуйте еще раз.")
+        await state.update_data(last_msg_id=msg.message_id)
+        return
+    try:
+        m.text.format(name="Тест", username="test", id=1, anon_id="#abcd1234")
+    except Exception:
+        msg = await m.answer(f"{em('warn')} Неизвестная переменная в шаблоне. "
+                             "Доступны: {name}, {username}, {id}, {anon_id}")
+        await state.update_data(last_msg_id=msg.message_id)
+        return
+
+    async with Session() as s:
+        obj = await s.get(ChildBot, data["bot_id"])
+        obj.topic_name_template = m.text.strip()
+        await s.commit()
+    await state.clear()
+    await m.answer(f"{em('check')} Имя топика сохранено!", reply_markup=nav_kb(data["bot_id"]))
 
 
 @router.callback_query(F.data.startswith("template:"))
@@ -458,14 +579,14 @@ async def template_save(m: Message, state: FSMContext):
         msg = await m.answer(f"{em('warn')} В шаблоне должна быть переменная {{text}}!")
         await state.update_data(last_msg_id=msg.message_id)
         return
-        
+
     data = await state.get_data()
     async with Session() as s:
         obj = await s.get(ChildBot, data["bot_id"])
         obj.post_template = m.html_text
         await s.commit()
     await state.clear()
-    await m.answer(f"{em('check')} Шаблон сохранён!")
+    await m.answer(f"{em('check')} Шаблон сохранён!", reply_markup=nav_kb(data["bot_id"]))
 
 
 @router.callback_query(F.data.startswith("warnlim:"))
@@ -479,18 +600,19 @@ async def warnlim(c: CallbackQuery, state: FSMContext):
 @router.message(St.set_warn_limit)
 async def warnlim_save(m: Message, state: FSMContext):
     await delete_previous(m, state)
-    if not m.text.isdigit():
-        msg = await m.answer("Нужно число. Попробуйте еще раз.")
+    # БАГ: 0 и не-текст проходили/падали — лимит 0 означал автобан за ЛЮБОЙ варн.
+    if not m.text or not m.text.isdigit() or int(m.text) < 1:
+        msg = await m.answer("Нужно число больше 0. Попробуйте еще раз.")
         await state.update_data(last_msg_id=msg.message_id)
         return
-        
+
     data = await state.get_data()
     async with Session() as s:
         obj = await s.get(ChildBot, data["bot_id"])
         obj.warn_limit = int(m.text)
         await s.commit()
     await state.clear()
-    await m.answer(f"{em('check')} Лимит варнов: {m.text}")
+    await m.answer(f"{em('check')} Лимит варнов: {m.text}", reply_markup=nav_kb(data["bot_id"]))
 
 
 # ================== кнопки и команды ==================
@@ -555,10 +677,27 @@ async def btn_kind(c: CallbackQuery, state: FSMContext):
 @router.message(St.btn_text)
 async def btn_text(m: Message, state: FSMContext):
     data = await state.get_data()
-    try: await m.delete()
-    except Exception: pass
-    
-    await state.update_data(text=m.text.strip().lstrip("/"))
+    try:
+        await m.delete()
+    except Exception:
+        pass
+
+    # БАГ: не-текстовое сообщение (фото без подписи и т.п.) роняло хендлер.
+    if not m.text or not m.text.strip():
+        msg = await m.answer("Нужен текст. Попробуйте еще раз.")
+        await state.update_data(last_msg_id=msg.message_id)
+        return
+
+    text = m.text.strip().lstrip("/")
+    # БАГ: триггер-команду можно было назвать /start, /newpost и т.п. — она
+    # перехватывала бы системную команду (common-роутер срабатывает раньше).
+    if data["kind"] == "command" and text.lower() in RESERVED_COMMANDS:
+        msg = await m.answer(f"{em('warn')} Имя «{text}» зарезервировано системной "
+                             "командой. Придумайте другое.")
+        await state.update_data(last_msg_id=msg.message_id)
+        return
+
+    await state.update_data(text=text)
     if data["kind"] == "inline_url":
         await state.set_state(St.btn_url)
         next_text = "Пришлите URL:"
@@ -577,6 +716,12 @@ async def btn_text(m: Message, state: FSMContext):
 @router.message(St.btn_url)
 async def btn_url(m: Message, state: FSMContext):
     await delete_previous(m, state)
+    # БАГ: URL не валидировался — кривая ссылка всплывала только при показе
+    # кнопки в дочернем боте (Telegram отклонял разметку целиком).
+    if not m.text or not m.text.strip().lower().startswith(("http://", "https://", "tg://")):
+        msg = await m.answer(f"{em('warn')} Ссылка должна начинаться с http(s):// или tg://")
+        await state.update_data(last_msg_id=msg.message_id)
+        return
     await state.update_data(url=m.text.strip())
     await _ask_style(m, state)
 
@@ -589,7 +734,7 @@ async def btn_response(m: Message, state: FSMContext):
                             response_photo=m.photo[-1].file_id if m.photo else None)
     if data["kind"] in ("keyboard", "command"):
         # Reply-клавиатура и команды — обычные Telegram-объекты без поддержки
-        # цвета/premium-иконки (это фича именно inline-кнопок), сохраняем сразу.
+        # цвета/premium-иконки, сохраняем сразу.
         await _save_button(m, state)
     else:
         await _ask_style(m, state)
@@ -643,20 +788,19 @@ async def btn_icon(m: Message, state: FSMContext):
 
 async def _save_button(m: Message, state: FSMContext):
     data = await state.get_data()
+    bot_id = data["bot_id"]
     async with Session() as s:
         s.add(BotButton(
-            bot_id=data["bot_id"], kind=data["kind"], text=data["text"],
+            bot_id=bot_id, kind=data["kind"], text=data["text"],
             url=data.get("url"),
             response_text=data.get("response_text"),
             response_photo=data.get("response_photo"),
             style=data.get("style"), icon_emoji_id=data.get("icon_emoji_id")))
         await s.commit()
     await state.clear()
-    # Кнопки читаются из БД "живьём" при каждом апдейте (см. child/common.py::
-    # build_keyboards) — рестарт бота здесь был не нужен вообще и только
-    # добавлял лишнюю нагрузку/риск (лишний Bot(), delete_webhook,
-    # переустановка long-poll) без всякой пользы.
-    await m.answer(f"{em('check')} Кнопка добавлена!")
+    # Кнопки читаются из БД "живьём" при каждом апдейте — рестарт бота не нужен.
+    await m.answer(f"{em('check')} Кнопка добавлена!",
+                   reply_markup=nav_kb(bot_id, f"btns:{bot_id}"))
 
 
 # --- кнопка "Открыть обращение" (текст/цвет/premium-эмодзи) ---
@@ -676,6 +820,10 @@ async def ticketbtn_start(c: CallbackQuery, state: FSMContext):
 @router.message(St.ticket_btn_text)
 async def ticketbtn_text(m: Message, state: FSMContext):
     await delete_previous(m, state)
+    if not m.text or not m.text.strip():
+        msg = await m.answer("Нужен текст кнопки. Попробуйте еще раз.")
+        await state.update_data(last_msg_id=msg.message_id)
+        return
     await state.update_data(text=m.text.strip()[:64])
     await state.set_state(St.ticket_btn_style)
     msg = await m.answer("Выберите цвет кнопки (Bot API 9.4):",
@@ -703,14 +851,15 @@ async def ticketbtn_icon(m: Message, state: FSMContext):
                 icon_id = e.custom_emoji_id
                 break
     data = await state.get_data()
+    bot_id = data["bot_id"]
     async with Session() as s:
-        obj = await s.get(ChildBot, data["bot_id"])
+        obj = await s.get(ChildBot, bot_id)
         obj.ticket_button_text = data["text"]
         obj.ticket_button_style = data.get("style")
         obj.ticket_button_icon = icon_id
         await s.commit()
     await state.clear()
-    await m.answer(f"{em('check')} Кнопка обращения обновлена!")
+    await m.answer(f"{em('check')} Кнопка обращения обновлена!", reply_markup=nav_kb(bot_id))
 
 
 # --- кнопки шаблона (появляются на КАЖДОМ посте постинг-бота) ---
@@ -727,7 +876,8 @@ async def tplbtn_menu(c: CallbackQuery):
     rows.append([("⬅️ Назад", f"cfg:{bot_id}")])
     await c.message.edit_text(
         f"{em('link')} Кнопки шаблона — добавляются к КАЖДОМУ посту "
-        "автоматически (поверх кнопок конкретного поста).", reply_markup=kb(rows))
+        "автоматически (для конкретного поста источник кнопок можно "
+        "переключить в редакторе черновика).", reply_markup=kb(rows))
     await c.answer()
 
 
@@ -751,19 +901,21 @@ async def tpladd_save(m: Message, state: FSMContext):
         await state.update_data(last_msg_id=msg.message_id)
         return
     text, url = [p.strip() for p in m.text.split("|", 1)]
-    if not (url.startswith("http://") or url.startswith("https://")):
-        msg = await m.answer(f"{em('warn')} Ссылка должна начинаться с http(s)://")
+    if not (url.startswith("http://") or url.startswith("https://") or url.startswith("tg://")):
+        msg = await m.answer(f"{em('warn')} Ссылка должна начинаться с http(s):// или tg://")
         await state.update_data(last_msg_id=msg.message_id)
         return
     data = await state.get_data()
+    bot_id = data["bot_id"]
     async with Session() as s:
-        obj = await s.get(ChildBot, data["bot_id"])
+        obj = await s.get(ChildBot, bot_id)
         rows_data = json.loads(obj.template_buttons_json) if obj.template_buttons_json else []
         rows_data.append([{"text": text[:64], "url": url}])
         obj.template_buttons_json = json.dumps(rows_data)
         await s.commit()
     await state.clear()
-    await m.answer(f"{em('check')} Кнопка шаблона добавлена!")
+    await m.answer(f"{em('check')} Кнопка шаблона добавлена!",
+                   reply_markup=nav_kb(bot_id, f"tplbtn:{bot_id}"))
 
 
 @router.callback_query(F.data.startswith("tpldel:"))
@@ -785,14 +937,10 @@ async def tpldel(c: CallbackQuery):
     await tplbtn_menu(c_new)
 
 
-
 # ================== админы ==================
 @router.callback_query(F.data.startswith("admins:"))
 async def admins_menu(c: CallbackQuery):
     bot_id = int(c.data.split(":")[1])
-    # БАГ БЕЗОПАСНОСТИ: раньше тут не было проверки владельца — любой, кто
-    # подобрал/увидел callback_data "admins:<id>", мог открыть список админов
-    # чужого бота и (через admadd/admdel) добавлять или удалять их.
     cb, is_owner = await _access(bot_id, c.from_user.id)
     if not cb or not is_owner:
         await c.answer("Только владелец", show_alert=True); return
@@ -823,21 +971,32 @@ async def admadd(c: CallbackQuery, state: FSMContext):
 @router.message(St.add_admin)
 async def admadd_save(m: Message, state: FSMContext):
     await delete_previous(m, state)
-    if not m.text.strip().isdigit():
+    if not m.text or not m.text.strip().isdigit():
         msg = await m.answer("Нужен числовой ID. Попробуйте еще раз.")
         await state.update_data(last_msg_id=msg.message_id)
         return
 
     data = await state.get_data()
-    cb, is_owner = await _access(data["bot_id"], m.from_user.id)
+    bot_id = data["bot_id"]
+    cb, is_owner = await _access(bot_id, m.from_user.id)
     if not cb or not is_owner:
         await state.clear()
         return
+    uid_new = int(m.text.strip())
     async with Session() as s:
-        s.add(BotAdmin(bot_id=data["bot_id"], user_id=int(m.text.strip())))
+        # БАГ: повторное добавление того же админа падало с
+        # UniqueConstraint violation (500 в логах, молчание у пользователя).
+        exists = await s.scalar(select(BotAdmin).where(
+            BotAdmin.bot_id == bot_id, BotAdmin.user_id == uid_new))
+        if exists:
+            msg = await m.answer("Этот пользователь уже в админах.")
+            await state.update_data(last_msg_id=msg.message_id)
+            return
+        s.add(BotAdmin(bot_id=bot_id, user_id=uid_new))
         await s.commit()
     await state.clear()
-    await m.answer(f"{em('check')} Админ добавлен! Ему доступно меню бота в конструкторе.")
+    await m.answer(f"{em('check')} Админ добавлен! Ему доступно меню бота в конструкторе.",
+                   reply_markup=nav_kb(bot_id, f"admins:{bot_id}"))
 
 
 @router.callback_query(F.data.startswith("admdel:"))
@@ -875,28 +1034,32 @@ async def bc_start(c: CallbackQuery, state: FSMContext):
 @router.message(St.bc_content)
 async def bc_content(m: Message, state: FSMContext):
     data = await state.get_data()
-    try: await m.delete()
-    except Exception: pass
-    
+    try:
+        await m.delete()
+    except Exception:
+        pass
+
     file_id, media_type = capture_media(m)
 
     await state.update_data(html_text=m.html_text if (m.text or m.caption) else None,
                             file_id=file_id, media_type=media_type)
     await state.set_state(St.bc_target)
-    
+
     text = "Кому разослать?"
     markup = kb([
         [("👥 Всем пользователям", "bct:all")],
         [("🔥 Активным (7 дней)", "bct:active")],
         [("❌ Отмена", "main")]
     ])
-    
+
     try:
         await m.bot.edit_message_text(text, m.chat.id, data["last_msg_id"], reply_markup=markup)
     except Exception:
         # Если вдруг редактирование не удалось (например из-за медиа), удаляем и шлем заново
-        try: await m.bot.delete_message(m.chat.id, data["last_msg_id"])
-        except Exception: pass
+        try:
+            await m.bot.delete_message(m.chat.id, data["last_msg_id"])
+        except Exception:
+            pass
         msg = await m.answer(text, reply_markup=markup)
         await state.update_data(last_msg_id=msg.message_id)
 
@@ -905,10 +1068,11 @@ async def bc_content(m: Message, state: FSMContext):
 async def bc_go(c: CallbackQuery, state: FSMContext):
     target = c.data.split(":")[1]
     data = await state.get_data()
+    bot_id = data["bot_id"]
     await state.clear()
     async with Session() as s:
-        cb = await s.get(ChildBot, data["bot_id"])
-        
+        cb = await s.get(ChildBot, bot_id)
+
     msg = await c.message.edit_text(f"{em('hourglass')} Рассылка запущена...")
 
     async def progress(done, total):
@@ -925,7 +1089,8 @@ async def bc_go(c: CallbackQuery, state: FSMContext):
     await msg.edit_text(
         f"{em('check')} <b>Рассылка завершена</b>\n\n"
         f"Всего: {result['total']}\n✅ Доставлено: {result['sent']}\n"
-        f"🚫 Заблокировали бота: {result['blocked']}\n❌ Ошибки: {result['failed']}")
+        f"🚫 Заблокировали бота: {result['blocked']}\n❌ Ошибки: {result['failed']}",
+        reply_markup=nav_kb(bot_id))
     await c.answer()
 
 
@@ -941,10 +1106,10 @@ async def stats(c: CallbackQuery):
     await c.message.answer_photo(
         BufferedInputFile(buf.read(), filename="stats.png"),
         caption=f"{em('chart')} Статистика @{cb.username}")
-    # Статистика по админам — отдельным текстовым блоком (не смешана с
-    # графиком), как и просили: кто из админов сколько ответил/забанил/варнил.
+    # Статистика по админам — отдельным текстовым блоком.
     admin_stats = await mod.admin_stats_text(bot_id)
-    await c.message.answer(f"{em('crown')} <b>Статистика по админам</b>\n\n{admin_stats}")
+    await c.message.answer(f"{em('crown')} <b>Статистика по админам</b>\n\n{admin_stats}",
+                           reply_markup=nav_kb(bot_id))
 
 
 # ================== вкл/выкл, удаление ==================
@@ -962,7 +1127,7 @@ async def toggle(c: CallbackQuery):
         await manager.start_bot(obj)
     else:
         await manager.stop_bot(bot_id)
-        
+
     c_new = c.model_copy(update={"data": f"bot:{bot_id}"})
     await bot_menu(c_new)
 
@@ -1082,10 +1247,7 @@ async def ap_bc_content(m: Message, state: FSMContext):
 
 # ================== модерация рекламы (/ads в мастер-боте) ==================
 async def _notify_ad_buyer(ad: Advertisement, text: str, reply_markup=None):
-    # /ads теперь покупается прямо в master-боте, поэтому покупатель уже
-    # переписывается именно с ним — не нужно поднимать отдельный Bot()
-    # для дочернего бота (это раньше и было лишним источником нестабильности:
-    # частое создание/закрытие сессий сторонних Bot() объектов).
+    # /ads покупается прямо в master-боте — покупатель уже переписывается с ним.
     bot = Bot(MASTER_BOT_TOKEN)
     try:
         await bot.send_message(ad.buyer_id, text, parse_mode="HTML", reply_markup=reply_markup)
@@ -1093,6 +1255,22 @@ async def _notify_ad_buyer(ad: Advertisement, text: str, reply_markup=None):
         pass
     finally:
         await bot.session.close()
+
+
+async def _append_to_message(c: CallbackQuery, suffix: str):
+    """Добавляет строку к сообщению заявки.
+
+    БАГ: для заявки С ФОТО c.message.text is None, и edit_text(None + ...)
+    падал с TypeError — одобрить/отклонить такую заявку было невозможно.
+    Для медиа-сообщений редактируем подпись.
+    """
+    try:
+        if c.message.photo or c.message.video or c.message.animation or c.message.document:
+            await c.message.edit_caption(caption=(c.message.caption or "") + suffix)
+        else:
+            await c.message.edit_text((c.message.text or "") + suffix)
+    except Exception:
+        pass
 
 
 @router.callback_query(F.data.startswith("ad_ok:"))
@@ -1118,10 +1296,10 @@ async def ad_approve(c: CallbackQuery):
             ad, f"{em('check')} Ваша заявка №{ad.id} одобрена!\n"
                f"Формат: {kind_label}\nК оплате: {ad.price_rub} ₽\n\n"
                "После оплаты реклама автоматически запустится.", pay_kb)
-        await c.message.edit_text(c.message.text + "\n\n✅ Одобрено, ссылка на оплату отправлена.")
+        await _append_to_message(c, "\n\n✅ Одобрено, ссылка на оплату отправлена.")
     except RuntimeError as e:
         # ЮKassa не настроена (нет ключей) — сообщаем админу прямо в чате
-        await c.message.edit_text(c.message.text + f"\n\n⚠️ {e}")
+        await _append_to_message(c, f"\n\n⚠️ {e}")
     await c.answer()
 
 
@@ -1132,8 +1310,7 @@ async def ad_reject(c: CallbackQuery, state: FSMContext):
     ad_id = int(c.data.split(":")[1])
     await state.set_state(St.ad_reject_reason)
     await state.update_data(ad_id=ad_id, last_msg_id=c.message.message_id)
-    await c.message.edit_text(c.message.text + "\n\n✏️ Укажите причину отклонения "
-                              "(или отправьте «-»):")
+    await _append_to_message(c, "\n\n✏️ Укажите причину отклонения (или отправьте «-»):")
     await c.answer()
 
 
@@ -1143,7 +1320,7 @@ async def ad_reject_reason(m: Message, state: FSMContext):
         return
     data = await state.get_data()
     await state.clear()
-    reason = "" if m.text.strip() == "-" else m.text.strip()
+    reason = "" if not m.text or m.text.strip() == "-" else m.text.strip()
     ad = await ads_service.reject(data["ad_id"], reason)
     if not ad:
         await m.answer("Заявка уже обработана.")
@@ -1158,12 +1335,6 @@ async def ad_reject_reason(m: Message, state: FSMContext):
 # =========================================================================
 # ==================   /ads — покупка рекламы В МАСТЕР-БОТЕ   ===========
 # =========================================================================
-# РАНЬШЕ /ads жил в каждом дочернем боте и показ рекламы не был привязан ни
-# к какому конкретному боту — одна купленная кампания светилась сразу во
-# ВСЕХ ботах платформы. Теперь /ads работает только здесь, в master-боте;
-# первым шагом покупатель явно выбирает КОНКРЕТНЫЙ бот, в котором реклама
-# будет показываться (или тариф "рассылка во все боты" — он платформенный
-# по своей сути и выбора бота не требует).
 @router.message(Command("ads"))
 async def ads_start(m: Message, state: FSMContext):
     await state.clear()
@@ -1372,9 +1543,17 @@ async def _notify_super_admin(ad: Advertisement):
     markup = kb([[("✅ Принять", f"ad_ok:{ad.id}"), ("❌ Отклонить", f"ad_no:{ad.id}")]])
     master = Bot(MASTER_BOT_TOKEN)
     try:
+        # БАГ: медиа заявки с видео/гифкой терялись — суперадмин видел только
+        # текст, а одобрить/отклонить фото-заявку было нельзя (см. _append_to_message).
         if ad.media_file_id and ad.media_type == "photo":
             await master.send_photo(SUPER_ADMIN_ID, ad.media_file_id, caption=text,
                                     parse_mode="HTML", reply_markup=markup)
+        elif ad.media_file_id and ad.media_type == "video":
+            await master.send_video(SUPER_ADMIN_ID, ad.media_file_id, caption=text,
+                                    parse_mode="HTML", reply_markup=markup)
+        elif ad.media_file_id and ad.media_type == "animation":
+            await master.send_animation(SUPER_ADMIN_ID, ad.media_file_id, caption=text,
+                                        parse_mode="HTML", reply_markup=markup)
         else:
             await master.send_message(SUPER_ADMIN_ID, text, parse_mode="HTML",
                                       reply_markup=markup)
