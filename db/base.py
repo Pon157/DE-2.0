@@ -113,6 +113,13 @@ async def init_db():
         "ALTER TABLE suggestions ADD COLUMN IF NOT EXISTS origin_chat_id BIGINT",
         "ALTER TABLE suggestions ADD COLUMN IF NOT EXISTS origin_message_id BIGINT",
         "ALTER TABLE suggestions ADD COLUMN IF NOT EXISTS origin_message_ids TEXT",
+        # Режим шапки (отдельно/слитно/выкл) и настраиваемое имя топика
+        "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS header_mode VARCHAR(16) DEFAULT 'separate'",
+        "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS topic_name_template TEXT DEFAULT '✉️ {name} · {id}'",
+        # id исходного сообщения юзера — reply-контекст и зеркалирование реакций
+        "ALTER TABLE msg_map ADD COLUMN IF NOT EXISTS user_chat_msg_id BIGINT",
+        # Источник кнопок поста (шаблон/свои/оба/без)
+        "ALTER TABLE posts ADD COLUMN IF NOT EXISTS buttons_mode VARCHAR(16) DEFAULT 'both'",
         # Гарантированные точечные фиксы для УЖЕ ИЗВЕСТНЫХ застрявших колонок
         # (в дополнение к универсальному поиску ниже — на случай, если он по
         # какой-то причине не сработает на конкретной инсталляции).
