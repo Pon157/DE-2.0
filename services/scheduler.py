@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 from datetime import datetime
 from aiogram import Bot
@@ -30,8 +31,25 @@ async def run_scheduler(interval: int = 20):
                     continue
                 bot = Bot(cfg.token)
                 try:
-                    await publish(bot, cfg, p.html_text, p.media_file_id, p.media_type,
-                                 use_template=False, buttons_json=p.buttons_json)
+                    # БАГ (критичный): publish() объявлена с keyword-only
+                    # параметрами (после cfg стоит *), а здесь всё передавалось
+                    # ПОЗИЦИОННО — каждый отложенный пост падал с TypeError на
+                    # КАЖДОМ тике и не публиковался НИКОГДА. Плюс терялись
+                    # альбомы и кнопки (не передавались media_group/origin_*/
+                    # buttons_mode), а шаблон поста не применялся вовсе
+                    # (жёсткий use_template=False в обход настройки).
+                    await publish(
+                        bot, cfg,
+                        html_text=p.html_text,
+                        file_id=p.media_file_id,
+                        media_type=p.media_type,
+                        media_group=json.loads(p.media_group_json) if p.media_group_json else None,
+                        origin_chat_id=p.origin_chat_id,
+                        origin_message_id=p.origin_message_id,
+                        origin_message_ids=p.origin_message_ids,
+                        use_template=(cfg.channel_delivery_mode != "copy"),
+                        buttons_json=p.buttons_json,
+                        buttons_mode=p.buttons_mode or "both")
                     async with Session() as s:
                         obj = await s.get(Post, p.id)
                         obj.published = True
