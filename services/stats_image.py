@@ -102,7 +102,9 @@ async def build_stats_image(bot_id: int) -> BytesIO:
     W, H = 1200, 1400
     img = Image.new("RGB", (W, H), BG)
     d = ImageDraw.Draw(img)
-    d.text((W // 2, 40), f"📊 Статистика @{cfg.username}", font=_font(36), fill=FG, anchor="ma")
+    # БАГ: эмодзи в заголовке рисовался "квадратом" — в DejaVu нет цветных
+    # эмодзи. В картинке используем только текст.
+    d.text((W // 2, 40), f"Статистика @{cfg.username}", font=_font(36), fill=FG, anchor="ma")
 
     stats = [("Пользователей", total_users, ACCENT), ("Сообщений", total_msgs, GREEN),
              ("Заблокировали", blocked, RED), ("Забанено", banned, RED)]
