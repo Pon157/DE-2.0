@@ -1,18 +1,18 @@
 from aiogram import Router, F, Bot
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message, CallbackQuery
-from sqlalchemy import select
+from aiogram.fsm.context import FSMContext
+from aiogram.types import Message
 from db.base import Session
-from db.models import (ChildBot, BotButton, Ticket, MessageLog,
-                       MsgMap, OpenMode, ForwardMode)
+from db.models import ChildBot, MessageLog, OpenMode
 from services import moderation as mod
-from child.common import inject_extras, build_keyboards, send_with_keyboards, handle_keyboard_button, open_ticket
+from child.common import (inject_extras, build_keyboards, send_with_keyboards,
+                          handle_keyboard_button, open_ticket, get_cfg,
+                          buffer_or_process, relay_to_admin_chat)
 from utils.emoji import em
 
 
 async def _cfg(bot_db_id: int) -> ChildBot:
-    async with Session() as s:
-        return await s.get(ChildBot, bot_db_id)
+    return await get_cfg(bot_db_id)
 
 
 def build_feedback_router() -> Router:
@@ -41,29 +41,12 @@ def build_feedback_router() -> Router:
                        if cfg.always_new_ticket else
                        f"{em('check')} Обращение продолжено.")
 
-    # БАГ (перенесено): "open_ticket" и "trg:" раньше обрабатывались только
-    # здесь, из-за чего в постинг-ботах те же самые кнопки (их рисует общий
-    # build_keyboards() в child/common.py) оставались без обработчика.
-    # Теперь оба хендлера — в child/common.py::build_common_router(), он
-    # подключается ко всем ботам. Здесь их удаляем, чтобы не регистрировать
-    # дважды на один и тот же callback_data.
-
-    @r.message(F.chat.type == "private", F.text.startswith("/"))
-    async def custom_command(m: Message, bot_db_id: int):
-        """Триггер-команды, настроенные владельцем."""
-        cmd = m.text.split()[0].lstrip("/").lower()
-        async with Session() as s:
-            b = await s.scalar(select(BotButton).where(
-                BotButton.bot_id == bot_db_id, BotButton.kind == "command",
-                BotButton.text == cmd))
-        if b:
-            if b.response_photo:
-                await m.answer_photo(b.response_photo, caption=b.response_text or "")
-            else:
-                await m.answer(b.response_text or "")
+    # Триггер-команды, кнопки open_ticket/trg/donate, ответы админов и
+    # реакции обрабатываются в child/common.py::build_common_router() — он
+    # подключается ко ВСЕМ ботам (и фидбек-, и постинг-).
 
     @r.message(F.chat.type == "private")
-    async def user_message(m: Message, bot: Bot, bot_db_id: int):
+    async def user_message(m: Message, bot: Bot, bot_db_id: int, state: FSMContext):
         cfg = await _cfg(bot_db_id)
         if await mod.is_banned(bot_db_id, m.from_user.id):
             return
@@ -71,60 +54,28 @@ def build_feedback_router() -> Router:
             await mod.get_or_create_user(s, bot_db_id, m.from_user)
             s.add(MessageLog(bot_id=bot_db_id, user_id=m.from_user.id, direction="in"))
             await s.commit()
+        # БАГ: сообщения, отправленные ВО ВРЕМЯ FSM-диалога (например сумма
+        # доната после кнопки), при некоторых условиях улетали в админ-чат
+        # как обычные. Если идёт любой FSM-ввод — тут делать нечего.
+        if await state.get_state() is not None:
+            return
         if await handle_keyboard_button(m, bot_db_id):
+            return
+        # БАГ: неизвестные команды (/что-угодно) раньше релеились в админ-чат
+        # как обращение. Триггер-команды из конструктора уже обработаны в
+        # common-роутере — сюда доходят только чужие/неизвестные.
+        if m.text and m.text.startswith("/"):
             return
         if not cfg.admin_chat_id:
             return
 
-        # первое сообщение = открытие обращения
-        ticket = await open_ticket(bot, cfg, m.from_user.id)
-        thread = ticket.topic_id if cfg.use_topics else None
+        async def _process(msgs: list[Message]):
+            await relay_to_admin_chat(msgs, bot, cfg)
 
-        if cfg.forward_mode == ForwardMode.forward:
-            fwd = await bot.forward_message(cfg.admin_chat_id, m.chat.id, m.message_id,
-                                            message_thread_id=thread)
-        else:
-            header = cfg.copy_header.format(
-                name=m.from_user.full_name,
-                username=m.from_user.username or "—",
-                id=m.from_user.id)
-            await bot.send_message(cfg.admin_chat_id, header, message_thread_id=thread)
-            fwd = await bot.copy_message(cfg.admin_chat_id, m.chat.id, m.message_id,
-                                         message_thread_id=thread)
-        async with Session() as s:
-            s.add(MsgMap(bot_id=bot_db_id, admin_chat_msg_id=fwd.message_id,
-                         user_id=m.from_user.id))
-            await s.commit()
-
-    # ================= админ-чат: ответы =================
-    @r.message(F.chat.type.in_({"group", "supergroup"}))
-    async def admin_reply(m: Message, bot: Bot, bot_db_id: int):
-        cfg = await _cfg(bot_db_id)
-        if m.chat.id != cfg.admin_chat_id or m.from_user.is_bot:
-            return
-        target_uid = None
-        if cfg.use_topics and m.message_thread_id:
-            async with Session() as s:
-                t = await s.scalar(select(Ticket).where(
-                    Ticket.bot_id == bot_db_id, Ticket.topic_id == m.message_thread_id))
-                target_uid = t.user_id if t else None
-        elif m.reply_to_message:
-            async with Session() as s:
-                mp = await s.scalar(select(MsgMap).where(
-                    MsgMap.bot_id == bot_db_id,
-                    MsgMap.admin_chat_msg_id == m.reply_to_message.message_id))
-                target_uid = mp.user_id if mp else None
-        if not target_uid:
-            return
-        try:
-            await bot.copy_message(target_uid, m.chat.id, m.message_id)
-            async with Session() as s:
-                s.add(MessageLog(bot_id=bot_db_id, user_id=m.from_user.id,
-                                 direction="out", is_admin=True,
-                                 admin_username=m.from_user.username))
-                await s.commit()
-            await m.react([{"type": "emoji", "emoji": "👍"}])
-        except Exception:
-            await m.reply(f"{em('cross')} Не доставлено (пользователь заблокировал бота).")
+        # БАГ "с фотками сложно": альбомы релеились по одному фото, каждое с
+        # ОТДЕЛЬНОЙ шапкой (в copy-режиме) — админ-чат превращался в спам.
+        # Теперь фидбек-бот копит альбом и шлёт его одной группой с одной
+        # шапкой, как постинг-бот.
+        await buffer_or_process(m, _process)
 
     return r
