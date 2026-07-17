@@ -67,6 +67,11 @@ class ChildBot(Base):
     rate_limit_max: Mapped[int] = mapped_column(Integer, default=6)      # сколько сообщений разрешено...
     rate_limit_window: Mapped[int] = mapped_column(Integer, default=10)  # ...за столько секунд
     captcha_every: Mapped[int] = mapped_column(Integer, default=20)      # капча каждые N запросов
+    # Раньше владелец/админы бота были ВСЕГДА исключены из антиспама — из-за
+    # этого при тестировании казалось, что антиспам "не работает". Теперь это
+    # переключаемо: True (по умолчанию) — старое поведение, антиспам владельца
+    # не трогает; False — антиспам проверяет и владельца тоже (удобно для теста).
+    antispam_ignore_owner: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
 class BotAdmin(Base):
@@ -266,6 +271,10 @@ class PlatformUser(Base):
     referral_count: Mapped[int] = mapped_column(Integer, default=0)
     pro_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    # ---- бан в САМОМ КОНСТРУКТОРЕ (master-боте), а не в дочерних ботах ----
+    is_banned: Mapped[bool] = mapped_column(Boolean, default=False)
+    ban_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    banned_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class ReferralEvent(Base):
