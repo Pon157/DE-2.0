@@ -62,6 +62,12 @@ class ChildBot(Base):
     template_buttons_json: Mapped[str | None] = mapped_column(Text, nullable=True)  # кнопки на КАЖДЫЙ пост
     channel_delivery_mode: Mapped[str] = mapped_column(String(10), default="template")  # template|copy
 
+    # ---- антиспам (services/antispam.py) ----
+    antispam_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    rate_limit_max: Mapped[int] = mapped_column(Integer, default=6)      # сколько сообщений разрешено...
+    rate_limit_window: Mapped[int] = mapped_column(Integer, default=10)  # ...за столько секунд
+    captcha_every: Mapped[int] = mapped_column(Integer, default=20)      # капча каждые N запросов
+
 
 class BotAdmin(Base):
     __tablename__ = "bot_admins"
@@ -100,6 +106,17 @@ class BotUser(Base):
     ban_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     ban_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     warns: Mapped[int] = mapped_column(Integer, default=0)
+
+    # ---- антиспам (services/antispam.py) ----
+    req_window_start: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    req_window_count: Mapped[int] = mapped_column(Integer, default=0)   # запросов в текущем "окне" (rate-limit)
+    total_requests: Mapped[int] = mapped_column(Integer, default=0)     # для капчи "каждые 20 запросов"
+    captcha_pending: Mapped[bool] = mapped_column(Boolean, default=False)
+    captcha_answer: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    captcha_asked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    spam_strikes: Mapped[int] = mapped_column(Integer, default=0)       # счётчик для прогрессирующего таймаута
+    throttled_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)  # временный "тихий" бан за спам
+
     __table_args__ = (UniqueConstraint("bot_id", "user_id"),)
 
 
