@@ -1,3 +1,4 @@
+import copy
 import json
 from datetime import datetime
 from aiogram import Router, F, Bot
@@ -6,7 +7,7 @@ from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (Message, CallbackQuery, InlineKeyboardMarkup,
-                           InputMediaPhoto, InputMediaVideo)
+                           InlineKeyboardButton, InputMediaPhoto, InputMediaVideo)
 from sqlalchemy import select
 from db.base import Session
 from db.models import ChildBot, Suggestion, Post, MessageLog
@@ -15,7 +16,7 @@ from services import antispam
 from child.common import (is_bot_admin, inject_extras, build_keyboards, send_with_keyboards,
                           handle_keyboard_button, buffer_or_process, message_media,
                           group_from_messages, text_from_messages, relay_to_admin_chat,
-                          get_cfg)
+                          get_cfg, should_apply_antispam)
 from utils.emoji import em, styled_button
 
 
@@ -41,7 +42,10 @@ def _buttons_markup(*sources: str | None) -> InlineKeyboardMarkup | None:
     if not rows:
         return None
     return InlineKeyboardMarkup(inline_keyboard=[
-        [styled_button(b["text"], url=b["url"]) for b in row] for row in rows])
+        [styled_button(b["text"], url=b["url"], style=b.get("style")) if not b.get("icon")
+         else InlineKeyboardButton(text=b["text"], url=b["url"], style=b.get("style"),
+                                    icon_custom_emoji_id=b.get("icon"))
+         for b in row] for row in rows])
 
 
 # Источники кнопок поста (переключатель в редакторе черновика)
@@ -147,13 +151,14 @@ async def _publish_fallback_copy(bot: Bot, cfg: ChildBot, *, text: str,
                                caption=text or None, parse_mode="HTML" if text else None,
                                reply_markup=markup)
     except TelegramBadRequest:
-        # Тип без caption (стикер/кружок) — копируем как есть, шаблон и
-        # кнопки уходят следующим сообщением.
-        await bot.copy_message(cfg.channel_id, origin_chat_id, origin_message_id)
+        # Тип без caption (стикер/кружок) — copyMessage всё равно поддерживает
+        # reply_markup (это общий параметр метода, не завязан на caption), так
+        # что кнопки вешаем ПРЯМО на копию, а не отдельным "🔘"-сообщением —
+        # раньше из-за этого казалось, что кнопки "прилипают не туда".
+        await bot.copy_message(cfg.channel_id, origin_chat_id, origin_message_id,
+                               reply_markup=markup)
         if text:
-            await bot.send_message(cfg.channel_id, text, reply_markup=markup)
-        elif markup:
-            await bot.send_message(cfg.channel_id, "🔘", reply_markup=markup)
+            await bot.send_message(cfg.channel_id, text)
 
 
 async def _publish_reconstructed(bot: Bot, cfg: ChildBot, *, text: str,
@@ -197,29 +202,28 @@ async def _publish_reconstructed(bot: Bot, cfg: ChildBot, *, text: str,
             await bot.send_message(cfg.channel_id, "🔘", reply_markup=markup)
         return
 
-    async def _send_text_or_buttons():
-        # для типов без caption (кружок/стикер): текст и кнопки отдельным сообщением
-        if text:
-            await bot.send_message(cfg.channel_id, text, reply_markup=markup)
-        elif markup:
-            await bot.send_message(cfg.channel_id, "🔘", reply_markup=markup)
-
     if file_id and media_type in _MEDIA_SENDERS:
         sender = getattr(bot, _MEDIA_SENDERS[media_type])
         if text and len(text) > CAPTION_LIMIT:
             # БАГ: caption > 1024 -> TelegramBadRequest, пост молча не публиковался
-            await sender(cfg.channel_id, file_id)
-            await bot.send_message(cfg.channel_id, text, reply_markup=markup)
+            await sender(cfg.channel_id, file_id, reply_markup=markup)
+            await bot.send_message(cfg.channel_id, text)
             return
         await sender(cfg.channel_id, file_id, caption=text or None, reply_markup=markup)
         return
     if file_id and media_type == "video_note":
-        await bot.send_video_note(cfg.channel_id, file_id)
-        await _send_text_or_buttons()
+        # БАГ: раньше кнопки шли ОТДЕЛЬНЫМ сообщением "🔘" под кружком — но
+        # sendVideoNote тоже принимает reply_markup, просто не принимает
+        # caption. Вешаем кнопки прямо на кружок, текст (если есть) — отдельно.
+        await bot.send_video_note(cfg.channel_id, file_id, reply_markup=markup)
+        if text:
+            await bot.send_message(cfg.channel_id, text)
         return
     if file_id and media_type == "sticker":
-        await bot.send_sticker(cfg.channel_id, file_id)
-        await _send_text_or_buttons()
+        # Аналогично: sendSticker тоже принимает reply_markup напрямую.
+        await bot.send_sticker(cfg.channel_id, file_id, reply_markup=markup)
+        if text:
+            await bot.send_message(cfg.channel_id, text)
         return
 
     if not text:
@@ -231,6 +235,14 @@ class PostSt(StatesGroup):
     composing = State()    # /newpost: ждём содержимое поста
     editing = State()      # /newpost: ждём кнопку "текст|url" или /done
     scheduling = State()   # /newpost: ждём дату-время
+    btn_style = State()    # /newpost: выбор цвета для кнопки поста
+    btn_icon = State()     # /newpost: premium-эмодзи для кнопки поста
+
+
+BTN_STYLES = [
+    ("⬜️ Обычная", "-"), ("🟦 Primary", "primary"),
+    ("🟩 Success", "success"), ("🟥 Danger", "danger"),
+]
 
 
 def build_posting_router() -> Router:
@@ -268,15 +280,35 @@ def build_posting_router() -> Router:
             await s.refresh(p)
             return p
 
-    async def _publish_post(bot: Bot, cfg: ChildBot, p: Post):
+    async def _send_preview(bot: Bot, cfg: ChildBot, preview_chat_id: int, **publish_kwargs):
+        """Шлёт в чат админа ПРЕДПРОСМОТР поста — ровно то же, что уйдёт в
+        канал (та же сборка по шаблону, форматирование, premium-эмодзи,
+        кнопки), просто в другой чат. Вызывается и при /newpost -> "Опубликовать
+        сейчас", и при одобрении предложки — ДО реальной публикации в канал."""
+        preview_cfg = copy.copy(cfg)
+        preview_cfg.channel_id = preview_chat_id
+        try:
+            await bot.send_message(preview_chat_id, f"{em('eyes')} Пост будет выглядеть вот так:")
+            await publish(bot, preview_cfg, **publish_kwargs)
+        except Exception as e:
+            # Предпросмотр best-effort — если он не удался, не блокируем
+            # реальную публикацию из-за этого.
+            await bot.send_message(preview_chat_id,
+                                   f"{em('warn')} Не удалось построить предпросмотр ({e}), "
+                                   "публикую в канал как есть.")
+
+    async def _publish_post(bot: Bot, cfg: ChildBot, p: Post, preview_chat_id: int | None = None):
         group = json.loads(p.media_group_json) if p.media_group_json else None
-        await publish(bot, cfg, html_text=p.html_text, file_id=p.media_file_id,
+        kwargs = dict(html_text=p.html_text, file_id=p.media_file_id,
                       media_type=p.media_type, media_group=group,
                       origin_chat_id=p.origin_chat_id, origin_message_id=p.origin_message_id,
                       origin_message_ids=p.origin_message_ids,
                       use_template=(cfg.channel_delivery_mode != "copy"),
                       buttons_json=p.buttons_json,
                       buttons_mode=p.buttons_mode or "both")
+        if preview_chat_id is not None:
+            await _send_preview(bot, cfg, preview_chat_id, **kwargs)
+        await publish(bot, cfg, **kwargs)
 
     # ================= /start =================
     @r.message(CommandStart(), F.chat.type == "private")
@@ -353,10 +385,60 @@ def build_posting_router() -> Router:
         if not (url.startswith("http://") or url.startswith("https://") or url.startswith("tg://")):
             await m.answer(f"{em('warn')} Ссылка должна начинаться с http(s):// или tg://")
             return
+        await state.update_data(pending_text=text[:64], pending_url=url)
+        await state.set_state(PostSt.btn_style)
+        await m.answer(
+            f"{em('sparkles')} Выберите цвет кнопки (Bot API 9.4):",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=t, callback_data=f"pbtnstyle:{v}")]
+                for t, v in BTN_STYLES]))
+
+    @r.message(PostSt.btn_style, F.chat.type == "private")
+    async def post_btn_style_msg_fallback(m: Message, state: FSMContext):
+        # если вместо нажатия на цвет прислали /done — не теряем уже
+        # добавленные кнопки, просто отменяем текущую незавершённую
+        if m.text and m.text.strip() == "/done":
+            await state.set_state(PostSt.editing)
+            await _finalize_editor(m, state)
+            return
+        await m.answer(f"{em('warn')} Выберите цвет кнопкой ниже, или /done чтобы закончить.")
+
+    @r.callback_query(PostSt.btn_style, F.data.startswith("pbtnstyle:"))
+    async def post_btn_style(c: CallbackQuery, state: FSMContext):
+        style = c.data.split(":", 1)[1]
+        await state.update_data(pending_style=None if style == "-" else style)
+        await state.set_state(PostSt.btn_icon)
+        await c.message.edit_text(
+            f"{em('sparkles')} Пришлите premium-эмодзи для кнопки (просто отправьте "
+            "его как текст), или «-» чтобы пропустить.")
+        await c.answer()
+
+    @r.message(PostSt.btn_icon, F.chat.type == "private")
+    async def post_btn_icon(m: Message, state: FSMContext):
+        if m.text and m.text.strip() == "/done":
+            # кнопка без эмодзи — сохраняем как есть, без иконки
+            data = await state.get_data()
+            rows = data.get("buttons", [])
+            rows.append([{"text": data["pending_text"], "url": data["pending_url"],
+                         "style": data.get("pending_style"), "icon": None}])
+            await state.update_data(buttons=rows, pending_text=None, pending_url=None,
+                                    pending_style=None)
+            await state.set_state(PostSt.editing)
+            await _finalize_editor(m, state)
+            return
+        icon_id = None
+        if m.text and m.text.strip() != "-" and m.entities:
+            for e in m.entities:
+                if e.type == "custom_emoji":
+                    icon_id = e.custom_emoji_id
+                    break
         data = await state.get_data()
         rows = data.get("buttons", [])
-        rows.append([{"text": text[:64], "url": url}])
-        await state.update_data(buttons=rows)
+        rows.append([{"text": data["pending_text"], "url": data["pending_url"],
+                     "style": data.get("pending_style"), "icon": icon_id}])
+        await state.update_data(buttons=rows, pending_text=None, pending_url=None,
+                                pending_style=None)
+        await state.set_state(PostSt.editing)
         await m.answer(f"{em('check')} Кнопка добавлена ({len(rows)}). Ещё одну, "
                        "или /done чтобы закончить.")
 
@@ -494,7 +576,7 @@ def build_posting_router() -> Router:
             if not cfg.channel_id:
                 await c.answer("Не задан канал в настройках бота!", show_alert=True); return
         try:
-            await _publish_post(bot, cfg, p)
+            await _publish_post(bot, cfg, p, preview_chat_id=c.message.chat.id)
         except Exception as e:
             await c.message.answer(f"{em('cross')} Не удалось опубликовать: {e}")
             await c.answer()
@@ -528,9 +610,10 @@ def build_posting_router() -> Router:
             await s.commit()
         if await mod.is_banned(bot_db_id, m.from_user.id):
             return
-        # Антиспам — не применяется к админам/владельцу бота (им и так можно
-        # слать команды часто, /newpost и т.п.).
-        if not await is_bot_admin(bot_db_id, m.from_user.id):
+        # Антиспам — обычных админов не трогает; владельца — в зависимости
+        # от тоггла cfg.antispam_ignore_owner (для теста можно включить и на
+        # себя, см. child/common.py::should_apply_antispam).
+        if await should_apply_antispam(bot_db_id, cfg, m.from_user.id):
             res = await antispam.check(bot_db_id, cfg, m.from_user.id, m.text)
             if not res.allowed:
                 if res.notice:
@@ -606,12 +689,14 @@ def build_posting_router() -> Router:
                 return
             try:
                 group = json.loads(sg.media_group_json) if sg.media_group_json else None
-                await publish(bot, cfg, html_text=sg.html_text, file_id=sg.media_file_id,
-                             media_type=sg.media_type, media_group=group,
-                             origin_chat_id=sg.origin_chat_id,
-                             origin_message_id=sg.origin_message_id,
-                             origin_message_ids=sg.origin_message_ids,
-                             use_template=(cfg.channel_delivery_mode != "copy"))
+                pub_kwargs = dict(html_text=sg.html_text, file_id=sg.media_file_id,
+                                  media_type=sg.media_type, media_group=group,
+                                  origin_chat_id=sg.origin_chat_id,
+                                  origin_message_id=sg.origin_message_id,
+                                  origin_message_ids=sg.origin_message_ids,
+                                  use_template=(cfg.channel_delivery_mode != "copy"))
+                await _send_preview(bot, cfg, c.message.chat.id, **pub_kwargs)
+                await publish(bot, cfg, **pub_kwargs)
             except Exception as e:
                 await c.message.answer(f"{em('cross')} Не удалось опубликовать: {e}")
                 await c.answer()
