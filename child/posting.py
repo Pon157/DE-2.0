@@ -65,6 +65,20 @@ _MEDIA_SENDERS = {
 CAPTION_LIMIT = 1024
 
 
+class PublishResult:
+    """Что реально было отправлено при publish() — нужно, чтобы при
+    подтверждённой публикации можно было буквально СКОПИРОВАТЬ уже
+    показанный админу предпросмотр в канал (см. _publish_via_copy), а не
+    пересобирать пост второй раз (второй сборкой мог вылезти другой
+    результат — например другое поведение Telegram при повторной
+    реконструкции премиум-стикера)."""
+    __slots__ = ("messages", "buttons_on")
+
+    def __init__(self, messages: list[Message], buttons_on: int | None):
+        self.messages = messages
+        self.buttons_on = buttons_on
+
+
 async def publish(bot: Bot, cfg: ChildBot, *, html_text: str = "",
                   file_id: str | None = None, media_type: str | None = None,
                   media_group: list[dict] | None = None,
@@ -72,9 +86,11 @@ async def publish(bot: Bot, cfg: ChildBot, *, html_text: str = "",
                   origin_message_id: int | None = None,
                   origin_message_ids: str | None = None,
                   use_template: bool = True, buttons_json: str | None = None,
-                  buttons_mode: str = "both"):
+                  buttons_mode: str = "both") -> PublishResult:
     """Публикует пост в канал. Бросает исключение при ошибке Telegram —
-    вызывающий код обязан её поймать и сообщить человеку.
+    вызывающий код обязан её поймать и сообщить человеку. Возвращает
+    PublishResult со списком реально отправленных сообщений — используется
+    для WYSIWYG-предпросмотра (см. _send_preview_and_publish).
 
     buttons_mode: откуда брать кнопки — "both" (шаблон+свои), "template"
     (только кнопки шаблона), "custom" (только кнопки поста), "none" (без).
@@ -113,17 +129,32 @@ async def publish(bot: Bot, cfg: ChildBot, *, html_text: str = "",
                 origin_chat_id=origin_chat_id, origin_message_id=origin_message_id,
                 origin_message_ids=origin_message_ids)
         except TelegramBadRequest:
-            await _publish_fallback_copy(
+            return await _publish_fallback_copy(
                 bot, cfg, text=text, origin_chat_id=origin_chat_id,
                 origin_message_id=origin_message_id,
                 origin_message_ids=origin_message_ids, markup=markup)
-            return
 
     return await _publish_reconstructed(
         bot, cfg, text=text, file_id=file_id, media_type=media_type,
         media_group=media_group, markup=markup,
         origin_chat_id=origin_chat_id, origin_message_id=origin_message_id,
         origin_message_ids=origin_message_ids)
+
+
+async def _publish_via_copy(bot: Bot, target_chat_id: int, source_chat_id: int,
+                            result: PublishResult, markup: InlineKeyboardMarkup | None):
+    """Буквально копирует уже отправленный предпросмотр (result.messages,
+    в чате source_chat_id) в target_chat_id — гарантирует, что в канале
+    появится РОВНО то же самое, что админ видел в предпросмотре ("Пост
+    будет выглядеть вот так:"), а не результат повторной пересборки."""
+    album_ids = [m.message_id for m in result.messages if m.media_group_id]
+    if album_ids:
+        await bot.copy_messages(target_chat_id, source_chat_id, album_ids)
+    for m in result.messages:
+        if m.media_group_id:
+            continue
+        rm = markup if m.message_id == result.buttons_on else None
+        await bot.copy_message(target_chat_id, source_chat_id, m.message_id, reply_markup=rm)
 
 
 async def _publish_fallback_copy(bot: Bot, cfg: ChildBot, *, text: str,
