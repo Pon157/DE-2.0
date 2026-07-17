@@ -455,15 +455,18 @@ async def relay_to_admin_chat(msgs: list[Message], bot: Bot, cfg: ChildBot,
         return
 
     markup = _combine_kb(extra_kb, close_kb)
-    if cfg.forward_mode == ForwardMode.forward:
-        # forwardMessage не поддерживает reply_markup — кнопки отдельным сообщением
+    if cfg.forward_mode == ForwardMode.forward and not markup:
+        # forwardMessage не поддерживает reply_markup вообще (ограничение Bot
+        # API) — но это ок, только когда кнопок нет. Если под сообщением
+        # нужны кнопки (например "Принять/Отклонить" предложки), forward
+        # такое молча не прикрепит, и раньше кнопки уходили ОТДЕЛЬНЫМ
+        # сообщением ПОСЛЕ фото/текста — визуально выглядело как "разрыв".
+        # Поэтому при наличии markup ниже используем copy_message вместо
+        # forward: копия поддерживает reply_markup и приходит ОДНИМ
+        # сообщением вместе с фото/текстом/подписью.
         sent = await bot.forward_message(cfg.admin_chat_id, first.chat.id,
                                          first.message_id, message_thread_id=thread)
         await _map_msg(cfg.id, sent.message_id, user.id, first.message_id)
-        if markup:
-            sm = await bot.send_message(cfg.admin_chat_id, "🔘 Действия:",
-                                        message_thread_id=thread, reply_markup=markup)
-            await _map_msg(cfg.id, sm.message_id, user.id, None)
     else:
         sent = await bot.copy_message(cfg.admin_chat_id, first.chat.id,
                                       first.message_id, message_thread_id=thread,
