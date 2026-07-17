@@ -139,6 +139,12 @@ async def init_db():
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS rate_limit_max INTEGER DEFAULT 6",
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS rate_limit_window INTEGER DEFAULT 10",
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS captcha_every INTEGER DEFAULT 20",
+        # владелец бота проверяется антиспамом или нет (тоггл для теста)
+        "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS antispam_ignore_owner BOOLEAN DEFAULT true",
+        # бан пользователя в САМОМ КОНСТРУКТОРЕ (master-боте)
+        "ALTER TABLE platform_users ADD COLUMN IF NOT EXISTS is_banned BOOLEAN DEFAULT false",
+        "ALTER TABLE platform_users ADD COLUMN IF NOT EXISTS ban_reason TEXT",
+        "ALTER TABLE platform_users ADD COLUMN IF NOT EXISTS banned_at TIMESTAMP",
     ):
         await _exec(stmt)
 
