@@ -9,7 +9,7 @@ from sqlalchemy import select
 from db.base import Session
 from db.models import (ChildBot, BotAdmin, BotButton, BotType, OpenMode, ForwardMode,
                        Advertisement, AdKind)
-from services.bot_manager import manager
+from services.bot_manager import manager, reupload_photo_for_bot as manager_reupload
 from services.broadcast import run_broadcast
 from services.stats_image import build_stats_image
 from services import ads as ads_service
@@ -429,12 +429,26 @@ async def welcome_save(m: Message, state: FSMContext):
     data = await state.get_data()
     await delete_previous(m, state)
 
-    async with Session() as s:
-        obj = await s.get(ChildBot, data["bot_id"])
-        obj.welcome_text = m.html_text or ""          # html_text сохраняет tg-emoji!
-        obj.welcome_photo = m.photo[-1].file_id if m.photo else None
-        await s.commit()
     bot_id = data["bot_id"]
+    welcome_photo = None
+    if m.photo:
+        # file_id, полученный МАСТЕР-ботом, невалиден для ДОЧЕРНЕГО — нужно
+        # перезалить фото через дочернего бота (см. reupload_photo_for_bot).
+        welcome_photo = await manager_reupload(m.bot, bot_id, m.photo[-1].file_id, m.from_user.id)
+        if welcome_photo is None:
+            # Конвертация не удалась (например, владелец ещё не писал
+            # дочернему боту) — предупреждаем и сохраняем без фото, чтобы не
+            # положить приветствие невалидным file_id (см. defensive fallback
+            # в child/common.py, если всё же решим сохранить исходный id).
+            await m.answer(f"{em('warn')} Не удалось прикрепить фото (напишите что-нибудь "
+                           f"дочернему боту @… и попробуйте снова) — приветствие сохранено "
+                           "только текстом.")
+
+    async with Session() as s:
+        obj = await s.get(ChildBot, bot_id)
+        obj.welcome_text = m.html_text or ""          # html_text сохраняет tg-emoji!
+        obj.welcome_photo = welcome_photo
+        await s.commit()
     await state.clear()
     await m.answer(f"{em('check')} Приветствие сохранено!", reply_markup=nav_kb(bot_id))
 
@@ -737,8 +751,16 @@ async def btn_url(m: Message, state: FSMContext):
 async def btn_response(m: Message, state: FSMContext):
     data = await state.get_data()
     await delete_previous(m, state)
-    await state.update_data(response_text=m.html_text or "",
-                            response_photo=m.photo[-1].file_id if m.photo else None)
+    response_photo = None
+    if m.photo:
+        # Тот же баг, что и с welcome_photo: file_id мастер-бота невалиден
+        # для дочернего — переливаем через reupload_photo_for_bot.
+        response_photo = await manager_reupload(m.bot, data["bot_id"], m.photo[-1].file_id,
+                                                 m.from_user.id)
+        if response_photo is None:
+            await m.answer(f"{em('warn')} Не удалось прикрепить фото к ответу — сохраню "
+                           "только текст. (Напишите что-нибудь дочернему боту и попробуйте снова.)")
+    await state.update_data(response_text=m.html_text or "", response_photo=response_photo)
     if data["kind"] in ("keyboard", "command"):
         # Reply-клавиатура и команды — обычные Telegram-объекты без поддержки
         # цвета/premium-иконки, сохраняем сразу.
