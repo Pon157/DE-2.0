@@ -2,7 +2,7 @@ import re
 from datetime import datetime, timedelta
 from sqlalchemy import select
 from db.base import Session
-from db.models import BotUser, ChildBot, ModerationLog
+from db.models import BotUser, ChildBot, ModerationLog, PlatformUser
 
 DURATION_RE = re.compile(r"^(\d+)([mhdwy])$|^perm$", re.I)
 UNITS = {"m": "minutes", "h": "hours", "d": "days", "w": "weeks", "y": "days"}
@@ -131,6 +131,35 @@ async def is_banned(bot_id: int, user_id: int) -> bool:
             await s.commit()
             return False
         return True
+
+
+async def ban_platform_user(user_id: int, reason: str) -> str:
+    """Банит пользователя в САМОМ КОНСТРУКТОРЕ (master-боте) — он не сможет
+    им пользоваться вообще (только SUPER_ADMIN может это делать, см.
+    master/router.py)."""
+    async with Session() as s:
+        u = await s.get(PlatformUser, user_id)
+        if not u:
+            u = PlatformUser(id=user_id)
+            s.add(u)
+        u.is_banned, u.ban_reason, u.banned_at = True, reason, datetime.utcnow()
+        await s.commit()
+    return f"Пользователь <code>{user_id}</code> забанен в конструкторе.\nПричина: {reason}"
+
+
+async def unban_platform_user(user_id: int) -> str:
+    async with Session() as s:
+        u = await s.get(PlatformUser, user_id)
+        if u:
+            u.is_banned, u.ban_reason, u.banned_at = False, None, None
+            await s.commit()
+    return f"Пользователь <code>{user_id}</code> разбанен в конструкторе."
+
+
+async def is_platform_banned(user_id: int) -> bool:
+    async with Session() as s:
+        u = await s.get(PlatformUser, user_id)
+        return bool(u and u.is_banned)
 
 
 async def admin_stats_text(bot_id: int) -> str:
