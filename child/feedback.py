@@ -5,9 +5,10 @@ from aiogram.types import Message
 from db.base import Session
 from db.models import ChildBot, MessageLog, OpenMode
 from services import moderation as mod
+from services import antispam
 from child.common import (inject_extras, build_keyboards, send_with_keyboards,
                           handle_keyboard_button, open_ticket, get_cfg,
-                          buffer_or_process, relay_to_admin_chat)
+                          buffer_or_process, relay_to_admin_chat, is_bot_admin)
 from utils.emoji import em
 
 
@@ -54,6 +55,14 @@ def build_feedback_router() -> Router:
             await mod.get_or_create_user(s, bot_db_id, m.from_user)
             s.add(MessageLog(bot_id=bot_db_id, user_id=m.from_user.id, direction="in"))
             await s.commit()
+        # Антиспам (rate-limit/капча/прогрессирующий тайм-аут) — не трогает
+        # админов и владельца бота, только обычных подписчиков.
+        if not await is_bot_admin(bot_db_id, m.from_user.id):
+            res = await antispam.check(bot_db_id, cfg, m.from_user.id, m.text)
+            if not res.allowed:
+                if res.notice:
+                    await m.answer(res.notice)
+                return
         # БАГ: сообщения, отправленные ВО ВРЕМЯ FSM-диалога (например сумма
         # доната после кнопки), при некоторых условиях улетали в админ-чат
         # как обычные. Если идёт любой FSM-ввод — тут делать нечего.
