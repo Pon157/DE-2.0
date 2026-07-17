@@ -55,6 +55,8 @@ class St(StatesGroup):
     ticket_btn_style = State()
     ticket_btn_icon = State()
     tpl_btn_edit = State()
+    ban_by_id = State()
+    antispam_cfg = State()
 
 
 HEADER_MODE_LABELS = {
@@ -349,6 +351,8 @@ async def cfg_menu(c: CallbackQuery):
             [("✉️ Кнопка обращения", f"ticketbtn:{bot_id}")],
             [("🔄 Restart/кнопка: " + ("новый тикет" if cb.always_new_ticket else "тот же тикет"),
               f"cyc_newticket:{bot_id}")],
+            [(f"🛡 Антиспам: {'вкл' if cb.antispam_enabled else 'выкл'}", f"cyc_antispam:{bot_id}"),
+             ("🛡 Пороги", f"antispamcfg:{bot_id}")],
         ]
     else:
         rows = [
@@ -364,6 +368,8 @@ async def cfg_menu(c: CallbackQuery):
               f"cyc_topics:{bot_id}"), ("🧵 Имя топика", f"topicname:{bot_id}")],
             [("📬 Публикация в канал: " + cb.channel_delivery_mode, f"cyc_delivery:{bot_id}")],
             [(f"⚠️ Лимит варнов: {cb.warn_limit}", f"warnlim:{bot_id}")],
+            [(f"🛡 Антиспам: {'вкл' if cb.antispam_enabled else 'выкл'}", f"cyc_antispam:{bot_id}"),
+             ("🛡 Пороги", f"antispamcfg:{bot_id}")],
         ]
     rows.append([("⬅️ Назад", f"bot:{bot_id}")])
     await c.message.edit_text(f"⚙️ Настройки @{cb.username}", reply_markup=kb(rows))
@@ -382,6 +388,7 @@ CYCLES = {
     "cyc_delivery": ("channel_delivery_mode", ["template", "copy"]),
     # шапка в админ-чате: отдельным сообщением / слитно с сообщением / выкл
     "cyc_header": ("header_mode", ["separate", "merge", "off"]),
+    "cyc_antispam": ("antispam_enabled", [True, False]),
 }
 
 
@@ -949,6 +956,7 @@ async def admins_menu(c: CallbackQuery):
             BotAdmin.bot_id == bot_id))).all()
     rows = [[(f"🗑 {a.user_id}", f"admdel:{bot_id}:{a.user_id}")] for a in admins]
     rows.append([("➕ Добавить админа", f"admadd:{bot_id}")])
+    rows.append([("🚫 Забанить по ID", f"banid:{bot_id}")])
     rows.append([("⬅️ Назад", f"bot:{bot_id}")])
     await c.message.edit_text("👥 Доверенные администраторы\n"
                               "(доступ к рассылке, статистике и модерации)",
@@ -1014,6 +1022,98 @@ async def admdel(c: CallbackQuery):
             await s.commit()
     c_new = c.model_copy(update={"data": f"admins:{bot_id}"})
     await admins_menu(c_new)
+
+
+# ================== бан по ID (через конструктор, без /ban в самом боте) ==================
+@router.callback_query(F.data.startswith("banid:"))
+async def banid_start(c: CallbackQuery, state: FSMContext):
+    bot_id = int(c.data.split(":")[1])
+    cb, is_owner = await _access(bot_id, c.from_user.id)
+    if not cb:
+        await c.answer("Нет доступа", show_alert=True); return
+    await state.set_state(St.ban_by_id)
+    await state.update_data(bot_id=bot_id, last_msg_id=c.message.message_id)
+    await c.message.edit_text(
+        f"{em('no_entry')} Пришлите Telegram ID пользователя, причину и срок бана "
+        "(причина и срок необязательны):\n"
+        "<code>123456789 Спам 7d</code>\n"
+        "<code>123456789 Спам perm</code> — навсегда\n"
+        "Срок: <code>Nm</code>/<code>Nh</code>/<code>Nd</code>/<code>Nw</code>/<code>perm</code>.\n"
+        "Чтобы разбанить — пришлите просто ID.")
+    await c.answer()
+
+
+@router.message(St.ban_by_id)
+async def banid_save(m: Message, state: FSMContext):
+    await delete_previous(m, state)
+    data = await state.get_data()
+    bot_id = data["bot_id"]
+    cb, is_owner = await _access(bot_id, m.from_user.id)
+    if not cb:
+        await state.clear()
+        return
+    args = (m.text or "").strip()
+    parsed = mod.parse_ban_args(args)
+    if not parsed:
+        msg = await m.answer(f"{em('warn')} Первым словом должен быть числовой Telegram ID. "
+                             "Попробуйте ещё раз или /cancel.")
+        await state.update_data(last_msg_id=msg.message_id)
+        return
+    user_id, reason, duration = parsed
+    only_id = len(args.split()) == 1
+    await state.clear()
+    if only_id:
+        # один ID без причины/срока -> разбан (удобный шорткат, чтобы не
+        # заводить отдельную кнопку/команду только ради снятия бана)
+        text = await mod.unban_user(bot_id, user_id, admin_id=m.from_user.id,
+                                    admin_username=m.from_user.username)
+    else:
+        text = await mod.ban_user(bot_id, user_id, reason, duration,
+                                  admin_id=m.from_user.id, admin_username=m.from_user.username)
+    await m.answer(text, reply_markup=nav_kb(bot_id, f"admins:{bot_id}"))
+
+
+# ================== пороги антиспама ==================
+@router.callback_query(F.data.startswith("antispamcfg:"))
+async def antispamcfg_start(c: CallbackQuery, state: FSMContext):
+    bot_id = int(c.data.split(":")[1])
+    cb, is_owner = await _access(bot_id, c.from_user.id)
+    if not cb or not is_owner:
+        await c.answer("Только владелец", show_alert=True); return
+    await state.set_state(St.antispam_cfg)
+    await state.update_data(bot_id=bot_id, last_msg_id=c.message.message_id)
+    await c.message.edit_text(
+        f"{em('shield')} Текущие пороги: не больше <b>{cb.rate_limit_max}</b> сообщений за "
+        f"<b>{cb.rate_limit_window}</b> сек, капча каждые <b>{cb.captcha_every}</b> сообщений.\n\n"
+        "Пришлите три числа через пробел: <code>max_сообщений окно_сек капча_каждые</code>\n"
+        "Например: <code>6 10 20</code>")
+    await c.answer()
+
+
+@router.message(St.antispam_cfg)
+async def antispamcfg_save(m: Message, state: FSMContext):
+    await delete_previous(m, state)
+    parts = (m.text or "").split()
+    if len(parts) != 3 or not all(p.isdigit() for p in parts):
+        msg = await m.answer(f"{em('warn')} Нужно три числа через пробел, например "
+                             "<code>6 10 20</code>. Попробуйте ещё раз или /cancel.")
+        await state.update_data(last_msg_id=msg.message_id)
+        return
+    rate_max, rate_window, captcha_every = (int(p) for p in parts)
+    data = await state.get_data()
+    bot_id = data["bot_id"]
+    cb, is_owner = await _access(bot_id, m.from_user.id)
+    if not cb or not is_owner:
+        await state.clear()
+        return
+    async with Session() as s:
+        obj = await s.get(ChildBot, bot_id)
+        obj.rate_limit_max = max(1, rate_max)
+        obj.rate_limit_window = max(1, rate_window)
+        obj.captcha_every = captcha_every  # 0 = выключить капчу
+        await s.commit()
+    await state.clear()
+    await m.answer(f"{em('check')} Пороги антиспама сохранены!", reply_markup=nav_kb(bot_id))
 
 
 # ================== рассылка ==================
