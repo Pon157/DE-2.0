@@ -1,6 +1,7 @@
 import json
 from datetime import datetime
 from aiogram import Router, F, Bot
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -10,6 +11,7 @@ from sqlalchemy import select
 from db.base import Session
 from db.models import ChildBot, Suggestion, Post, MessageLog
 from services import moderation as mod
+from services import antispam
 from child.common import (is_bot_admin, inject_extras, build_keyboards, send_with_keyboards,
                           handle_keyboard_button, buffer_or_process, message_media,
                           group_from_messages, text_from_messages, relay_to_admin_chat,
@@ -90,6 +92,80 @@ async def publish(bot: Bot, cfg: ChildBot, *, html_text: str = "",
         # раньше) падал глубоко в Telegram с "message text is empty".
         raise ValueError("пустой пост — нечего публиковать")
 
+    # --- защита от потери премиум-контента в режиме "по шаблону" ---
+    # Бот НЕ может пересобрать премиум-стикер или премиум (custom) эмодзи
+    # "с нуля" по одному file_id — Telegram иногда отказывает в отправке
+    # такой реконструкции (TelegramBadRequest). Чтобы контент не терялся
+    # молча (пост просто не публиковался), при наличии origin_* пробуем
+    # сначала штатную реконструкцию по шаблону, а если Telegram её отклонит
+    # — ПЕРЕСЫЛАЕМ оригинал через copy_message (премиум-стикеры/эмодзи там
+    # сохраняются 1:1, т.к. Telegram берёт их из исходного сообщения, а не
+    # пересобирает заново), и добавляем шапку/подпись из шаблона + кнопки.
+    if use_template and (origin_message_id or origin_message_ids):
+        try:
+            return await _publish_reconstructed(
+                bot, cfg, text=text, file_id=file_id, media_type=media_type,
+                media_group=media_group, markup=markup,
+                origin_chat_id=origin_chat_id, origin_message_id=origin_message_id,
+                origin_message_ids=origin_message_ids)
+        except TelegramBadRequest:
+            await _publish_fallback_copy(
+                bot, cfg, text=text, origin_chat_id=origin_chat_id,
+                origin_message_id=origin_message_id,
+                origin_message_ids=origin_message_ids, markup=markup)
+            return
+
+    return await _publish_reconstructed(
+        bot, cfg, text=text, file_id=file_id, media_type=media_type,
+        media_group=media_group, markup=markup,
+        origin_chat_id=origin_chat_id, origin_message_id=origin_message_id,
+        origin_message_ids=origin_message_ids)
+
+
+async def _publish_fallback_copy(bot: Bot, cfg: ChildBot, *, text: str,
+                                 origin_chat_id: int | None,
+                                 origin_message_id: int | None,
+                                 origin_message_ids: str | None,
+                                 markup: InlineKeyboardMarkup | None):
+    """Публикует пост копированием ОРИГИНАЛА (сохраняет премиум-стикеры,
+    премиум-эмодзи и любое форматирование как есть), плюс отдельным
+    сообщением — текст из шаблона (шапка/подпись) с кнопками, если исходное
+    сообщение не поддерживает caption (стикер, кружок и т.п.)."""
+    if origin_message_ids:
+        ids = [int(x) for x in origin_message_ids.split(",")]
+        await bot.copy_messages(cfg.channel_id, origin_chat_id, ids)
+        if text:
+            await bot.send_message(cfg.channel_id, text, reply_markup=markup)
+        elif markup:
+            await bot.send_message(cfg.channel_id, "🔘", reply_markup=markup)
+        return
+    try:
+        # Если у оригинала есть caption-слот (фото/видео/документ и т.п.),
+        # copy_message умеет заменить подпись на текст из шаблона и повесить
+        # кнопки — одним сообщением.
+        await bot.copy_message(cfg.channel_id, origin_chat_id, origin_message_id,
+                               caption=text or None, parse_mode="HTML" if text else None,
+                               reply_markup=markup)
+    except TelegramBadRequest:
+        # Тип без caption (стикер/кружок) — копируем как есть, шаблон и
+        # кнопки уходят следующим сообщением.
+        await bot.copy_message(cfg.channel_id, origin_chat_id, origin_message_id)
+        if text:
+            await bot.send_message(cfg.channel_id, text, reply_markup=markup)
+        elif markup:
+            await bot.send_message(cfg.channel_id, "🔘", reply_markup=markup)
+
+
+async def _publish_reconstructed(bot: Bot, cfg: ChildBot, *, text: str,
+                                 file_id: str | None, media_type: str | None,
+                                 media_group: list[dict] | None,
+                                 markup: InlineKeyboardMarkup | None,
+                                 origin_chat_id: int | None = None,
+                                 origin_message_id: int | None = None,
+                                 origin_message_ids: str | None = None):
+    """Старая логика "собрать пост заново по file_id/тексту" — вынесена в
+    отдельную функцию, чтобы publish() мог обернуть её в try/except и
+    подстраховаться через _publish_fallback_copy при отказе Telegram."""
     # --- режим "оригинал" (copy_message/copy_messages) ---
     if cfg.channel_delivery_mode == "copy" and origin_chat_id \
             and (origin_message_id or origin_message_ids):
@@ -452,6 +528,14 @@ def build_posting_router() -> Router:
             await s.commit()
         if await mod.is_banned(bot_db_id, m.from_user.id):
             return
+        # Антиспам — не применяется к админам/владельцу бота (им и так можно
+        # слать команды часто, /newpost и т.п.).
+        if not await is_bot_admin(bot_db_id, m.from_user.id):
+            res = await antispam.check(bot_db_id, cfg, m.from_user.id, m.text)
+            if not res.allowed:
+                if res.notice:
+                    await m.answer(res.notice)
+                return
         # Идёт FSM-ввод (/newpost, кнопки, расписание, донат) — НЕ релеим.
         # Это страховка от бага "сообщения улетают в чат админов посреди
         # диалога" — сюда такие сообщения доходить не должны вообще.
