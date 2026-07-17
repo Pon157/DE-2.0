@@ -181,7 +181,16 @@ class BotManager:
         if task:
             task.cancel()
             try:
-                await task
+                # БАГ "бот не останавливается": раньше `await task` ждал
+                # ЛЮБОЕ время — если polling завис (сетевой хвост, Telegram
+                # не отдаёт соединение и т.п.), stop_bot зависал вместе с
+                # ним и toggle/restart в конструкторе выглядели так, будто
+                # "ничего не происходит". Теперь ждём максимум 10 секунд —
+                # после этого просто идём дальше (задача всё равно cancel()
+                # получила и рано или поздно завершится сама).
+                await asyncio.wait_for(asyncio.shield(task), timeout=10)
+            except asyncio.TimeoutError:
+                log.warning("Bot %s: остановка зависла дольше 10с, продолжаю без ожидания", bot_id)
             except (asyncio.CancelledError, Exception):
                 pass
         if bot:
@@ -189,6 +198,10 @@ class BotManager:
                 await bot.session.close()
             except Exception:
                 pass
+        # Лок в БД снимаем ЯВНО и здесь тоже (а не только в finally у _run()):
+        # если задача зависла и wait_for вышел по таймауту, _run() ещё не
+        # успел дойти до своего finally, и следующий _start_bot_locked() мог
+        # решить, что бот "занят другим процессом", и отказаться стартовать.
         await self._release_runtime_lock(bot_id)
 
     async def restart_bot(self, bot_id: int):
