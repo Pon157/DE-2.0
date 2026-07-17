@@ -25,6 +25,55 @@ from config import SUPER_ADMIN_ID, MASTER_BOT_TOKEN, AD_MAX_LEN, AD_BROADCAST_CO
 router = Router()
 
 
+# ---------------------------------------------------------------------------
+# Антиспам и бан в САМОМ КОНСТРУКТОРЕ (master-боте).
+# Раньше антиспам был только у дочерних ботов и НИКОГДА не применялся в
+# master-роутере — если человек флудил в конструктор напрямую, его тут
+# ничего не тормозило. Здесь — простой rate-limit в памяти процесса,
+# применяется абсолютно ко всем, включая владельца/SUPER_ADMIN_ID (это
+# сознательно: конструктором тоже можно флудить, тестировать нужно на всех).
+# ---------------------------------------------------------------------------
+from collections import deque
+import time as _time
+
+_ROUTER_RATE_MAX = 15       # сообщений
+_ROUTER_RATE_WINDOW = 10.0  # за столько секунд
+_router_hits: dict[int, deque] = {}
+
+
+async def _router_antispam_allowed(user_id: int) -> bool:
+    now = _time.monotonic()
+    dq = _router_hits.setdefault(user_id, deque())
+    dq.append(now)
+    while dq and now - dq[0] > _ROUTER_RATE_WINDOW:
+        dq.popleft()
+    return len(dq) <= _ROUTER_RATE_MAX
+
+
+@router.message.outer_middleware()
+async def _master_guard_message(handler, event: Message, data: dict):
+    uid = event.from_user.id if event.from_user else None
+    if uid is not None:
+        if await mod.is_platform_banned(uid):
+            return  # забанен в конструкторе — молча игнорируем
+        if not await _router_antispam_allowed(uid):
+            return  # флуд — молча игнорируем (без наказания, просто троттлинг)
+    return await handler(event, data)
+
+
+@router.callback_query.outer_middleware()
+async def _master_guard_callback(handler, event: CallbackQuery, data: dict):
+    uid = event.from_user.id if event.from_user else None
+    if uid is not None:
+        if await mod.is_platform_banned(uid):
+            await event.answer("Вы забанены в конструкторе.", show_alert=True)
+            return
+        if not await _router_antispam_allowed(uid):
+            await event.answer()
+            return
+    return await handler(event, data)
+
+
 class St(StatesGroup):
     add_token = State()
     add_type = State()
@@ -55,6 +104,8 @@ class St(StatesGroup):
     ticket_btn_style = State()
     ticket_btn_icon = State()
     tpl_btn_edit = State()
+    tpl_btn_style = State()
+    tpl_btn_icon = State()
     ban_by_id = State()
     antispam_cfg = State()
 
@@ -162,9 +213,19 @@ async def _child_bot_can_access(token: str, chat_id: int) -> bool:
 
 
 # ================== главное меню ==================
+WELCOME_STICKER_ID = "CAACAgEAAxkBAAEFhKhqWilcvpZc4woyhjArQLamLF7lcgACdQIAAutt2EfwJl7czJ5z4z0E"
+
+
 @router.message(CommandStart())
 async def start(m: Message, command: CommandObject):
+    if await mod.is_platform_banned(m.from_user.id):
+        await m.answer(f"{em('no_entry')} Вы забанены в конструкторе и не можете им пользоваться.")
+        return
     await referrals.register_start(m.from_user.id, command.args)
+    try:
+        await m.answer_sticker(WELCOME_STICKER_ID)
+    except Exception:
+        pass  # стикер не критичен — не роняем /start, если он вдруг недоступен
     await show_main(m, user_id=m.from_user.id)
 
 
@@ -318,7 +379,8 @@ async def bot_menu(c: CallbackQuery):
             [("⚙️ Настройки", f"cfg:{bot_id}")],
             [("🔘 Кнопки и команды", f"btns:{bot_id}"),
              ("👥 Админы", f"admins:{bot_id}")],
-            [("⏯ Вкл/выкл", f"toggle:{bot_id}"), ("🗑 Удалить", f"del:{bot_id}")]]
+            [("⏯ Вкл/выкл", f"toggle:{bot_id}"), ("🔄 Перезапустить", f"restartbot:{bot_id}")],
+            [("🗑 Удалить", f"del:{bot_id}")]]
     rows.append([("⬅️ Назад", "main")])
     status = "🟢 работает" if cb.is_active else "🔴 остановлен"
     await c.message.edit_text(
@@ -353,6 +415,8 @@ async def cfg_menu(c: CallbackQuery):
               f"cyc_newticket:{bot_id}")],
             [(f"🛡 Антиспам: {'вкл' if cb.antispam_enabled else 'выкл'}", f"cyc_antispam:{bot_id}"),
              ("🛡 Пороги", f"antispamcfg:{bot_id}")],
+            [(f"🛡 Антиспам трогает владельца: {'нет' if cb.antispam_ignore_owner else 'да'}",
+              f"cyc_aspown:{bot_id}")],
         ]
     else:
         rows = [
@@ -370,6 +434,8 @@ async def cfg_menu(c: CallbackQuery):
             [(f"⚠️ Лимит варнов: {cb.warn_limit}", f"warnlim:{bot_id}")],
             [(f"🛡 Антиспам: {'вкл' if cb.antispam_enabled else 'выкл'}", f"cyc_antispam:{bot_id}"),
              ("🛡 Пороги", f"antispamcfg:{bot_id}")],
+            [(f"🛡 Антиспам трогает владельца: {'нет' if cb.antispam_ignore_owner else 'да'}",
+              f"cyc_aspown:{bot_id}")],
         ]
     rows.append([("⬅️ Назад", f"bot:{bot_id}")])
     await c.message.edit_text(f"⚙️ Настройки @{cb.username}", reply_markup=kb(rows))
@@ -389,6 +455,7 @@ CYCLES = {
     # шапка в админ-чате: отдельным сообщением / слитно с сообщением / выкл
     "cyc_header": ("header_mode", ["separate", "merge", "off"]),
     "cyc_antispam": ("antispam_enabled", [True, False]),
+    "cyc_aspown": ("antispam_ignore_owner", [True, False]),
 }
 
 
@@ -446,7 +513,14 @@ async def welcome_save(m: Message, state: FSMContext):
 
     async with Session() as s:
         obj = await s.get(ChildBot, bot_id)
-        obj.welcome_text = m.html_text or ""          # html_text сохраняет tg-emoji!
+        # БАГ: если владелец прислал фото БЕЗ подписи, m.html_text пуст, и
+        # раньше это затирало welcome_text пустой строкой — из-за чего /start
+        # в дочернем боте молча ничего не отправлял (см. фикс в
+        # child/common.py::send_with_keyboards). Пустая подпись у фото —
+        # ЗАКОННЫЙ случай (просто фото без текста), поэтому подставляем
+        # дефолтный текст вместо пустой строки, а не полагаемся только на
+        # защиту ниже по цепочке.
+        obj.welcome_text = m.html_text or "Привет! Напишите ваше сообщение."
         obj.welcome_photo = welcome_photo
         await s.commit()
     await state.clear()
@@ -934,12 +1008,39 @@ async def tpladd_save(m: Message, state: FSMContext):
         msg = await m.answer(f"{em('warn')} Ссылка должна начинаться с http(s):// или tg://")
         await state.update_data(last_msg_id=msg.message_id)
         return
+    await state.update_data(pending_text=text[:64], pending_url=url)
+    await state.set_state(St.tpl_btn_style)
+    msg = await m.answer("Выберите цвет кнопки (Bot API 9.4):",
+                         reply_markup=kb([[(t, f"tplstyle:{v}")] for t, v in STYLES]))
+    await state.update_data(last_msg_id=msg.message_id)
+
+
+@router.callback_query(St.tpl_btn_style, F.data.startswith("tplstyle:"))
+async def tplbtn_style(c: CallbackQuery, state: FSMContext):
+    style = c.data.split(":", 1)[1]
+    await state.update_data(pending_style=None if style == "-" else style)
+    await state.set_state(St.tpl_btn_icon)
+    await c.message.edit_text(
+        f"{em('sparkles')} Пришлите premium-эмодзи для кнопки (просто отправьте "
+        "его как текст), или «-» чтобы пропустить.")
+    await c.answer()
+
+
+@router.message(St.tpl_btn_icon)
+async def tplbtn_icon(m: Message, state: FSMContext):
+    icon_id = None
+    if m.text and m.text.strip() != "-" and m.entities:
+        for e in m.entities:
+            if e.type == "custom_emoji":
+                icon_id = e.custom_emoji_id
+                break
     data = await state.get_data()
     bot_id = data["bot_id"]
     async with Session() as s:
         obj = await s.get(ChildBot, bot_id)
         rows_data = json.loads(obj.template_buttons_json) if obj.template_buttons_json else []
-        rows_data.append([{"text": text[:64], "url": url}])
+        rows_data.append([{"text": data["pending_text"], "url": data["pending_url"],
+                           "style": data.get("pending_style"), "icon": icon_id}])
         obj.template_buttons_json = json.dumps(rows_data)
         await s.commit()
     await state.clear()
@@ -1254,6 +1355,23 @@ async def toggle(c: CallbackQuery):
     await bot_menu(c_new)
 
 
+@router.callback_query(F.data.startswith("restartbot:"))
+async def restartbot(c: CallbackQuery):
+    """Полный перезапуск бота (новый Bot()/Dispatcher(), сброс webhook и
+    т.п.) — раньше manager.restart_bot() существовал, но нигде не
+    вызывался: единственным способом "перезапустить" было дважды нажать
+    Вкл/выкл, и это не помогало при зависшем поллинге (см. фикс
+    _stop_bot_locked в services/bot_manager.py)."""
+    bot_id = int(c.data.split(":")[1])
+    cb, is_owner = await _access(bot_id, c.from_user.id)
+    if not cb or not is_owner:
+        return
+    await c.answer(f"{em('refresh')} Перезапускаю…")
+    await manager.restart_bot(bot_id)
+    c_new = c.model_copy(update={"data": f"bot:{bot_id}"})
+    await bot_menu(c_new)
+
+
 @router.callback_query(F.data.startswith("del:"))
 async def delete(c: CallbackQuery):
     bot_id = int(c.data.split(":")[1])
@@ -1272,6 +1390,35 @@ async def delete(c: CallbackQuery):
 # ================== админ-панель (только SUPER_ADMIN_ID) ==================
 def _is_super(user_id: int) -> bool:
     return bool(SUPER_ADMIN_ID) and user_id == SUPER_ADMIN_ID
+
+
+# --- бан пользователя в САМОМ КОНСТРУКТОРЕ (не в дочерних ботах) ---
+@router.message(Command("banconstructor"))
+async def cmd_ban_constructor(m: Message, command: CommandObject):
+    """/banconstructor 123456 Причина — банит человека в master-боте, он не
+    сможет создавать/управлять ботами вообще. Только SUPER_ADMIN_ID."""
+    if not _is_super(m.from_user.id):
+        return
+    args = (command.args or "").split(maxsplit=1)
+    if not args or not args[0].isdigit():
+        await m.answer(f"{em('warn')} Формат: <code>/banconstructor 123456 Причина</code>")
+        return
+    user_id = int(args[0])
+    reason = args[1] if len(args) > 1 else "Не указана"
+    text = await mod.ban_platform_user(user_id, reason)
+    await m.answer(f"{em('no_entry')} " + text)
+
+
+@router.message(Command("unbanconstructor"))
+async def cmd_unban_constructor(m: Message, command: CommandObject):
+    if not _is_super(m.from_user.id):
+        return
+    if not command.args or not command.args.split()[0].isdigit():
+        await m.answer(f"{em('warn')} Формат: <code>/unbanconstructor 123456</code>")
+        return
+    user_id = int(command.args.split()[0])
+    text = await mod.unban_platform_user(user_id)
+    await m.answer(f"{em('check')} " + text)
 
 
 @router.callback_query(F.data == "ap")
