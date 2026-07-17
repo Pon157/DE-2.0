@@ -3,6 +3,7 @@ import hashlib
 import logging
 import re
 from aiogram import Router, F, Bot
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter, TelegramForbiddenError
 from aiogram.filters import Command, CommandObject, BaseFilter
 from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.fsm.context import FSMContext
@@ -22,6 +23,32 @@ from utils.emoji import em, styled_button
 from config import PLATFORM_BOT_USERNAME
 
 log = logging.getLogger("child.common")
+
+
+async def safe_call(coro_func, *args, retries: int = 2, **kwargs):
+    """Вызывает Telegram-метод (aiogram coroutine factory) с автоповтором при
+    flood control (TelegramRetryAfter).
+
+    БАГ из прод-логов: при вспышке сообщений от подписчиков (несколько
+    альбомов/сообщений подряд) Telegram отвечает "Flood control exceeded...
+    Retry in N seconds" на send_message в чат админов. Раньше это исключение
+    нигде не ловилось — апдейт падал необработанным (видно в логах пачками
+    "is not handled"), сообщение молча терялось и админ его не видел вообще.
+    Теперь ждём подсказанное Telegram время и повторяем (до `retries` раз).
+
+    coro_func — вызываемое, возвращающее awaitable (например
+    `lambda: bot.send_message(...)`), НЕ уже awaited-корутина — её нельзя
+    было бы повторно await'нуть после первой попытки.
+    """
+    for attempt in range(retries + 1):
+        try:
+            return await coro_func(*args, **kwargs)
+        except TelegramRetryAfter as e:
+            if attempt >= retries:
+                log.warning("safe_call: flood control не отступил после %d попыток", retries)
+                raise
+            await asyncio.sleep(e.retry_after + 0.5)
+    return None
 
 
 class DonateSt(StatesGroup):
@@ -250,14 +277,28 @@ async def send_with_keyboards(m: Message, text: str, ikb, rkb, photo: str | None
     а следом отдельным сообщением выставляем reply-клавиатуру. У caption к
     фото лимит 1024 символа — если текст не влезает, шлём фото и текст
     отдельными сообщениями.
+
+    БАГ из прод-логов ("wrong file identifier/HTTP URL specified"):
+    file_id в Telegram привязан к конкретному боту, которым он был получен.
+    welcome_photo сохраняется в конструкторе через МАСТЕР-бота (владелец
+    присылает фото ЕМУ), а отправляет его уже ДОЧЕРНИЙ бот — с точки зрения
+    Telegram это два разных бота, и file_id одного для другого невалиден.
+    Итог — ЛЮБОЕ приветствие с фото падало с необработанным исключением при
+    первом же /start. Раз конвертировать file_id между ботами без лишнего
+    запроса к пользователю нельзя, здесь — защита: если фото не отправилось,
+    не роняем весь апдейт, а тихо откатываемся на отправку текста.
     """
     PHOTO_CAPTION_LIMIT = 1024
     if photo:
-        if len(text) <= PHOTO_CAPTION_LIMIT:
-            msg = await m.answer_photo(photo, caption=text, reply_markup=ikb or rkb)
-        else:
-            await m.answer_photo(photo)
-            msg = await m.answer(text, reply_markup=ikb or rkb)
+        try:
+            if len(text) <= PHOTO_CAPTION_LIMIT:
+                msg = await m.answer_photo(photo, caption=text, reply_markup=ikb or rkb)
+            else:
+                await m.answer_photo(photo)
+                msg = await m.answer(text, reply_markup=ikb or rkb)
+        except TelegramBadRequest as e:
+            log.warning("send_with_keyboards: не смог отправить фото (%s), шлю только текст", e)
+            msg = await m.answer(text, reply_markup=ikb or rkb) if text else None
     else:
         msg = await m.answer(text, reply_markup=ikb or rkb)
     if ikb and rkb:
@@ -271,16 +312,25 @@ async def send_response(m: Message, text: str | None, photo: str | None = None):
     БАГ: если владелец ставил на триггер ответ-фото БЕЗ текста, хендлеры
     проверяли `if b.response_text:` и молча ничего не отправляли. Плюс лимит
     caption 1024 — длинный текст с фото раньше ронял отправку.
+
+    Фото триггера тоже настраивается через МАСТЕР-бота и отправляется потом
+    ДОЧЕРНИМ — тот же класс бага, что и с welcome_photo (см.
+    send_with_keyboards): file_id может быть невалиден для этого бота.
+    Не роняем обработку — при ошибке отправки фото откатываемся на текст.
     """
     text = text or ""
     if photo:
-        if len(text) <= 1024:
-            await m.answer_photo(photo, caption=text)
-        else:
-            await m.answer_photo(photo)
-            if text:
-                await m.answer(text)
-    elif text:
+        try:
+            if len(text) <= 1024:
+                await m.answer_photo(photo, caption=text)
+            else:
+                await m.answer_photo(photo)
+                if text:
+                    await m.answer(text)
+            return
+        except TelegramBadRequest as e:
+            log.warning("send_response: не смог отправить фото (%s), шлю только текст", e)
+    if text:
         await m.answer(text)
 
 
@@ -406,10 +456,10 @@ async def relay_to_admin_chat(msgs: list[Message], bot: Bot, cfg: ChildBot,
         if first.text:
             merged = f"{header}\n\n{first.html_text}"
             if len(merged) <= 4096:
-                sent = await bot.send_message(cfg.admin_chat_id, merged,
-                                              message_thread_id=thread,
-                                              reply_markup=markup,
-                                              reply_parameters=reply_params)
+                sent = await safe_call(bot.send_message, cfg.admin_chat_id, merged,
+                                       message_thread_id=thread,
+                                       reply_markup=markup,
+                                       reply_parameters=reply_params)
                 await _map_msg(cfg.id, sent.message_id, user.id, first.message_id)
                 return
         else:
@@ -420,8 +470,8 @@ async def relay_to_admin_chat(msgs: list[Message], bot: Bot, cfg: ChildBot,
                 if len(merged) <= 1024:
                     # copyMessage умеет заменять caption у медиа — шапка
                     # становится частью подписи, одно сообщение вместо двух.
-                    sent = await bot.copy_message(
-                        cfg.admin_chat_id, first.chat.id, first.message_id,
+                    sent = await safe_call(
+                        bot.copy_message, cfg.admin_chat_id, first.chat.id, first.message_id,
                         message_thread_id=thread, caption=merged,
                         reply_markup=markup, reply_parameters=reply_params)
                     await _map_msg(cfg.id, sent.message_id, user.id, first.message_id)
@@ -430,27 +480,27 @@ async def relay_to_admin_chat(msgs: list[Message], bot: Bot, cfg: ChildBot,
 
     # --- отдельная шапка
     if header_mode != "off":
-        hm = await bot.send_message(cfg.admin_chat_id, header, message_thread_id=thread,
-                                    reply_markup=close_kb)
+        hm = await safe_call(bot.send_message, cfg.admin_chat_id, header,
+                             message_thread_id=thread, reply_markup=close_kb)
         await _map_msg(cfg.id, hm.message_id, user.id, None)
         close_kb = None  # кнопка закрытия уже повешена на шапку
 
     if is_album:
         ids = [mm.message_id for mm in msgs]
         if cfg.forward_mode == ForwardMode.forward:
-            copies = await bot.forward_messages(cfg.admin_chat_id, first.chat.id, ids,
-                                                message_thread_id=thread)
+            copies = await safe_call(bot.forward_messages, cfg.admin_chat_id, first.chat.id, ids,
+                                     message_thread_id=thread)
         else:
-            copies = await bot.copy_messages(cfg.admin_chat_id, first.chat.id, ids,
-                                             message_thread_id=thread)
+            copies = await safe_call(bot.copy_messages, cfg.admin_chat_id, first.chat.id, ids,
+                                     message_thread_id=thread)
         for mm, cp in zip(msgs, copies):
             await _map_msg(cfg.id, cp.message_id, user.id, mm.message_id)
         markup = _combine_kb(extra_kb, close_kb)
         if markup:
             # У копий альбома нет reply_markup (ограничение Bot API) — кнопки
             # шлём отдельным сообщением сразу под альбомом.
-            sm = await bot.send_message(cfg.admin_chat_id, "🔘 Действия:",
-                                        message_thread_id=thread, reply_markup=markup)
+            sm = await safe_call(bot.send_message, cfg.admin_chat_id, "🔘 Действия:",
+                                 message_thread_id=thread, reply_markup=markup)
             await _map_msg(cfg.id, sm.message_id, user.id, None)
         return
 
@@ -464,13 +514,13 @@ async def relay_to_admin_chat(msgs: list[Message], bot: Bot, cfg: ChildBot,
         # Поэтому при наличии markup ниже используем copy_message вместо
         # forward: копия поддерживает reply_markup и приходит ОДНИМ
         # сообщением вместе с фото/текстом/подписью.
-        sent = await bot.forward_message(cfg.admin_chat_id, first.chat.id,
-                                         first.message_id, message_thread_id=thread)
+        sent = await safe_call(bot.forward_message, cfg.admin_chat_id, first.chat.id,
+                               first.message_id, message_thread_id=thread)
         await _map_msg(cfg.id, sent.message_id, user.id, first.message_id)
     else:
-        sent = await bot.copy_message(cfg.admin_chat_id, first.chat.id,
-                                      first.message_id, message_thread_id=thread,
-                                      reply_markup=markup, reply_parameters=reply_params)
+        sent = await safe_call(bot.copy_message, cfg.admin_chat_id, first.chat.id,
+                               first.message_id, message_thread_id=thread,
+                               reply_markup=markup, reply_parameters=reply_params)
         await _map_msg(cfg.id, sent.message_id, user.id, first.message_id)
 
 
