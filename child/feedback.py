@@ -8,7 +8,8 @@ from services import moderation as mod
 from services import antispam
 from child.common import (inject_extras, build_keyboards, send_with_keyboards,
                           handle_keyboard_button, open_ticket, get_cfg,
-                          buffer_or_process, relay_to_admin_chat, is_bot_admin)
+                          buffer_or_process, relay_to_admin_chat, is_bot_admin,
+                          should_apply_antispam)
 from utils.emoji import em
 
 
@@ -55,9 +56,10 @@ def build_feedback_router() -> Router:
             await mod.get_or_create_user(s, bot_db_id, m.from_user)
             s.add(MessageLog(bot_id=bot_db_id, user_id=m.from_user.id, direction="in"))
             await s.commit()
-        # Антиспам (rate-limit/капча/прогрессирующий тайм-аут) — не трогает
-        # админов и владельца бота, только обычных подписчиков.
-        if not await is_bot_admin(bot_db_id, m.from_user.id):
+        # Антиспам (rate-limit/капча/прогрессирующий тайм-аут) — обычных
+        # админов не трогает, владельца — в зависимости от тоггла
+        # cfg.antispam_ignore_owner (см. child/common.py::should_apply_antispam).
+        if await should_apply_antispam(bot_db_id, cfg, m.from_user.id):
             res = await antispam.check(bot_db_id, cfg, m.from_user.id, m.text)
             if not res.allowed:
                 if res.notice:
