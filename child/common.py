@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import logging
 import re
+import time as _time
 from aiogram import Router, F, Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter, TelegramForbiddenError
 from aiogram.filters import Command, CommandObject, BaseFilter
@@ -72,6 +73,23 @@ async def is_bot_admin(bot_db_id: int, user_id: int) -> bool:
             return True
         return bool(await s.scalar(select(BotAdmin).where(
             BotAdmin.bot_id == bot_db_id, BotAdmin.user_id == user_id)))
+
+
+async def should_apply_antispam(bot_db_id: int, cfg: ChildBot, user_id: int) -> bool:
+    """Раньше антиспам ВСЕГДА пропускал и админов, и владельца — из-за этого
+    при проверке настроек владельцем казалось, что антиспам "не работает".
+    Теперь: обычные админы по-прежнему не проверяются (иначе они не смогут
+    модерировать во время наплыва сообщений), а владелец проверяется или нет
+    в зависимости от `cfg.antispam_ignore_owner` (тоггл в настройках —
+    удобно, чтобы протестировать антиспам на себе)."""
+    if not cfg.antispam_enabled:
+        return False
+    is_admin = await is_bot_admin(bot_db_id, user_id)
+    if not is_admin:
+        return True
+    if cfg.owner_id == user_id and not cfg.antispam_ignore_owner:
+        return True
+    return False
 
 
 # =========================================================================
@@ -289,18 +307,25 @@ async def send_with_keyboards(m: Message, text: str, ikb, rkb, photo: str | None
     не роняем весь апдейт, а тихо откатываемся на отправку текста.
     """
     PHOTO_CAPTION_LIMIT = 1024
+    # БАГ: если текст приветствия пуст (например, владелец прислал фото без
+    # подписи) И отправка фото падает (невалидный для этого бота file_id —
+    # см. комментарий выше), старый код делал `if text else None` — при
+    # пустом text это давало None и ЮЗЕР НЕ ПОЛУЧАЛ ВООБЩЕ НИЧЕГО на /start,
+    # без единой ошибки в логах. Теперь всегда гарантируем хоть какое-то
+    # сообщение — при пустом тексте подставляем нейтральный плейсхолдер.
+    safe_text = text if text and text.strip() else f"{em('wave')} Привет!"
     if photo:
         try:
-            if len(text) <= PHOTO_CAPTION_LIMIT:
-                msg = await m.answer_photo(photo, caption=text, reply_markup=ikb or rkb)
+            if len(safe_text) <= PHOTO_CAPTION_LIMIT:
+                msg = await m.answer_photo(photo, caption=safe_text, reply_markup=ikb or rkb)
             else:
                 await m.answer_photo(photo)
-                msg = await m.answer(text, reply_markup=ikb or rkb)
+                msg = await m.answer(safe_text, reply_markup=ikb or rkb)
         except TelegramBadRequest as e:
             log.warning("send_with_keyboards: не смог отправить фото (%s), шлю только текст", e)
-            msg = await m.answer(text, reply_markup=ikb or rkb) if text else None
+            msg = await m.answer(safe_text, reply_markup=ikb or rkb)
     else:
-        msg = await m.answer(text, reply_markup=ikb or rkb)
+        msg = await m.answer(safe_text, reply_markup=ikb or rkb)
     if ikb and rkb:
         await m.answer(f"{em('gear')} Меню", reply_markup=rkb)
     return msg
@@ -535,20 +560,76 @@ async def _mirror_reaction(bot: Bot, chat_id: int, message_id: int, reactions):
         pass
 
 
+# Защита от того, что один и тот же апдейт с /ban, /warn, /unban, /unwarn
+# обработается дважды (например если сеть/Telegram ретраит доставку, или
+# апдейт долетел до бота более одного раза) — тогда бан/варн "не работает",
+# т.к. warn+autoban сразу гасится следующим unwarn и т.п. Держим в памяти
+# последние обработанные (bot_db_id, message_id) недолго — этого достаточно,
+# ретраи приходят почти сразу друг за другом.
+_recent_mod_cmds: dict[tuple[int, int], float] = {}
+_MOD_CMD_DEDUP_TTL = 30.0
+
+
+def _mod_cmd_already_handled(bot_db_id: int, message_id: int) -> bool:
+    now = _time.monotonic()
+    key = (bot_db_id, message_id)
+    # чистим старое, чтобы словарь не рос бесконечно
+    stale = [k for k, ts in _recent_mod_cmds.items() if now - ts > _MOD_CMD_DEDUP_TTL]
+    for k in stale:
+        _recent_mod_cmds.pop(k, None)
+    if key in _recent_mod_cmds:
+        return True
+    _recent_mod_cmds[key] = now
+    return False
+
+
+async def _target_from_reply(bot_db_id: int, m: Message) -> int | None:
+    """Если /ban, /warn и т.п. отправлены РЕПЛАЕМ на копию сообщения
+    пользователя в админ-чате (топик или нет — не важно), достаём айди
+    пользователя из MsgMap, чтобы не приходилось вручную вводить ID."""
+    if not m.reply_to_message:
+        return None
+    async with Session() as s:
+        mp = await s.scalar(select(MsgMap).where(
+            MsgMap.bot_id == bot_db_id,
+            MsgMap.admin_chat_msg_id == m.reply_to_message.message_id))
+    return mp.user_id if mp else None
+
+
 def build_common_router() -> Router:
     r = Router()
 
     # ---------- модерация (работает и в ЛС, и в админ-чате) ----------
+    # /ban, /warn, /unban, /unwarn можно писать РЕПЛАЕМ на сообщение
+    # пользователя в админ-чате (с топиками или без) — тогда ID не нужен,
+    # причина/срок передаются как есть в аргументах. Без реплая работает
+    # как раньше — первым словом обязателен числовой Telegram ID.
     @r.message(Command("ban"))
     async def cmd_ban(m: Message, command: CommandObject, bot_db_id: int, bot: Bot):
         if not await is_bot_admin(bot_db_id, m.from_user.id):
             return
-        parsed = mod.parse_ban_args(command.args or "")
-        if not parsed:
-            await m.answer(f"{em('info')} Формат: <code>/ban 123456 Причина 7d</code>\n"
-                           "Сроки: m/h/d/w/y/perm")
+        if _mod_cmd_already_handled(bot_db_id, m.message_id):
             return
-        uid, reason, dur = parsed
+        reply_uid = await _target_from_reply(bot_db_id, m)
+        if reply_uid is not None:
+            args = command.args or ""
+            reason, dur = "Не указана", "perm"
+            if args.strip():
+                parts = args.split()
+                if parts and mod.DURATION_RE.match(parts[-1]):
+                    dur = parts.pop()
+                if parts:
+                    reason = " ".join(parts)
+            uid = reply_uid
+        else:
+            parsed = mod.parse_ban_args(command.args or "")
+            if not parsed:
+                await m.answer(f"{em('info')} Формат: <code>/ban 123456 Причина 7d</code>\n"
+                               "Сроки: m/h/d/w/y/perm\n"
+                               "Или ответьте (реплай) на сообщение пользователя в "
+                               "админ-чате командой <code>/ban Причина 7d</code> без ID.")
+                return
+            uid, reason, dur = parsed
         text = await mod.ban_user(bot_db_id, uid, reason, dur,
                                   m.from_user.id, m.from_user.username)
         await m.answer(f"{em('no_entry')} " + text)
@@ -560,9 +641,17 @@ def build_common_router() -> Router:
     async def cmd_unban(m: Message, command: CommandObject, bot_db_id: int, bot: Bot):
         if not await is_bot_admin(bot_db_id, m.from_user.id):
             return
-        if not command.args or not command.args.split()[0].isdigit():
-            await m.answer("Формат: <code>/unban 123456</code>"); return
-        uid = int(command.args.split()[0])
+        if _mod_cmd_already_handled(bot_db_id, m.message_id):
+            return
+        reply_uid = await _target_from_reply(bot_db_id, m)
+        if reply_uid is not None:
+            uid = reply_uid
+        elif command.args and command.args.split()[0].isdigit():
+            uid = int(command.args.split()[0])
+        else:
+            await m.answer("Формат: <code>/unban 123456</code> либо реплай на "
+                           "сообщение пользователя командой <code>/unban</code> без ID.")
+            return
         text = await mod.unban_user(bot_db_id, uid, m.from_user.id, m.from_user.username)
         await m.answer(f"{em('check')} " + text)
         await _notify_user(bot, uid, f"{em('check')} Вы разбанены в этом боте, снова можно писать.")
@@ -571,11 +660,20 @@ def build_common_router() -> Router:
     async def cmd_warn(m: Message, command: CommandObject, bot_db_id: int, bot: Bot):
         if not await is_bot_admin(bot_db_id, m.from_user.id):
             return
-        parts = (command.args or "").split(maxsplit=1)
-        if not parts or not parts[0].isdigit():
-            await m.answer("Формат: <code>/warn 123456 Причина</code>"); return
-        uid = int(parts[0])
-        reason = parts[1] if len(parts) > 1 else "Не указана"
+        if _mod_cmd_already_handled(bot_db_id, m.message_id):
+            return
+        reply_uid = await _target_from_reply(bot_db_id, m)
+        if reply_uid is not None:
+            uid = reply_uid
+            reason = (command.args or "").strip() or "Не указана"
+        else:
+            parts = (command.args or "").split(maxsplit=1)
+            if not parts or not parts[0].isdigit():
+                await m.answer("Формат: <code>/warn 123456 Причина</code> либо реплай на "
+                               "сообщение пользователя командой <code>/warn Причина</code> без ID.")
+                return
+            uid = int(parts[0])
+            reason = parts[1] if len(parts) > 1 else "Не указана"
         text, autoban = await mod.warn_user(bot_db_id, uid, reason,
                                             m.from_user.id, m.from_user.username)
         await m.answer(f"{em('warn')} " + text)
@@ -588,9 +686,17 @@ def build_common_router() -> Router:
     async def cmd_unwarn(m: Message, command: CommandObject, bot_db_id: int, bot: Bot):
         if not await is_bot_admin(bot_db_id, m.from_user.id):
             return
-        if not command.args or not command.args.split()[0].isdigit():
-            await m.answer("Формат: <code>/unwarn 123456</code>"); return
-        uid = int(command.args.split()[0])
+        if _mod_cmd_already_handled(bot_db_id, m.message_id):
+            return
+        reply_uid = await _target_from_reply(bot_db_id, m)
+        if reply_uid is not None:
+            uid = reply_uid
+        elif command.args and command.args.split()[0].isdigit():
+            uid = int(command.args.split()[0])
+        else:
+            await m.answer("Формат: <code>/unwarn 123456</code> либо реплай на "
+                           "сообщение пользователя командой <code>/unwarn</code> без ID.")
+            return
         text = await mod.unwarn_user(bot_db_id, uid, m.from_user.id, m.from_user.username)
         await m.answer(f"{em('check')} " + text)
         await _notify_user(bot, uid, f"{em('check')} С вас снято предупреждение.")
