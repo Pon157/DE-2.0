@@ -125,6 +125,20 @@ async def init_db():
         # какой-то причине не сработает на конкретной инсталляции).
         'ALTER TABLE child_bots ALTER COLUMN restart_creates_new_ticket DROP NOT NULL',
         'ALTER TABLE child_bots ALTER COLUMN open_ticket_button_text DROP NOT NULL',
+        # ---- антиспам (rate-limit / капча / прогрессирующие тайм-ауты) ----
+        "ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS req_window_start TIMESTAMP",
+        "ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS req_window_count INTEGER DEFAULT 0",
+        "ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS total_requests INTEGER DEFAULT 0",
+        "ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS captcha_pending BOOLEAN DEFAULT false",
+        "ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS captcha_answer VARCHAR(8)",
+        "ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS captcha_asked_at TIMESTAMP",
+        "ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS spam_strikes INTEGER DEFAULT 0",
+        "ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS throttled_until TIMESTAMP",
+        # ---- настраиваемые в конструкторе пороги антиспама на бота ----
+        "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS antispam_enabled BOOLEAN DEFAULT true",
+        "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS rate_limit_max INTEGER DEFAULT 6",
+        "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS rate_limit_window INTEGER DEFAULT 10",
+        "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS captcha_every INTEGER DEFAULT 20",
     ):
         await _exec(stmt)
 
