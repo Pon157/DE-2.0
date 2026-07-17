@@ -208,3 +208,46 @@ class BotManager:
 
 
 manager = BotManager()
+
+
+async def reupload_photo_for_bot(source_bot: Bot, bot_id: int, file_id: str,
+                                 target_chat_id: int) -> str | None:
+    """Конвертирует file_id, полученный ЧЕРЕЗ ОДНОГО бота (например мастер-бот
+    при настройке в конструкторе), в file_id, валидный для ДОЧЕРНЕГО бота.
+
+    Корень бага "wrong file identifier/HTTP URL specified": file_id в
+    Telegram Bot API привязан к конкретному боту, которым файл был получен.
+    Когда владелец присылает фото приветствия/кнопки МАСТЕР-боту, а его потом
+    пытается отправить ДОЧЕРНИЙ бот (другой токен) — Telegram отвечает
+    ошибкой, потому что для него это чужой, непонятный идентификатор.
+
+    Единственный способ "перенести" файл между ботами — скачать его байты и
+    заново загрузить от имени целевого бота. Отправляем результат в личный
+    чат владельца (target_chat_id) и сразу удаляем служебное сообщение —
+    остаётся только новый, валидный для ДОЧЕРНЕГО бота file_id.
+
+    Возвращает None, если конвертация не удалась (например, владелец ещё ни
+    разу не писал дочернему боту, и слать ему нельзя — Forbidden). В этом
+    случае вызывающий код должен либо не сохранять фото, либо сохранить
+    исходный file_id как best-effort (тогда сработает defensive fallback в
+    child/common.py::send_with_keyboards — приветствие уйдёт текстом, без
+    падения, но без фото).
+    """
+    child_bot = manager.bots.get(bot_id)
+    if not child_bot:
+        return None
+    try:
+        from aiogram.types import BufferedInputFile
+        tg_file = await source_bot.get_file(file_id)
+        buf = await source_bot.download_file(tg_file.file_path)
+        input_file = BufferedInputFile(buf.read(), filename="photo.jpg")
+        sent = await child_bot.send_photo(target_chat_id, input_file)
+        try:
+            await child_bot.delete_message(target_chat_id, sent.message_id)
+        except Exception:
+            pass  # неважно, удалилось служебное сообщение или нет — file_id уже получен
+        return sent.photo[-1].file_id
+    except Exception as e:
+        log.warning("reupload_photo_for_bot: не удалось перенести file_id для бота %s: %s",
+                   bot_id, e)
+        return None
