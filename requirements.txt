@@ -4,3 +4,4 @@ asyncpg>=0.29
 Pillow>=10.0
 python-dotenv>=1.0
 yookassa>=3.5
+cryptography>=42.0
