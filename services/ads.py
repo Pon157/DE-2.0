@@ -50,16 +50,20 @@ async def bot_is_pro_protected(bot_id: int) -> bool:
     return await referrals.is_pro(cb.owner_id)
 
 
-async def create_impressions_ad(buyer_id: int, source_bot_id: int, text: str,
-                                media_file_id: str | None, media_type: str | None,
+async def create_impressions_ad(buyer_id: int, source_bot_id: int | None, text: str,
                                 impressions: int) -> Advertisement | None:
-    if await bot_is_pro_protected(source_bot_id):
+    """source_bot_id=None -> реклама показывается в /start ВО ВСЕХ активных
+    ботах платформы (кроме Pro-владельцев), а не только в одном выбранном.
+    БАГ (по запросу "убери медиа у рекламных постов"): раньше сюда же
+    принимались media_file_id/media_type — теперь реклама только текстовая,
+    это упрощает модерацию и не даёт разместить потенциально запрещённый
+    визуал в чужих ботах без проверки."""
+    if source_bot_id is not None and await bot_is_pro_protected(source_bot_id):
         return None  # у владельца Pro — реклама в этот бот недоступна
     price = price_for_impressions(impressions)
     async with Session() as s:
         ad = Advertisement(buyer_id=buyer_id, source_bot_id=source_bot_id,
                            kind=AdKind.impressions, text=text,
-                           media_file_id=media_file_id, media_type=media_type,
                            target_impressions=impressions, price_rub=price,
                            status=AdStatus.pending)
         s.add(ad)
@@ -68,8 +72,7 @@ async def create_impressions_ad(buyer_id: int, source_bot_id: int, text: str,
         return ad
 
 
-async def create_broadcast_ad(buyer_id: int, source_bot_id: int, text: str,
-                              media_file_id: str | None, media_type: str | None) -> Advertisement | None:
+async def create_broadcast_ad(buyer_id: int, source_bot_id: int, text: str) -> Advertisement | None:
     """Возвращает None, если ещё действует кулдаун 5 дней."""
     async with Session() as s:
         cd = await s.scalar(select(AdCooldown).where(AdCooldown.buyer_id == buyer_id))
@@ -77,7 +80,6 @@ async def create_broadcast_ad(buyer_id: int, source_bot_id: int, text: str,
             return None
         ad = Advertisement(buyer_id=buyer_id, source_bot_id=source_bot_id,
                            kind=AdKind.broadcast, text=text,
-                           media_file_id=media_file_id, media_type=media_type,
                            price_rub=BROADCAST_PRICE_RUB, status=AdStatus.pending)
         s.add(ad)
         await s.commit()
@@ -144,18 +146,16 @@ async def mark_paid(ad_id: int, payment_id: str) -> Advertisement | None:
 
 
 async def get_active_ad_for_display(bot_id: int) -> Advertisement | None:
-    """Случайная активная реклама с показами в запасе — ТОЛЬКО для конкретного
-    бота (source_bot_id), в котором она куплена. Раньше показ рекламы не был
-    привязан к боту вообще и одна и та же кампания светилась сразу во ВСЕХ
-    ботах платформы — это и была причина бага "показы во всех ботах вместо
-    определённых". Также не показываем рекламу, если владелец бота — Pro."""
+    """Случайная активная реклама с показами в запасе — для КОНКРЕТНОГО бота
+    (source_bot_id == bot_id) ИЛИ показ "во всех ботах" (source_bot_id IS
+    NULL). Не показываем рекламу, если владелец бота — Pro."""
     if await bot_is_pro_protected(bot_id):
         return None
     async with Session() as s:
         ads = (await s.scalars(select(Advertisement).where(
             Advertisement.status == AdStatus.active,
             Advertisement.kind == AdKind.impressions,
-            Advertisement.source_bot_id == bot_id))).all()
+            (Advertisement.source_bot_id == bot_id) | (Advertisement.source_bot_id.is_(None))))).all()
         ads = [a for a in ads if a.shown_count < a.target_impressions]
         if not ads:
             return None
@@ -198,3 +198,52 @@ async def list_active_bots() -> list[ChildBot]:
             continue
         result.append(cb)
     return result
+
+
+# =========================================================================
+# ===================   Рекламный кабинет покупателя   ===================
+# =========================================================================
+async def list_my_ads(buyer_id: int) -> list[Advertisement]:
+    """Все кампании конкретного покупателя — для "🎯 Мои кампании"."""
+    async with Session() as s:
+        return list((await s.scalars(select(Advertisement).where(
+            Advertisement.buyer_id == buyer_id
+        ).order_by(Advertisement.created_at.desc()))).all())
+
+
+async def my_spend_total(buyer_id: int) -> int:
+    """Сколько всего потрачено (только реально оплаченные кампании)."""
+    async with Session() as s:
+        ads = (await s.scalars(select(Advertisement).where(
+            Advertisement.buyer_id == buyer_id, Advertisement.paid.is_(True)))).all()
+    return sum(a.price_rub for a in ads)
+
+
+async def get_ad_for_owner(ad_id: int, buyer_id: int) -> Advertisement | None:
+    async with Session() as s:
+        ad = await s.get(Advertisement, ad_id)
+    if not ad or ad.buyer_id != buyer_id:
+        return None
+    return ad
+
+
+async def extend_ad(ad_id: int, buyer_id: int, extra_impressions: int) -> Advertisement | None:
+    """"Продлить" кампанию — докупить ещё показов к УЖЕ ИСЧЕРПАННОЙ
+    impressions-кампании (kind=impressions, status=finished). Специально не
+    позволяем продлевать ещё АКТИВНУЮ кампанию через смену статуса на
+    awaiting_payment — это бы прервало её текущий показ до новой оплаты.
+    Для активной кампании корректный путь — просто дождаться, пока она
+    закончится, либо купить новую через /ads."""
+    async with Session() as s:
+        ad = await s.get(Advertisement, ad_id)
+        if not ad or ad.buyer_id != buyer_id or ad.kind != AdKind.impressions:
+            return None
+        if ad.status != AdStatus.finished:
+            return None
+        ad.target_impressions += extra_impressions
+        ad.price_rub += price_for_impressions(extra_impressions)
+        ad.status = AdStatus.awaiting_payment  # новая оплата за добавленные показы
+        ad.paid = False
+        await s.commit()
+        await s.refresh(ad)
+        return ad
