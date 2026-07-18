@@ -37,6 +37,10 @@ def build_feedback_router() -> Router:
 
     @r.message(Command("restart"), F.chat.type == "private")
     async def restart(m: Message, bot: Bot, bot_db_id: int):
+        # БАГ: /restart не проверял бан вообще — забаненный пользователь мог
+        # открыть новое обращение и снова писать в обход бана.
+        if await mod.is_banned(bot_db_id, m.from_user.id):
+            return
         cfg = await _cfg(bot_db_id)
         await open_ticket(bot, cfg, m.from_user.id, force_new=True)
         await m.answer(f"{em('new')} Новое обращение открыто!"
