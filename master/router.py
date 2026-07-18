@@ -8,7 +8,7 @@ from aiogram.utils.token import validate_token
 from sqlalchemy import select
 from db.base import Session
 from db.models import (ChildBot, BotAdmin, BotButton, BotType, OpenMode, ForwardMode,
-                       Advertisement, AdKind)
+                       Advertisement, AdKind, PlatformUser)
 from services.bot_manager import manager, reupload_photo_for_bot as manager_reupload
 from services.broadcast import run_broadcast
 from services.stats_image import build_stats_image
@@ -58,6 +58,12 @@ async def _master_guard_message(handler, event: Message, data: dict):
             return  # забанен в конструкторе — молча игнорируем
         if not await _router_antispam_allowed(uid):
             return  # флуд — молча игнорируем (без наказания, просто троттлинг)
+        # Капча — ПОКАЗЫВАЕТСЯ ВСЕМ, включая владельца/SUPER_ADMIN_ID, без
+        # исключений (раньше в master-роутере капчи не было вообще).
+        notice = await mod.check_platform_captcha(uid, event.text)
+        if notice is not None:
+            await event.answer(notice)
+            return
     return await handler(event, data)
 
 
@@ -106,6 +112,7 @@ class St(StatesGroup):
     tpl_btn_edit = State()
     tpl_btn_style = State()
     tpl_btn_icon = State()
+    ap_ban_add = State()
     ban_by_id = State()
     antispam_cfg = State()
 
@@ -431,6 +438,8 @@ async def cfg_menu(c: CallbackQuery):
             [("🧵 Топики в чате админов: " + ("вкл" if cb.use_topics else "выкл"),
               f"cyc_topics:{bot_id}"), ("🧵 Имя топика", f"topicname:{bot_id}")],
             [("📬 Публикация в канал: " + cb.channel_delivery_mode, f"cyc_delivery:{bot_id}")],
+            [(f"📤 Как публикуется: {'пересылка' if cb.channel_publish_mode == 'forward' else 'копия'}",
+              f"cyc_pubmode:{bot_id}")],
             [(f"⚠️ Лимит варнов: {cb.warn_limit}", f"warnlim:{bot_id}")],
             [(f"🛡 Антиспам: {'вкл' if cb.antispam_enabled else 'выкл'}", f"cyc_antispam:{bot_id}"),
              ("🛡 Пороги", f"antispamcfg:{bot_id}")],
@@ -452,6 +461,7 @@ CYCLES = {
     "cyc_sugg": ("accept_suggestions", [False, True]),
     "cyc_newticket": ("always_new_ticket", [False, True]),
     "cyc_delivery": ("channel_delivery_mode", ["template", "copy"]),
+    "cyc_pubmode": ("channel_publish_mode", ["copy", "forward"]),
     # шапка в админ-чате: отдельным сообщением / слитно с сообщением / выкл
     "cyc_header": ("header_mode", ["separate", "merge", "off"]),
     "cyc_antispam": ("antispam_enabled", [True, False]),
@@ -1361,12 +1371,25 @@ async def restartbot(c: CallbackQuery):
     т.п.) — раньше manager.restart_bot() существовал, но нигде не
     вызывался: единственным способом "перезапустить" было дважды нажать
     Вкл/выкл, и это не помогало при зависшем поллинге (см. фикс
-    _stop_bot_locked в services/bot_manager.py)."""
+    _stop_bot_locked в services/bot_manager.py).
+
+    БАГ "конфликты при перезапуске выключенного бота": manager.restart_bot()
+    сам по себе рестартует только УЖЕ включённого бота (is_active=True) —
+    если бот выключен, старая версия просто тихо ничего не делала, и было
+    неочевидно, что произошло (человек жал ещё раз, слал новые команды —
+    как раз тут и рождались гонки/конфликты). Теперь "Перезапустить" ведёт
+    себя однозначно: бот ВСЕГДА гарантированно включается и поднимает
+    чистый поллинг, независимо от того, был он включён или выключен."""
     bot_id = int(c.data.split(":")[1])
     cb, is_owner = await _access(bot_id, c.from_user.id)
     if not cb or not is_owner:
         return
     await c.answer(f"{em('refresh')} Перезапускаю…")
+    if not cb.is_active:
+        async with Session() as s:
+            obj = await s.get(ChildBot, bot_id)
+            obj.is_active = True
+            await s.commit()
     await manager.restart_bot(bot_id)
     c_new = c.model_copy(update={"data": f"bot:{bot_id}"})
     await bot_menu(c_new)
@@ -1431,9 +1454,83 @@ async def ap_menu(c: CallbackQuery):
             [("🤖 Все боты", "ap_bots:0")],
             [("📊 Общая статистика", "ap_stats")],
             [("📢 Разослать во все боты", "ap_bc")],
+            [("🚫 Бан в конструкторе", "ap_ban:0")],
             [("⬅️ Назад", "main")],
         ]))
     await c.answer()
+
+
+@router.callback_query(F.data.startswith("ap_ban:"))
+async def ap_ban_menu(c: CallbackQuery):
+    """Раньше бан в конструкторе был доступен ТОЛЬКО командами
+    /banconstructor и /unbanconstructor без единой кнопки в интерфейсе —
+    теперь полноценный раздел в админ-панели: список забаненных + кнопка
+    забанить по ID."""
+    if not _is_super(c.from_user.id):
+        await c.answer("Нет доступа", show_alert=True); return
+    page = int(c.data.split(":")[1])
+    per_page = 10
+    async with Session() as s:
+        banned = (await s.scalars(select(PlatformUser).where(
+            PlatformUser.is_banned == True).order_by(PlatformUser.banned_at.desc()))).all()
+    chunk = banned[page * per_page:(page + 1) * per_page]
+    rows = [[(f"🚫 {u.id} — {(u.ban_reason or 'без причины')[:20]}", f"ap_unban:{u.id}")]
+            for u in chunk]
+    nav = []
+    if page > 0:
+        nav.append((f"⬅️ Стр. {page}", f"ap_ban:{page-1}"))
+    if (page + 1) * per_page < len(banned):
+        nav.append((f"Стр. {page+2} ➡️", f"ap_ban:{page+1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([("➕ Забанить по ID", "ap_ban_add")])
+    rows.append([("⬅️ Назад", "ap")])
+    text = (f"{em('no_entry')} <b>Бан в конструкторе</b>\n"
+           f"Забанено: {len(banned)}. Нажмите на запись, чтобы разбанить.")
+    await c.message.edit_text(text, reply_markup=kb(rows))
+    await c.answer()
+
+
+@router.callback_query(F.data == "ap_ban_add")
+async def ap_ban_add_start(c: CallbackQuery, state: FSMContext):
+    if not _is_super(c.from_user.id):
+        await c.answer("Нет доступа", show_alert=True); return
+    await state.set_state(St.ap_ban_add)
+    msg = await c.message.edit_text(
+        f"{em('info')} Пришлите: <code>ID Причина</code> (причина необязательна)",
+        reply_markup=kb([[("⬅️ Назад", "ap_ban:0")]]))
+    await state.update_data(last_msg_id=msg.message_id)
+    await c.answer()
+
+
+@router.message(St.ap_ban_add)
+async def ap_ban_add_save(m: Message, state: FSMContext):
+    await delete_previous(m, state)
+    if not _is_super(m.from_user.id):
+        return
+    parts = (m.text or "").split(maxsplit=1)
+    if not parts or not parts[0].lstrip("-").isdigit():
+        msg = await m.answer(f"{em('warn')} Формат: <code>ID Причина</code>")
+        await state.update_data(last_msg_id=msg.message_id)
+        return
+    user_id = int(parts[0])
+    reason = parts[1] if len(parts) > 1 else "Не указана"
+    await mod.ban_platform_user(user_id, reason)
+    await state.clear()
+    c_fake_data = "ap_ban:0"
+    msg = await m.answer(f"{em('check')} Пользователь {user_id} забанен в конструкторе.",
+                         reply_markup=kb([[("⬅️ К списку", c_fake_data)]]))
+
+
+@router.callback_query(F.data.startswith("ap_unban:"))
+async def ap_unban(c: CallbackQuery):
+    if not _is_super(c.from_user.id):
+        await c.answer("Нет доступа", show_alert=True); return
+    user_id = int(c.data.split(":")[1])
+    await mod.unban_platform_user(user_id)
+    await c.answer(f"{em('check')} Разбанен")
+    c_new = c.model_copy(update={"data": "ap_ban:0"})
+    await ap_ban_menu(c_new)
 
 
 @router.callback_query(F.data.startswith("ap_bots:"))
