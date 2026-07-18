@@ -150,6 +150,15 @@ async def init_db():
         "ALTER TABLE platform_users ADD COLUMN IF NOT EXISTS captcha_pending BOOLEAN DEFAULT false",
         "ALTER TABLE platform_users ADD COLUMN IF NOT EXISTS captcha_answer VARCHAR(8)",
         "ALTER TABLE platform_users ADD COLUMN IF NOT EXISTS captcha_asked_at TIMESTAMP",
+        # реклама: source_bot_id теперь может быть NULL ("показ во всех ботах")
+        'ALTER TABLE advertisements ALTER COLUMN source_bot_id DROP NOT NULL',
+        # отслеживание пользователей, заблокировавших дочернего бота
+        "ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS blocked_bot BOOLEAN DEFAULT false",
+        "ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS blocked_at TIMESTAMP",
+        # согласие с политикой конфиденциальности/соглашением (по дочернему боту)
+        "ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS accepted_terms BOOLEAN DEFAULT false",
+        "ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS accepted_terms_at TIMESTAMP",
+        "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS require_terms_accept BOOLEAN DEFAULT true",
     ):
         await _exec(stmt)
 
