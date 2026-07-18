@@ -19,7 +19,6 @@ from db.base import Session
 from db.models import (ChildBot, BotAdmin, Donation, BotButton, OpenMode, ForwardMode,
                        BotUser, Ticket, MsgMap, MessageLog)
 from services import moderation as mod
-from child import legal
 from services import ads as ads_service
 from services import referrals
 from utils.emoji import em, styled_button
@@ -66,45 +65,6 @@ RESERVED_COMMANDS = {"start", "restart", "cancel", "donate", "newpost", "done",
 async def get_cfg(bot_db_id: int) -> ChildBot | None:
     async with Session() as s:
         return await s.get(ChildBot, bot_db_id)
-
-
-async def has_accepted_terms(bot_db_id: int, user_id: int) -> bool:
-    async with Session() as s:
-        u = await s.scalar(select(BotUser).where(
-            BotUser.bot_id == bot_db_id, BotUser.user_id == user_id))
-    return bool(u and u.accepted_terms)
-
-
-async def mark_terms_accepted(bot_db_id: int, user_id: int):
-    async with Session() as s:
-        u = await s.scalar(select(BotUser).where(
-            BotUser.bot_id == bot_db_id, BotUser.user_id == user_id))
-        if u:
-            u.accepted_terms = True
-            u.accepted_terms_at = datetime.utcnow()
-            await s.commit()
-
-
-async def send_terms_gate(m: Message, cfg: ChildBot):
-    """Экран согласия с политикой конфиденциальности/пользовательским
-    соглашением/политикой возвратов — показывается ОДИН РАЗ, до этого бот
-    не отправляет ни приветствие, ни что-либо ещё (см. вызовы в
-    child/feedback.py и child/posting.py: гейт стоит первым, до welcome и
-    до обработки любых сообщений)."""
-    await m.answer(legal.gate_text(cfg.username), reply_markup=InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="✅ Принимаю", callback_data="accept_terms")]]))
-
-
-async def terms_gate_blocks(bot_db_id: int, cfg: ChildBot, user_id: int) -> bool:
-    """True, если действие нужно ЗАБЛОКИРОВАТЬ (человек ещё не принял
-    условия) — вызывающий код должен показать гейт (если это /start) или
-    просто ничего не отвечать (для любых остальных сообщений/кнопок: "бот
-    не будет отправлять никакие сообщения, пока человек не примет") и
-    сразу выйти, не обрабатывая действие дальше."""
-    if not cfg.require_terms_accept:
-        return False
-    return not await has_accepted_terms(bot_db_id, user_id)
-
 
 async def is_bot_admin(bot_db_id: int, user_id: int) -> bool:
     async with Session() as s:
@@ -646,22 +606,6 @@ async def _target_from_reply(bot_db_id: int, m: Message) -> int | None:
 def build_common_router() -> Router:
     r = Router()
 
-    # ---------- /info: юр. документы — доступны в любой момент ----------
-    @r.message(Command("info"), F.chat.type == "private")
-    async def cmd_info(m: Message, bot_db_id: int):
-        cfg = await get_cfg(bot_db_id)
-        if not cfg:
-            return
-        await m.answer(legal.info_text(cfg.username))
-
-    # ---------- согласие с условиями (см. send_terms_gate) ----------
-    @r.callback_query(F.data == "accept_terms")
-    async def cb_accept_terms(c: CallbackQuery, bot_db_id: int):
-        await mark_terms_accepted(bot_db_id, c.from_user.id)
-        await c.message.edit_text(
-            f"{em('check')} Спасибо! Условия приняты. Отправьте /start, чтобы продолжить.")
-        await c.answer()
-
     # ---------- модерация (работает и в ЛС, и в админ-чате) ----------
     # /ban, /warn, /unban, /unwarn можно писать РЕПЛАЕМ на сообщение
     # пользователя в админ-чате (с топиками или без) — тогда ID не нужен,
@@ -791,9 +735,6 @@ def build_common_router() -> Router:
         cfg = await get_cfg(bot_db_id)
         if not cfg or not cfg.donate_enabled:
             return
-        if await terms_gate_blocks(bot_db_id, cfg, m.from_user.id):
-            await send_terms_gate(m, cfg)
-            return
         await state.set_state(DonateSt.amount)
         await m.answer(f"{em('star')} Введите количество звёзд для доната (1–10000):")
 
@@ -813,9 +754,6 @@ def build_common_router() -> Router:
             return
         cfg = await get_cfg(bot_db_id)
         if not cfg or not cfg.donate_enabled:
-            return
-        if await terms_gate_blocks(bot_db_id, cfg, m.from_user.id):
-            await send_terms_gate(m, cfg)
             return
         stars = int(m.text.strip())
         if not 1 <= stars <= 10000:
@@ -847,9 +785,6 @@ def build_common_router() -> Router:
         if not cfg or not cfg.donate_enabled:
             await c.answer()
             return
-        if await terms_gate_blocks(bot_db_id, cfg, c.from_user.id):
-            await c.answer("Сначала примите условия использования (/start).", show_alert=True)
-            return
         # БАГ (главный по репорту): после нажатия инлайн-кнопки доната НЕ
         # выставлялось состояние DonateSt.amount — введённое число не
         # обрабатывалось хендлером доната, а улетало в админ-чат как обычное
@@ -867,9 +802,6 @@ def build_common_router() -> Router:
             await c.answer("Вы забанены в этом боте.", show_alert=True)
             return
         cfg = await get_cfg(bot_db_id)
-        if cfg and await terms_gate_blocks(bot_db_id, cfg, c.from_user.id):
-            await c.answer("Сначала примите условия использования (/start).", show_alert=True)
-            return
         async with Session() as s:
             b = await s.get(BotButton, int(c.data.split(":")[1]))
         if b and (b.response_text or b.response_photo):
@@ -884,9 +816,6 @@ def build_common_router() -> Router:
             await c.answer("Вы забанены в этом боте.", show_alert=True)
             return
         cfg = await get_cfg(bot_db_id)
-        if cfg and await terms_gate_blocks(bot_db_id, cfg, c.from_user.id):
-            await c.answer("Сначала примите условия использования (/start).", show_alert=True)
-            return
         await open_ticket(bot, cfg, c.from_user.id, force_new=True)
         await c.answer("Обращение открыто! Напишите сообщение.", show_alert=True)
 
@@ -904,9 +833,6 @@ def build_common_router() -> Router:
         if await mod.is_banned(bot_db_id, m.from_user.id):
             return
         cfg = await get_cfg(bot_db_id)
-        if cfg and await terms_gate_blocks(bot_db_id, cfg, m.from_user.id):
-            await send_terms_gate(m, cfg)
-            return
         async with Session() as s:
             b = await s.scalar(select(BotButton).where(
                 BotButton.bot_id == bot_db_id, BotButton.kind == "command",
