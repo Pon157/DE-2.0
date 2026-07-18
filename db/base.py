@@ -87,6 +87,74 @@ async def _drop_stray_not_null_constraints():
                        table_name, col_name)
 
 
+async def _reencrypt_plaintext_tokens():
+    """Скрипт перешифровки: находит записи child_bots, где token ЕЩЁ
+    хранится открытым текстом (вида '123456789:AAAA...') — то есть созданные
+    до включения шифрования, — и на месте шифрует их + проставляет
+    token_fingerprint. Работает НАПРЯМУЮ через raw SQL, а не через ORM: если
+    прогнать через ORM-модель с уже подключённым EncryptedToken, она
+    попытается РАСШИФРОВАТЬ то, что на самом деле ещё открытый текст, и
+    упадёт. Идемпотентна — на уже зашифрованных записях ничего не делает,
+    поэтому безопасно гоняется при каждом старте приложения."""
+    from sqlalchemy import text
+    from utils import crypto
+
+    async with engine.begin() as conn:
+        try:
+            rows = (await conn.execute(text(
+                "SELECT id, token, token_fingerprint FROM child_bots"))).fetchall()
+        except Exception as e:
+            log.debug("Пропускаю перешифровку токенов (%s)", e)
+            return
+
+    migrated, backfilled_fp, broken = 0, 0, 0
+    for row in rows:
+        bot_id, token_value, fp_value = row.id, row.token, row.token_fingerprint
+        if crypto.looks_like_plaintext_token(token_value):
+            # Открытый текст — шифруем и сразу считаем отпечаток от
+            # оригинала (единственный момент, когда мы ещё видим plaintext).
+            encrypted = crypto.encrypt_token(token_value)
+            fp = crypto.token_fingerprint(token_value)
+            await _exec_params(
+                "UPDATE child_bots SET token = :t, token_fingerprint = :fp WHERE id = :id",
+                {"t": encrypted, "fp": fp, "id": bot_id})
+            migrated += 1
+        elif not fp_value:
+            # Уже зашифрован (например, прошлым запуском этой же функции),
+            # но по какой-то причине остался без отпечатка — расшифровываем
+            # только чтобы посчитать fingerprint, сам токен не трогаем.
+            if not crypto.is_valid_ciphertext(token_value):
+                broken += 1
+                log.error("child_bots.id=%s: токен не расшифровывается текущим "
+                         "TOKEN_ENCRYPTION_KEY и не похож на открытый текст — "
+                         "пропускаю (проверьте, не сменился ли ключ шифрования).", bot_id)
+                continue
+            plain = crypto.decrypt_token(token_value)
+            fp = crypto.token_fingerprint(plain)
+            await _exec_params(
+                "UPDATE child_bots SET token_fingerprint = :fp WHERE id = :id",
+                {"fp": fp, "id": bot_id})
+            backfilled_fp += 1
+
+    if migrated or backfilled_fp:
+        log.warning("Токены ботов: перешифровано %s, доставлен fingerprint для %s "
+                   "(без изменений: %s, битых: %s)",
+                   migrated, backfilled_fp, len(rows) - migrated - backfilled_fp - broken, broken)
+
+
+async def _exec_params(stmt: str, params: dict):
+    """Как _exec, но с именованными параметрами (для UPDATE с реальными
+    данными — не строим SQL конкатенацией строк)."""
+    from sqlalchemy import text
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text(stmt), params)
+        return True
+    except Exception as e:
+        log.debug("Migration statement (params) failed: %s", e)
+        return False
+
+
 async def init_db():
     from db import models  # noqa — регистрирует все модели в Base.metadata
 
@@ -158,6 +226,24 @@ async def init_db():
         # (дочерние боты) без миграции модели — падало AttributeError.
         "ALTER TABLE platform_users ADD COLUMN IF NOT EXISTS accepted_terms BOOLEAN DEFAULT false",
         "ALTER TABLE platform_users ADD COLUMN IF NOT EXISTS accepted_terms_at TIMESTAMP",
+        # ---- шифрование токенов дочерних ботов (см. utils/crypto.py) ----
+        # Расширяем колонку под шифротекст (заметно длиннее сырого токена)
+        # и добавляем отдельный детерминированный отпечаток для поиска
+        # дублей, раз сам зашифрованный токен для этого больше не годится.
+        "ALTER TABLE child_bots ALTER COLUMN token TYPE VARCHAR(512)",
+        "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS token_fingerprint VARCHAR(64)",
+    ):
+        await _exec(stmt)
+
+    # Перешифровка ещё не зашифрованных (старых, открытых) токенов + бэкфилл
+    # token_fingerprint — см. докстринг функции. Идёт ПОСЛЕ ALTER-ов выше
+    # (нужна расширенная колонка) и ДО попытки навесить UNIQUE-индекс ниже
+    # (нужны заполненные значения, иначе индекс создать не получится).
+    await _reencrypt_plaintext_tokens()
+
+    for stmt in (
+        "CREATE UNIQUE INDEX IF NOT EXISTS ix_child_bots_token_fingerprint "
+        "ON child_bots (token_fingerprint)",
     ):
         await _exec(stmt)
 
