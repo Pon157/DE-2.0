@@ -288,6 +288,10 @@ class PlatformUser(Base):
     captcha_pending: Mapped[bool] = mapped_column(Boolean, default=False)
     captcha_answer: Mapped[str | None] = mapped_column(String(8), nullable=True)
     captcha_asked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # ---- согласие с политикой конфиденциальности / пользовательским
+    # соглашением / политикой возвратов КОНСТРУКТОРА (не дочерних ботов) ----
+    accepted_terms: Mapped[bool] = mapped_column(Boolean, default=False)
+    accepted_terms_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class ReferralEvent(Base):
