@@ -61,6 +61,11 @@ class ChildBot(Base):
     post_template: Mapped[str] = mapped_column(Text, default="{text}")
     template_buttons_json: Mapped[str | None] = mapped_column(Text, nullable=True)  # кнопки на КАЖДЫЙ пост
     channel_delivery_mode: Mapped[str] = mapped_column(String(10), default="template")  # template|copy
+    # Отдельный переключатель: КАК именно контент уходит в канал при
+    # подтверждённой публикации — "copy" (bot.copy_message/copy_messages,
+    # без пометки "Forwarded from") или "forward" (bot.forward_message/
+    # forward_messages, с пометкой). Раньше это было жёстко зашито на copy.
+    channel_publish_mode: Mapped[str] = mapped_column(String(10), default="copy")  # copy|forward
 
     # ---- антиспам (services/antispam.py) ----
     antispam_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -275,6 +280,12 @@ class PlatformUser(Base):
     is_banned: Mapped[bool] = mapped_column(Boolean, default=False)
     ban_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     banned_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # ---- капча в САМОМ КОНСТРУКТОРЕ (master-боте) — показывается ВСЕМ,
+    # включая владельца/SUPER_ADMIN_ID, каждые CAPTCHA_EVERY запросов ----
+    total_requests: Mapped[int] = mapped_column(Integer, default=0)
+    captcha_pending: Mapped[bool] = mapped_column(Boolean, default=False)
+    captcha_answer: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    captcha_asked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class ReferralEvent(Base):
