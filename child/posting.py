@@ -159,9 +159,11 @@ async def _publish_via_copy(bot: Bot, cfg: ChildBot, source_chat_id: int,
     - "copy"    — bot.copy_message/copy_messages (без пометки "Forwarded from").
     - "forward" — bot.forward_message/forward_messages (с пометкой источника).
       ВАЖНО: forward_message/forward_messages НЕ поддерживают reply_markup
-      вообще (ограничение Bot API) — если у поста есть кнопки, их всё равно
-      приходится слать отдельным сообщением через copy_message (у которого
-      reply_markup есть всегда, независимо от исходного типа контента).
+      вообще (ограничение Bot API) — если у поста есть кнопки, контент всё
+      равно ПЕРЕСЫЛАЕТСЯ (не копируется), а кнопки уходят отдельным
+      сообщением следом. Раньше при наличии кнопок код тихо переключался на
+      copy_message целиком — из-за этого режим "пересылка" фактически не
+      работал почти ни для одного поста (у большинства есть кнопки шаблона).
     """
     target_chat_id = cfg.channel_id
     forward = cfg.channel_publish_mode == "forward"
@@ -172,11 +174,21 @@ async def _publish_via_copy(bot: Bot, cfg: ChildBot, source_chat_id: int,
             await bot.copy_messages(target_chat_id, source_chat_id, result.album_ids)
     for mid in result.single_ids:
         has_buttons = mid == result.buttons_on
-        if forward and not has_buttons:
+        if forward:
+            # БАГ (главный, по репорту "режим forward, а бот всё равно
+            # копирует"): раньше ЛЮБОЕ сообщение с кнопками — а кнопки
+            # шаблона обычно есть почти у каждого поста — тихо уходило в
+            # else-ветку и копировалось, вообще игнорируя forward. То есть
+            # если у бота настроены кнопки шаблона, режим "пересылка"
+            # НИКОГДА фактически не срабатывал. forward_message
+            # действительно не умеет reply_markup (ограничение Bot API),
+            # но это не повод молча переключаться на copy — вместо этого
+            # пересылаем контент КАК ЕСТЬ, а кнопки (если были) шлём
+            # отдельным сообщением следом, а не заменяем пересылку копией.
             await bot.forward_message(target_chat_id, source_chat_id, mid)
+            if has_buttons and markup:
+                await bot.send_message(target_chat_id, "🔘", reply_markup=markup)
         else:
-            # либо это сообщение с кнопками (forward их всё равно не
-            # довезёт — используем copy), либо режим "copy" целиком.
             rm = markup if has_buttons else None
             await bot.copy_message(target_chat_id, source_chat_id, mid, reply_markup=rm)
 
