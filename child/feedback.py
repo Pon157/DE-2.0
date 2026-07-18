@@ -9,7 +9,7 @@ from services import antispam
 from child.common import (inject_extras, build_keyboards, send_with_keyboards,
                           handle_keyboard_button, open_ticket, get_cfg,
                           buffer_or_process, relay_to_admin_chat, is_bot_admin,
-                          should_apply_antispam, terms_gate_blocks, send_terms_gate)
+                          should_apply_antispam)
 from utils.emoji import em
 
 
@@ -29,13 +29,6 @@ def build_feedback_router() -> Router:
             await s.commit()
         if await mod.is_banned(bot_db_id, m.from_user.id):
             return
-        # БАГ (по запросу): бот отправлял приветствие ДО согласия с
-        # политикой конфиденциальности/соглашением/политикой возвратов —
-        # теперь /start сначала показывает экран согласия и ничего больше
-        # не делает, пока человек не нажмёт "Принимаю".
-        if await terms_gate_blocks(bot_db_id, cfg, m.from_user.id):
-            await send_terms_gate(m, cfg)
-            return
         ikb, rkb = await build_keyboards(bot_db_id, cfg)
         welcome = await inject_extras(bot_db_id, cfg.welcome_text)
         await send_with_keyboards(m, welcome, ikb, rkb, photo=cfg.welcome_photo)
@@ -49,9 +42,6 @@ def build_feedback_router() -> Router:
         if await mod.is_banned(bot_db_id, m.from_user.id):
             return
         cfg = await _cfg(bot_db_id)
-        if await terms_gate_blocks(bot_db_id, cfg, m.from_user.id):
-            await send_terms_gate(m, cfg)
-            return
         await open_ticket(bot, cfg, m.from_user.id, force_new=True)
         await m.answer(f"{em('new')} Новое обращение открыто!"
                        if cfg.always_new_ticket else
@@ -70,9 +60,6 @@ def build_feedback_router() -> Router:
             await mod.get_or_create_user(s, bot_db_id, m.from_user)
             s.add(MessageLog(bot_id=bot_db_id, user_id=m.from_user.id, direction="in"))
             await s.commit()
-        if await terms_gate_blocks(bot_db_id, cfg, m.from_user.id):
-            await send_terms_gate(m, cfg)
-            return
         # Антиспам (rate-limit/капча/прогрессирующий тайм-аут) — обычных
         # админов не трогает, владельца — в зависимости от тоггла
         # cfg.antispam_ignore_owner (см. child/common.py::should_apply_antispam).
