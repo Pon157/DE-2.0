@@ -105,6 +105,7 @@ async def init_db():
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS always_new_ticket BOOLEAN DEFAULT false",
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS template_buttons_json TEXT",
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS channel_delivery_mode VARCHAR(10) DEFAULT 'template'",
+        "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS channel_publish_mode VARCHAR(10) DEFAULT 'copy'",
         "ALTER TABLE posts ADD COLUMN IF NOT EXISTS media_group_json TEXT",
         "ALTER TABLE posts ADD COLUMN IF NOT EXISTS origin_chat_id BIGINT",
         "ALTER TABLE posts ADD COLUMN IF NOT EXISTS origin_message_id BIGINT",
@@ -145,6 +146,10 @@ async def init_db():
         "ALTER TABLE platform_users ADD COLUMN IF NOT EXISTS is_banned BOOLEAN DEFAULT false",
         "ALTER TABLE platform_users ADD COLUMN IF NOT EXISTS ban_reason TEXT",
         "ALTER TABLE platform_users ADD COLUMN IF NOT EXISTS banned_at TIMESTAMP",
+        "ALTER TABLE platform_users ADD COLUMN IF NOT EXISTS total_requests INTEGER DEFAULT 0",
+        "ALTER TABLE platform_users ADD COLUMN IF NOT EXISTS captcha_pending BOOLEAN DEFAULT false",
+        "ALTER TABLE platform_users ADD COLUMN IF NOT EXISTS captcha_answer VARCHAR(8)",
+        "ALTER TABLE platform_users ADD COLUMN IF NOT EXISTS captcha_asked_at TIMESTAMP",
     ):
         await _exec(stmt)
 
