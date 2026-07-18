@@ -4,7 +4,30 @@ from datetime import datetime
 from sqlalchemy import (BigInteger, Boolean, DateTime, Enum, ForeignKey,
                         Integer, String, Text, UniqueConstraint, func)
 from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.types import TypeDecorator, String as SAString
 from db.base import Base
+from utils.crypto import encrypt_token, decrypt_token
+
+
+class EncryptedToken(TypeDecorator):
+    """Прозрачно шифрует токен бота на запись и расшифровывает на чтение —
+    весь остальной код (Bot(cb.token), run_broadcast(cb.token, ...) и т.п.)
+    продолжает работать как раньше, ничего не зная о шифровании. ВАЖНО:
+    так как Fernet НЕ детерминирован, эту колонку нельзя использовать в
+    `WHERE token = :значение` — для поиска/уникальности есть отдельная
+    колонка token_fingerprint (см. ChildBot ниже)."""
+    impl = SAString(512)
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return None
+        return encrypt_token(value)
+
+    def process_result_value(self, value, dialect):
+        if value is None:
+            return None
+        return decrypt_token(value)
 
 
 class BotType(str, enum.Enum):
@@ -27,12 +50,19 @@ class ChildBot(Base):
     __tablename__ = "child_bots"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     owner_id: Mapped[int] = mapped_column(BigInteger, index=True)
-    token: Mapped[str] = mapped_column(String(64), unique=True)
+    # БАГ (безопасность): токен раньше хранился в БД открытым текстом —
+    # утечка дампа = скомпрометированы все боты платформы. Теперь шифруется
+    # прозрачно (см. EncryptedToken выше). token_fingerprint — отдельный
+    # ДЕТЕРМИНИРОВАННЫЙ отпечаток для проверки на дубликаты при создании
+    # бота (сам шифротекст для этого не годится — см. utils/crypto.py).
+    token: Mapped[str] = mapped_column(EncryptedToken)
+    token_fingerprint: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     bot_tg_id: Mapped[int] = mapped_column(BigInteger, unique=True)
     username: Mapped[str] = mapped_column(String(64))
     bot_type: Mapped[BotType] = mapped_column(Enum(BotType))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
 
     # ---- настройки feedback ----
     open_mode: Mapped[OpenMode] = mapped_column(Enum(OpenMode), default=OpenMode.first_message)
