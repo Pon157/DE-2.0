@@ -8,7 +8,7 @@ from aiogram.utils.token import validate_token
 from sqlalchemy import select
 from db.base import Session
 from db.models import (ChildBot, BotAdmin, BotButton, BotType, OpenMode, ForwardMode,
-                       Advertisement, AdKind, PlatformUser, BotUser)
+                       Advertisement, AdKind, AdStatus, PlatformUser, BotUser)
 from services.bot_manager import manager, reupload_photo_for_bot as manager_reupload
 from services.broadcast import run_broadcast
 from services.stats_image import build_stats_image
@@ -18,11 +18,30 @@ from services import referrals
 from services import moderation as mod
 from utils.emoji import em, styled_button
 from child.common import RESERVED_COMMANDS
+from master import legal
 import config
 import json
 from config import SUPER_ADMIN_ID, MASTER_BOT_TOKEN, AD_MAX_LEN, AD_BROADCAST_COOLDOWN_DAYS
 
 router = Router()
+
+
+async def _has_accepted_terms(user_id: int) -> bool:
+    async with Session() as s:
+        u = await s.get(PlatformUser, user_id)
+    return bool(u and u.accepted_terms)
+
+
+async def _mark_terms_accepted(user_id: int):
+    from datetime import datetime
+    async with Session() as s:
+        u = await s.get(PlatformUser, user_id)
+        if not u:
+            u = PlatformUser(id=user_id)
+            s.add(u)
+        u.accepted_terms = True
+        u.accepted_terms_at = datetime.utcnow()
+        await s.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -58,6 +77,15 @@ async def _master_guard_message(handler, event: Message, data: dict):
             return  # забанен в конструкторе — молча игнорируем
         if not await _router_antispam_allowed(uid):
             return  # флуд — молча игнорируем (без наказания, просто троттлинг)
+        # Согласие с политикой конфиденциальности/соглашением/политикой
+        # возвратов — показывается ОДИН РАЗ, до этого бот не отвечает вообще
+        # ничем (кроме самого экрана согласия), даже на /start. /info
+        # разрешён всегда — это как раз просмотр текстов документов.
+        if event.text != "/info" and not await _has_accepted_terms(uid):
+            await event.answer(legal.GATE_TEXT, reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="✅ Принимаю",
+                                                       callback_data="accept_terms")]]))
+            return
         # Капча — ПОКАЗЫВАЕТСЯ ВСЕМ, включая владельца/SUPER_ADMIN_ID, без
         # исключений (раньше в master-роутере капчи не было вообще).
         notice = await mod.check_platform_captcha(uid, event.text)
@@ -77,7 +105,27 @@ async def _master_guard_callback(handler, event: CallbackQuery, data: dict):
         if not await _router_antispam_allowed(uid):
             await event.answer()
             return
+        if event.data != "accept_terms" and not await _has_accepted_terms(uid):
+            await event.answer("Сначала примите условия использования (/start).", show_alert=True)
+            return
     return await handler(event, data)
+
+
+@router.callback_query(F.data == "accept_terms")
+async def cb_accept_terms(c: CallbackQuery):
+    await _mark_terms_accepted(c.from_user.id)
+    await c.message.edit_text(f"{em('check')} Спасибо! Условия приняты.")
+    try:
+        await c.message.answer_sticker(WELCOME_STICKER_ID)
+    except Exception:
+        pass
+    await show_main(c.message, user_id=c.from_user.id)
+    await c.answer()
+
+
+@router.message(Command("info"))
+async def cmd_info(m: Message):
+    await m.answer(legal.info_text())
 
 
 class St(StatesGroup):
@@ -447,7 +495,6 @@ async def cfg_menu(c: CallbackQuery):
             [(f"🛡 Антиспам трогает владельца: {'нет' if cb.antispam_ignore_owner else 'да'}",
               f"cyc_aspown:{bot_id}")],
         ]
-    rows.append([(f"📜 Требовать согласие с политикой: {'вкл' if cb.require_terms_accept else 'выкл'}", f"cyc_terms:{bot_id}")])
     rows.append([("⬅️ Назад", f"bot:{bot_id}")])
     await c.message.edit_text(f"⚙️ Настройки @{cb.username}", reply_markup=kb(rows))
     await c.answer()
@@ -468,7 +515,6 @@ CYCLES = {
     "cyc_header": ("header_mode", ["separate", "merge", "off"]),
     "cyc_antispam": ("antispam_enabled", [True, False]),
     "cyc_aspown": ("antispam_ignore_owner", [True, False]),
-    "cyc_terms": ("require_terms_accept", [True, False]),
 }
 
 
@@ -1882,7 +1928,24 @@ async def ads_impr_custom_save(m: Message, state: FSMContext):
     if not m.text or not m.text.strip().isdigit() or int(m.text.strip()) < 1:
         await m.answer(f"{em('warn')} Нужно целое число больше 0.")
         return
-    await _ads_confirm_impressions(m, state, int(m.text.strip()))
+    n = int(m.text.strip())
+    data = await state.get_data()
+    ext_id = data.get("extend_ad_id")
+    if ext_id:
+        # Пришли сюда через "🔁 Продлить" в рекламном кабинете, а не через
+        # обычную покупку — тут число показов докупается к существующей
+        # кампании, а не создаёт новую.
+        await state.clear()
+        ad = await ads_service.extend_ad(ext_id, m.from_user.id, n)
+        if not ad:
+            await m.answer(f"{em('warn')} Не удалось продлить — кампания уже недоступна.")
+            return
+        await m.answer(f"{em('check')} Заявка на продление кампании №{ad.id} "
+                       f"({n} показов, +{ads_service.price_for_impressions(n)} ₽) "
+                       "отправлена на модерацию.")
+        await _notify_super_admin(ad)
+        return
+    await _ads_confirm_impressions(m, state, n)
 
 
 @router.callback_query(St.ads_confirm, F.data.startswith("adi:"))
@@ -1936,6 +1999,79 @@ async def ads_send(c: CallbackQuery, state: FSMContext):
                               "на модерацию. Мы напишем, когда решение будет принято.")
     await c.answer()
     await _notify_super_admin(ad)
+
+
+# =========================================================================
+# ======================   Рекламный кабинет   ===========================
+# =========================================================================
+_AD_STATUS_LABEL = {
+    "pending": "⏳ на модерации", "rejected": "❌ отклонено",
+    "awaiting_payment": "💳 ждёт оплаты", "active": "🟢 активна",
+    "finished": "🏁 показы закончились",
+}
+
+
+@router.callback_query(F.data.startswith("adcab:"))
+async def ads_cabinet(c: CallbackQuery):
+    """БАГ: кнопка "🎯 Мои кампании" в /ads вела на callback_data, для
+    которого не было ни одного обработчика — нажатие просто ничего не
+    делало ("not handled" в логах). Теперь показывает список кампаний
+    покупателя, сколько потрачено всего, и позволяет продлить исчерпанную
+    impressions-кампанию."""
+    page = int(c.data.split(":")[1])
+    ads = await ads_service.list_my_ads(c.from_user.id)
+    spent = await ads_service.my_spend_total(c.from_user.id)
+    per_page = 6
+    chunk = ads[page * per_page:(page + 1) * per_page]
+    if not ads:
+        text = f"{em('info')} У вас пока нет рекламных кампаний. Создать — /ads."
+        rows = [[("⬅️ Назад", "adcab_back")]]
+    else:
+        lines = [f"{em('coin')} Всего потрачено: <b>{spent} ₽</b>\n"]
+        rows = []
+        for ad in chunk:
+            kind = "🌐 все боты" if (ad.kind == AdKind.impressions and ad.source_bot_id is None) \
+                else ("📢 рассылка" if ad.kind == AdKind.broadcast else "🎯 конкретный бот")
+            progress = f" ({ad.shown_count}/{ad.target_impressions})" if ad.kind == AdKind.impressions else ""
+            lines.append(f"№{ad.id} · {kind}{progress} · {_AD_STATUS_LABEL.get(ad.status.value, ad.status.value)}\n"
+                        f"«{ad.text[:60]}{'…' if len(ad.text) > 60 else ''}» · {ad.price_rub} ₽")
+            row = []
+            if ad.kind == AdKind.impressions and ad.status == AdStatus.finished:
+                row.append((f"🔁 Продлить №{ad.id}", f"adext:{ad.id}"))
+            if row:
+                rows.append(row)
+        text = "\n\n".join(lines)
+        nav = []
+        if page > 0:
+            nav.append((f"⬅️ Стр. {page}", f"adcab:{page-1}"))
+        if (page + 1) * per_page < len(ads):
+            nav.append((f"Стр. {page+2} ➡️", f"adcab:{page+1}"))
+        if nav:
+            rows.append(nav)
+        rows.append([("⬅️ Назад", "adcab_back")])
+    await c.message.edit_text(text, reply_markup=kb(rows))
+    await c.answer()
+
+
+@router.callback_query(F.data == "adcab_back")
+async def ads_cabinet_back(c: CallbackQuery, state: FSMContext):
+    await ads_start(c.message, state)
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("adext:"))
+async def ads_extend_start(c: CallbackQuery, state: FSMContext):
+    ad_id = int(c.data.split(":")[1])
+    ad = await ads_service.get_ad_for_owner(ad_id, c.from_user.id)
+    if not ad or ad.status != AdStatus.finished:
+        await c.answer("Эту кампанию сейчас нельзя продлить.", show_alert=True)
+        return
+    await state.set_state(St.ads_impr_custom)
+    await state.update_data(extend_ad_id=ad_id)
+    await c.message.edit_text(
+        f"{em('pencil')} Сколько ещё показов докупить к кампании №{ad_id}? "
+        "Введите целое число (минимум 1):")
+    await c.answer()
 
 
 async def _notify_super_admin(ad: Advertisement):
