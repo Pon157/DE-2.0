@@ -720,6 +720,11 @@ def build_common_router() -> Router:
     @r.message(Command("donate"), F.chat.type == "private")
     @r.message(_DonateKbText(), F.chat.type == "private")
     async def donate_start(m: Message, bot_db_id: int, state: FSMContext):
+        # БАГ "блокировка не мешает писать": /donate и кнопка доната не
+        # проверяли бан вообще — забаненный пользователь мог продолжать
+        # пользоваться ботом через донат-флоу в обход бана.
+        if await mod.is_banned(bot_db_id, m.from_user.id):
+            return
         cfg = await get_cfg(bot_db_id)
         if not cfg or not cfg.donate_enabled:
             return
@@ -728,6 +733,9 @@ def build_common_router() -> Router:
 
     @r.message(DonateSt.amount, F.chat.type == "private")
     async def donate_amount(m: Message, bot: Bot, bot_db_id: int, state: FSMContext):
+        if await mod.is_banned(bot_db_id, m.from_user.id):
+            await state.clear()
+            return
         if m.text and m.text.startswith("/"):
             # команда в середине ввода — отменяем донат и отдаём команду дальше
             await state.clear()
@@ -763,6 +771,9 @@ def build_common_router() -> Router:
 
     @r.callback_query(F.data == "donate_btn")
     async def cb_donate(c: CallbackQuery, bot_db_id: int, state: FSMContext):
+        if await mod.is_banned(bot_db_id, c.from_user.id):
+            await c.answer("Вы забанены в этом боте.", show_alert=True)
+            return
         cfg = await get_cfg(bot_db_id)
         if not cfg or not cfg.donate_enabled:
             await c.answer()
@@ -778,6 +789,11 @@ def build_common_router() -> Router:
     # ---------- триггер-кнопки и кнопка "открыть обращение" ----------
     @r.callback_query(F.data.startswith("trg:"))
     async def cb_trigger(c: CallbackQuery, bot_db_id: int):
+        # БАГ: триггер-кнопки не проверяли бан — забаненный мог продолжать
+        # получать авто-ответы бота как ни в чём не бывало.
+        if await mod.is_banned(bot_db_id, c.from_user.id):
+            await c.answer("Вы забанены в этом боте.", show_alert=True)
+            return
         async with Session() as s:
             b = await s.get(BotButton, int(c.data.split(":")[1]))
         if b and (b.response_text or b.response_photo):
@@ -786,6 +802,11 @@ def build_common_router() -> Router:
 
     @r.callback_query(F.data == "open_ticket")
     async def cb_open_ticket(c: CallbackQuery, bot: Bot, bot_db_id: int):
+        # БАГ: кнопка "открыть обращение" не проверяла бан — самый прямой
+        # путь для забаненного снова начать писать в чат админов в обход бана.
+        if await mod.is_banned(bot_db_id, c.from_user.id):
+            await c.answer("Вы забанены в этом боте.", show_alert=True)
+            return
         cfg = await get_cfg(bot_db_id)
         await open_ticket(bot, cfg, c.from_user.id, force_new=True)
         await c.answer("Обращение открыто! Напишите сообщение.", show_alert=True)
@@ -799,6 +820,10 @@ def build_common_router() -> Router:
         cmd = m.text.split()[0].lstrip("/").split("@")[0].lower()
         if cmd in RESERVED_COMMANDS:
             raise SkipHandler
+        # БАГ: пользовательские триггер-команды не проверяли бан —
+        # забаненный мог продолжать получать авто-ответы через них.
+        if await mod.is_banned(bot_db_id, m.from_user.id):
+            return
         async with Session() as s:
             b = await s.scalar(select(BotButton).where(
                 BotButton.bot_id == bot_db_id, BotButton.kind == "command",
