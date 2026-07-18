@@ -17,6 +17,7 @@ from services import payments as pay_service
 from services import referrals
 from services import moderation as mod
 from utils.emoji import em, styled_button
+from utils import crypto
 from child.common import RESERVED_COMMANDS
 from master import legal
 import config
@@ -401,14 +402,20 @@ async def newbot_token(m: Message, state: FSMContext):
 
     data = await state.get_data()
     async with Session() as s:
-        exists = await s.scalar(select(ChildBot).where(ChildBot.token == token))
+        # БАГ: с шифрованием токена (Fernet, не детерминированное) сравнение
+        # `ChildBot.token == token` больше никогда не совпадёт с уже
+        # сохранённой (по-другому зашифрованной) записью — дубликаты
+        # перестали бы отлавливаться молча. Ищем по token_fingerprint
+        # (детерминированный HMAC) вместо самого токена.
+        fp = crypto.token_fingerprint(token)
+        exists = await s.scalar(select(ChildBot).where(ChildBot.token_fingerprint == fp))
         if exists:
             msg = await m.answer("Этот бот уже добавлен.")
             await state.update_data(last_msg_id=msg.message_id)
             return
 
-        cb = ChildBot(owner_id=m.from_user.id, token=token, bot_tg_id=me.id,
-                      username=me.username, bot_type=BotType(data["bot_type"]))
+        cb = ChildBot(owner_id=m.from_user.id, token=token, token_fingerprint=fp,
+                      bot_tg_id=me.id, username=me.username, bot_type=BotType(data["bot_type"]))
         s.add(cb)
         await s.commit()
         await s.refresh(cb)
