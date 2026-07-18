@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import select
 from db.base import Session
 from db.models import BotUser, ChildBot, ModerationLog, PlatformUser
+from utils.emoji import em
 
 DURATION_RE = re.compile(r"^(\d+)([mhdwy])$|^perm$", re.I)
 UNITS = {"m": "minutes", "h": "hours", "d": "days", "w": "weeks", "y": "days"}
@@ -160,6 +161,48 @@ async def is_platform_banned(user_id: int) -> bool:
     async with Session() as s:
         u = await s.get(PlatformUser, user_id)
         return bool(u and u.is_banned)
+
+
+CAPTCHA_EVERY = 15               # капча в конструкторе каждые N запросов
+CAPTCHA_TIMEOUT_MINUTES = 3
+
+
+async def check_platform_captcha(user_id: int, text: str | None) -> str | None:
+    """Капча для САМОГО КОНСТРУКТОРА (master-бота) — в отличие от антиспама
+    дочерних ботов, применяется АБСОЛЮТНО КО ВСЕМ, включая владельца и
+    SUPER_ADMIN_ID (так и просили — "показывалась всем, даже мне").
+    Возвращает None, если сообщение можно обрабатывать дальше как обычно,
+    либо текст уведомления, которое нужно отправить ВМЕСТО обработки
+    (сообщение-ответ на капчу/новый вызов капчи — не настоящая команда)."""
+    from services.antispam import _make_captcha
+    now = datetime.utcnow()
+    async with Session() as s:
+        u = await s.get(PlatformUser, user_id)
+        if not u:
+            u = PlatformUser(id=user_id)
+            s.add(u)
+        if u.captcha_pending:
+            if u.captcha_asked_at and now - u.captcha_asked_at > timedelta(minutes=CAPTCHA_TIMEOUT_MINUTES):
+                u.captcha_pending = False  # протухла — зададим новую ниже по счётчику
+            else:
+                if bool(text) and text.strip() == (u.captcha_answer or ""):
+                    u.captcha_pending = False
+                    u.captcha_answer = None
+                    await s.commit()
+                    return f"{em('check')} Проверка пройдена, можно продолжать."
+                await s.commit()
+                return (f"{em('warn')} Неверно. Решите пример из предыдущего "
+                        "сообщения и пришлите ответ числом.")
+        u.total_requests += 1
+        if CAPTCHA_EVERY > 0 and u.total_requests % CAPTCHA_EVERY == 0:
+            q, answer = _make_captcha()
+            u.captcha_pending = True
+            u.captcha_answer = answer
+            u.captcha_asked_at = now
+            await s.commit()
+            return f"{em('shield')} Проверка: реши пример и пришли ответ числом.\n<b>{q}</b>"
+        await s.commit()
+    return None
 
 
 async def admin_stats_text(bot_id: int) -> str:
