@@ -8,7 +8,7 @@ from aiogram.utils.token import validate_token
 from sqlalchemy import select
 from db.base import Session
 from db.models import (ChildBot, BotAdmin, BotButton, BotType, OpenMode, ForwardMode,
-                       Advertisement, AdKind, PlatformUser)
+                       Advertisement, AdKind, PlatformUser, BotUser)
 from services.bot_manager import manager, reupload_photo_for_bot as manager_reupload
 from services.broadcast import run_broadcast
 from services.stats_image import build_stats_image
@@ -407,7 +407,7 @@ async def cfg_menu(c: CallbackQuery):
     if cb.bot_type == BotType.feedback:
         rows = [
             [("✉️ Открытие обращений: " + cb.open_mode.value, f"cyc_open:{bot_id}")],
-            [("📨 Метод: " + cb.forward_mode.value, f"cyc_fwd:{bot_id}")],
+            [(f"📨 Пересылка сообщений в чат админов: {cb.forward_mode.value}", f"cyc_fwd:{bot_id}")],
             [("🧵 Топики: " + ("вкл" if cb.use_topics else "выкл"), f"cyc_topics:{bot_id}"),
              ("🧵 Имя топика", f"topicname:{bot_id}")],
             [("👋 Приветствие", f"welcome:{bot_id}"),
@@ -432,13 +432,14 @@ async def cfg_menu(c: CallbackQuery):
             [("👋 Приветствие", f"welcome:{bot_id}")],
             [("🎨 Шаблон поста", f"template:{bot_id}"), ("🔘 Кнопки шаблона", f"tplbtn:{bot_id}")],
             [("📡 Канал", f"channel:{bot_id}"), ("🏠 Чат админов", f"admchat:{bot_id}")],
-            [("📨 Метод пересылки: " + cb.forward_mode.value, f"cyc_fwd:{bot_id}")],
+            [(f"📨 Пересылка предложки в чат админов: {cb.forward_mode.value}", f"cyc_fwd:{bot_id}")],
             [(f"🏷 Шапка: {header_label}", f"cyc_header:{bot_id}"),
              ("🏷 Шаблон шапки", f"header:{bot_id}")],
             [("🧵 Топики в чате админов: " + ("вкл" if cb.use_topics else "выкл"),
               f"cyc_topics:{bot_id}"), ("🧵 Имя топика", f"topicname:{bot_id}")],
-            [("📬 Публикация в канал: " + cb.channel_delivery_mode, f"cyc_delivery:{bot_id}")],
-            [(f"📤 Как публикуется: {'пересылка' if cb.channel_publish_mode == 'forward' else 'копия'}",
+            [("📬 Контент поста: " + ("по шаблону" if cb.channel_delivery_mode == "template" else "оригинал"),
+              f"cyc_delivery:{bot_id}")],
+            [(f"📤 ПУБЛИКАЦИЯ В КАНАЛ: {'пересылка (Forwarded from)' if cb.channel_publish_mode == 'forward' else 'копия (без пометки)'}",
               f"cyc_pubmode:{bot_id}")],
             [(f"⚠️ Лимит варнов: {cb.warn_limit}", f"warnlim:{bot_id}")],
             [(f"🛡 Антиспам: {'вкл' if cb.antispam_enabled else 'выкл'}", f"cyc_antispam:{bot_id}"),
@@ -446,6 +447,7 @@ async def cfg_menu(c: CallbackQuery):
             [(f"🛡 Антиспам трогает владельца: {'нет' if cb.antispam_ignore_owner else 'да'}",
               f"cyc_aspown:{bot_id}")],
         ]
+    rows.append([(f"📜 Требовать согласие с политикой: {'вкл' if cb.require_terms_accept else 'выкл'}", f"cyc_terms:{bot_id}")])
     rows.append([("⬅️ Назад", f"bot:{bot_id}")])
     await c.message.edit_text(f"⚙️ Настройки @{cb.username}", reply_markup=kb(rows))
     await c.answer()
@@ -466,6 +468,7 @@ CYCLES = {
     "cyc_header": ("header_mode", ["separate", "merge", "off"]),
     "cyc_antispam": ("antispam_enabled", [True, False]),
     "cyc_aspown": ("antispam_ignore_owner", [True, False]),
+    "cyc_terms": ("require_terms_accept", [True, False]),
 }
 
 
@@ -1342,7 +1345,41 @@ async def stats(c: CallbackQuery):
     # Статистика по админам — отдельным текстовым блоком.
     admin_stats = await mod.admin_stats_text(bot_id)
     await c.message.answer(f"{em('crown')} <b>Статистика по админам</b>\n\n{admin_stats}",
-                           reply_markup=nav_kb(bot_id))
+                           reply_markup=kb([[("🚫 Кто заблокировал бота", f"blockedlist:{bot_id}:0")],
+                                            [("⬅️ Назад", f"bot:{bot_id}")]]))
+
+
+@router.callback_query(F.data.startswith("blockedlist:"))
+async def blocked_list(c: CallbackQuery):
+    """БАГ (по запросу): люди, заблокировавшие бота, учитывались только в
+    ОБЩЕМ числе на графике — конкретный список, кто именно, нигде не был
+    виден. Теперь отдельная страница с ID/username каждого."""
+    _, bot_id_s, page_s = c.data.split(":")
+    bot_id, page = int(bot_id_s), int(page_s)
+    cb, _ = await _access(bot_id, c.from_user.id)
+    if not cb:
+        await c.answer("Нет доступа", show_alert=True); return
+    per_page = 15
+    async with Session() as s:
+        rows = (await s.scalars(select(BotUser).where(
+            BotUser.bot_id == bot_id, BotUser.is_blocked_bot.is_(True)
+        ).order_by(BotUser.last_active.desc()))).all()
+    chunk = rows[page * per_page:(page + 1) * per_page]
+    if not rows:
+        text = f"{em('check')} Никто не блокировал бота."
+    else:
+        lines = [f"• <code>{u.user_id}</code>" + (f" @{u.username}" if u.username else "")
+                for u in chunk]
+        text = (f"{em('no_entry')} <b>Заблокировали бота: {len(rows)}</b>\n\n"
+               + "\n".join(lines))
+    nav = []
+    if page > 0:
+        nav.append((f"⬅️ Стр. {page}", f"blockedlist:{bot_id}:{page-1}"))
+    if (page + 1) * per_page < len(rows):
+        nav.append((f"Стр. {page+2} ➡️", f"blockedlist:{bot_id}:{page+1}"))
+    rows_kb = ([nav] if nav else []) + [[("⬅️ Назад", f"stats:{bot_id}")]]
+    await c.message.edit_text(text, reply_markup=kb(rows_kb))
+    await c.answer()
 
 
 # ================== вкл/выкл, удаление ==================
@@ -1705,13 +1742,15 @@ async def ad_reject_reason(m: Message, state: FSMContext):
 async def ads_start(m: Message, state: FSMContext):
     await state.clear()
     await state.set_state(St.ads_pick_kind)
-    rows = [[("🎯 Показы в конкретном боте", "adk:impr")]]
+    rows = [[("🎯 Показы в конкретном боте", "adk:impr")],
+           [("🌐 Показы ВО ВСЕХ ботах платформы", "adk:allbots")]]
     cd = await ads_service.cooldown_remaining(m.from_user.id)
     if cd:
         days = cd.days + (1 if cd.seconds else 0)
         rows.append([(f"📢 Рассылка (доступна через {days} дн.)", "adk:cd")])
     else:
         rows.append([(f"📢 Рассылка во все боты ({ads_service.BROADCAST_PRICE_RUB} ₽)", "adk:bcast")])
+    rows.append([("🎯 Мои кампании", "adcab:0")])
     await m.answer(
         f"{em('megaphone')} <b>Покупка рекламы</b>\n\nВыберите формат:",
         reply_markup=kb(rows))
@@ -1728,6 +1767,20 @@ async def ads_kind_impr(c: CallbackQuery, state: FSMContext):
     await state.set_state(St.ads_pick_bot)
     await state.update_data(kind="impressions", page=0)
     await _show_bot_picker(c, 0)
+    await c.answer()
+
+
+@router.callback_query(St.ads_pick_kind, F.data == "adk:allbots")
+async def ads_kind_allbots(c: CallbackQuery, state: FSMContext):
+    # БАГ (по запросу): раньше показ рекламы можно было купить ТОЛЬКО в
+    # одном конкретном боте — не было формата "показывать во всех ботах
+    # платформы сразу" (это НЕ разовая рассылка, а обычный, длящийся показ
+    # в /start каждого активного бота, пока не закончатся показы).
+    await state.update_data(kind="impressions", target_bot_id=None)
+    await state.set_state(St.ads_text)
+    await c.message.edit_text(
+        f"{em('pencil')} Пришлите ТЕКСТ объявления (до {AD_MAX_LEN} символов). "
+        "Реклама только текстовая, без фото/видео.")
     await c.answer()
 
 
@@ -1766,8 +1819,8 @@ async def ads_pick_bot(c: CallbackQuery, state: FSMContext):
     await state.update_data(target_bot_id=bot_id)
     await state.set_state(St.ads_text)
     await c.message.edit_text(
-        f"{em('pencil')} Пришлите текст объявления (до {AD_MAX_LEN} символов). "
-        "Можно приложить фото/видео/гифку — текст тогда идёт подписью.")
+        f"{em('pencil')} Пришлите ТЕКСТ объявления (до {AD_MAX_LEN} символов). "
+        "Реклама только текстовая, без фото/видео.")
     await c.answer()
 
 
@@ -1780,33 +1833,25 @@ async def ads_kind_bcast(c: CallbackQuery, state: FSMContext):
     await state.update_data(kind="broadcast")
     await state.set_state(St.ads_text)
     await c.message.edit_text(
-        f"{em('pencil')} Пришлите текст объявления (до {AD_MAX_LEN} символов). "
-        "Можно приложить фото/видео/гифку — текст тогда идёт подписью.")
+        f"{em('pencil')} Пришлите ТЕКСТ объявления (до {AD_MAX_LEN} символов). "
+        "Реклама только текстовая, без фото/видео.")
     await c.answer()
-
-
-def _ad_media(m: Message):
-    if m.photo:
-        return m.photo[-1].file_id, "photo"
-    if m.video:
-        return m.video.file_id, "video"
-    if m.animation:
-        return m.animation.file_id, "animation"
-    return None, None
 
 
 @router.message(St.ads_text)
 async def ads_text(m: Message, state: FSMContext):
+    # БАГ (по запросу "убери медиа у рекламных постов"): раньше сюда же
+    # принималось фото/видео/гифка — реклама теперь принципиально ТОЛЬКО
+    # текстовая, любое вложение просто игнорируется (берём m.text/caption).
     text = (m.text or m.caption or "").strip()
     if not text:
-        await m.answer(f"{em('warn')} Нужен текст объявления.")
+        await m.answer(f"{em('warn')} Нужен текст объявления (только текст, без вложений).")
         return
     if len(text) > AD_MAX_LEN:
         await m.answer(f"{em('warn')} Слишком длинно ({len(text)}/{AD_MAX_LEN}). "
                        "Сократите текст и пришлите ещё раз.")
         return
-    file_id, media_type = _ad_media(m)
-    await state.update_data(text=text, media_file_id=file_id, media_type=media_type)
+    await state.update_data(text=text)
     data = await state.get_data()
     if data["kind"] == "broadcast":
         await state.set_state(St.ads_confirm)
@@ -1851,8 +1896,10 @@ async def _ads_confirm_impressions(m: Message, state: FSMContext, n: int, edit=F
     price = ads_service.price_for_impressions(n)
     await state.update_data(impressions=n, price=price)
     await state.set_state(St.ads_confirm)
+    data = await state.get_data()
+    scope = "ВО ВСЕХ ботах платформы" if data.get("target_bot_id") is None else "выбранного бота"
     text = (f"{em('info')} Объявление: {n} показов в стартовых сообщениях "
-           f"выбранного бота.\nЦена: <b>{price} ₽</b>\n\nОтправить на модерацию?")
+           f"{scope}.\nЦена: <b>{price} ₽</b>\n\nОтправить на модерацию?")
     markup = kb([[("✅ Отправить", "adc:send"), ("❌ Отмена", "adc:cancel")]])
     if edit:
         await m.edit_text(text, reply_markup=markup)
@@ -1872,17 +1919,14 @@ async def ads_send(c: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     await state.clear()
     if data.get("kind") == "broadcast":
-        ad = await ads_service.create_broadcast_ad(
-            c.from_user.id, 0, data["text"],
-            data.get("media_file_id"), data.get("media_type"))
+        ad = await ads_service.create_broadcast_ad(c.from_user.id, 0, data["text"])
         if not ad:
             await c.message.edit_text(f"{em('warn')} Кулдаун ещё не истёк, попробуйте позже.")
             await c.answer()
             return
     else:
         ad = await ads_service.create_impressions_ad(
-            c.from_user.id, data["target_bot_id"], data["text"],
-            data.get("media_file_id"), data.get("media_type"), data["impressions"])
+            c.from_user.id, data.get("target_bot_id"), data["text"], data["impressions"])
         if not ad:
             await c.message.edit_text(f"{em('warn')} Владелец этого бота — Pro-подписчик, "
                                       "реклама в нём недоступна. Выберите другой бот через /ads.")
