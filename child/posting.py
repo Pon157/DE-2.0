@@ -16,7 +16,7 @@ from services import antispam
 from child.common import (is_bot_admin, inject_extras, build_keyboards, send_with_keyboards,
                           handle_keyboard_button, buffer_or_process, message_media,
                           group_from_messages, text_from_messages, relay_to_admin_chat,
-                          get_cfg, should_apply_antispam)
+                          get_cfg, should_apply_antispam, terms_gate_blocks, send_terms_gate)
 from utils.emoji import em, styled_button
 
 
@@ -415,6 +415,13 @@ def build_posting_router() -> Router:
         if not await is_bot_admin(bot_db_id, m.from_user.id) \
                 and await mod.is_banned(bot_db_id, m.from_user.id):
             return
+        # БАГ (по запросу): бот отправлял приветствие ДО согласия с
+        # политикой конфиденциальности/соглашением/политикой возвратов.
+        # Админов/владельца это не касается — это их собственный бот.
+        if not await is_bot_admin(bot_db_id, m.from_user.id) \
+                and await terms_gate_blocks(bot_db_id, cfg, m.from_user.id):
+            await send_terms_gate(m, cfg)
+            return
         if await is_bot_admin(bot_db_id, m.from_user.id):
             ikb, rkb = await build_keyboards(bot_db_id, cfg)
             await send_with_keyboards(
@@ -707,6 +714,10 @@ def build_posting_router() -> Router:
             s.add(MessageLog(bot_id=bot_db_id, user_id=m.from_user.id, direction="in"))
             await s.commit()
         if await mod.is_banned(bot_db_id, m.from_user.id):
+            return
+        if not await is_bot_admin(bot_db_id, m.from_user.id) \
+                and await terms_gate_blocks(bot_db_id, cfg, m.from_user.id):
+            await send_terms_gate(m, cfg)
             return
         # Антиспам — обычных админов не трогает; владельца — в зависимости
         # от тоггла cfg.antispam_ignore_owner (для теста можно включить и на
