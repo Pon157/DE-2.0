@@ -229,7 +229,9 @@ class Advertisement(Base):
     __tablename__ = "advertisements"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     buyer_id: Mapped[int] = mapped_column(BigInteger, index=True)
-    source_bot_id: Mapped[int] = mapped_column(Integer)      # в каком боте создана заявка
+    # None = показывается во ВСЕХ активных ботах платформы (не только в одном) —
+    # "рекламный showcase". Раньше поле было NOT NULL, отдельного режима не было.
+    source_bot_id: Mapped[int | None] = mapped_column(Integer, nullable=True)      # в каком боте создана заявка
     kind: Mapped[AdKind] = mapped_column(Enum(AdKind), default=AdKind.impressions)
     text: Mapped[str] = mapped_column(String(100))
     media_file_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
