@@ -503,10 +503,16 @@ async def relay_to_admin_chat(msgs: list[Message], bot: Bot, cfg: ChildBot,
             reply_params = ReplyParameters(message_id=mp.admin_chat_msg_id)
 
     close_kb = None
-    if created:
+    if cfg.forward_mode == ForwardMode.copy:
+        # БАГ (по запросу): раньше кнопка "Закрыть обращение" вешалась
+        # ТОЛЬКО на первое сообщение нового тикета — на всех последующих
+        # сообщениях пользователя её не было вообще, приходилось скроллить
+        # вверх. В режиме copy у каждой копии есть свой reply_markup —
+        # вешаем кнопку на КАЖДОЕ сообщение. В режиме forward это
+        # невозможно (forwardMessage не поддерживает reply_markup вообще) —
+        # там вместо кнопки работает команда /close (реплаем или в топике).
         close_kb = InlineKeyboardMarkup(inline_keyboard=[[
-            styled_button("🔒 Закрыть обращение",
-                          callback_data=f"close_ticket:{ticket.id}")]])
+            styled_button("🔒 Закрыть обращение", callback_data=f"close_ticket:{ticket.id}")]])
 
     # --- режим "шапка слитно с сообщением" (только copy + одиночное сообщение)
     if header_mode == "merge" and cfg.forward_mode == ForwardMode.copy and not is_album:
@@ -539,27 +545,45 @@ async def relay_to_admin_chat(msgs: list[Message], bot: Bot, cfg: ChildBot,
     # --- отдельная шапка
     if header_mode != "off":
         hm = await safe_call(bot.send_message, cfg.admin_chat_id, header,
-                             message_thread_id=thread, reply_markup=close_kb)
+                             message_thread_id=thread)
         await _map_msg(cfg.id, hm.message_id, user.id, None)
-        close_kb = None  # кнопка закрытия уже повешена на шапку
+        # close_kb НЕ обнуляем — теперь кнопка вешается на КАЖДОЕ сообщение
+        # пользователя (см. комментарий выше), а не только на шапку.
 
     if is_album:
         ids = [mm.message_id for mm in msgs]
+        markup = _combine_kb(extra_kb, close_kb)
         if cfg.forward_mode == ForwardMode.forward:
             copies = await safe_call(bot.forward_messages, cfg.admin_chat_id, first.chat.id, ids,
                                      message_thread_id=thread)
+            for mm, cp in zip(msgs, copies):
+                await _map_msg(cfg.id, cp.message_id, user.id, mm.message_id)
+            if markup:
+                # forwardMessages не поддерживает reply_markup вообще —
+                # ограничение Bot API, тут отдельное сообщение неизбежно.
+                sm = await safe_call(bot.send_message, cfg.admin_chat_id, "👆 Кнопки к посту выше",
+                                     message_thread_id=thread, reply_markup=markup)
+                await _map_msg(cfg.id, sm.message_id, user.id, None)
+        elif markup:
+            # БАГ (по запросу — "кнопки отдельным сообщением"): copy_messages
+            # (батч) не поддерживает reply_markup ни на одном элементе — но
+            # обычный copy_message ПО ОДНОМУ поддерживает. Копируем элементы
+            # альбома по очереди и вешаем кнопки прямо на последний, без
+            # отдельного служебного сообщения.
+            copies = []
+            for i, mm in enumerate(msgs):
+                is_last = i == len(msgs) - 1
+                cp = await safe_call(bot.copy_message, cfg.admin_chat_id, first.chat.id,
+                                     mm.message_id, message_thread_id=thread,
+                                     reply_markup=markup if is_last else None)
+                copies.append(cp)
+            for mm, cp in zip(msgs, copies):
+                await _map_msg(cfg.id, cp.message_id, user.id, mm.message_id)
         else:
             copies = await safe_call(bot.copy_messages, cfg.admin_chat_id, first.chat.id, ids,
                                      message_thread_id=thread)
-        for mm, cp in zip(msgs, copies):
-            await _map_msg(cfg.id, cp.message_id, user.id, mm.message_id)
-        markup = _combine_kb(extra_kb, close_kb)
-        if markup:
-            # У копий альбома нет reply_markup (ограничение Bot API) — кнопки
-            # шлём отдельным сообщением сразу под альбомом.
-            sm = await safe_call(bot.send_message, cfg.admin_chat_id, "🔘 Действия:",
-                                 message_thread_id=thread, reply_markup=markup)
-            await _map_msg(cfg.id, sm.message_id, user.id, None)
+            for mm, cp in zip(msgs, copies):
+                await _map_msg(cfg.id, cp.message_id, user.id, mm.message_id)
         return
 
     markup = _combine_kb(extra_kb, close_kb)
@@ -907,21 +931,19 @@ def build_common_router() -> Router:
         await send_response(m, b.response_text, b.response_photo)
 
     # ---------- закрытие / переоткрытие обращения ----------
-    @r.callback_query(F.data.startswith("close_ticket:"))
-    async def cb_close_ticket(c: CallbackQuery, bot: Bot, bot_db_id: int):
-        if not await is_bot_admin(bot_db_id, c.from_user.id):
-            await c.answer("Только администраторы бота", show_alert=True)
-            return
-        tid = int(c.data.split(":")[1])
+    async def _close_ticket_core(bot: Bot, bot_db_id: int, tid: int) -> str | None:
+        """Общая логика закрытия тикета — используется и инлайн-кнопкой
+        (доступна только в copy-режиме), и командой /close (работает в
+        любом режиме — единственный способ закрыть тикет при forward, и
+        альтернативный способ при copy). Возвращает текст ошибки (если
+        что-то пошло не так) или None при успехе."""
         async with Session() as s:
             t = await s.get(Ticket, tid)
             cfg = await s.get(ChildBot, bot_db_id)
             if not t or t.bot_id != bot_db_id:
-                await c.answer("Обращение не найдено", show_alert=True)
-                return
+                return "Обращение не найдено"
             if not t.is_open:
-                await c.answer("Обращение уже закрыто")
-                return
+                return "Обращение уже закрыто"
             t.is_open = False
             await s.commit()
         if cfg.use_topics and cfg.admin_chat_id and t.topic_id:
@@ -929,16 +951,6 @@ def build_common_router() -> Router:
                 await bot.close_forum_topic(cfg.admin_chat_id, t.topic_id)
             except Exception:
                 pass
-        try:
-            await c.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[[styled_button("🔓 Открыть снова",
-                                                callback_data=f"reopen_ticket:{tid}")]]))
-        except Exception:
-            pass
-        # БАГ: у пользователя оставалась висеть reply-клавиатура с кнопкой
-        # "Закрыть обращение" даже после того, как админ уже закрыл его —
-        # нажатие на неё просто отвечало "нет открытых обращений", что
-        # выглядело странно. Убираем клавиатуру сразу же.
         try:
             await bot.send_message(t.user_id,
                                    f"{em('lock')} Обращение закрыто администрацией. "
@@ -948,7 +960,58 @@ def build_common_router() -> Router:
             await mod.mark_blocked_bot(bot_db_id, t.user_id)
         except Exception:
             pass
+        return None
+
+    @r.callback_query(F.data.startswith("close_ticket:"))
+    async def cb_close_ticket(c: CallbackQuery, bot: Bot, bot_db_id: int):
+        if not await is_bot_admin(bot_db_id, c.from_user.id):
+            await c.answer("Только администраторы бота", show_alert=True)
+            return
+        tid = int(c.data.split(":")[1])
+        err = await _close_ticket_core(bot, bot_db_id, tid)
+        if err:
+            await c.answer(err, show_alert=(err == "Обращение не найдено"))
+            return
+        try:
+            await c.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[styled_button("🔓 Открыть снова",
+                                                callback_data=f"reopen_ticket:{tid}")]]))
+        except Exception:
+            pass
         await c.answer("Обращение закрыто")
+
+    # ---------- /close: закрыть обращение командой (реплаем или в топике) ----------
+    # БАГ (по запросу): в режиме forward инлайн-кнопку закрытия вообще
+    # некуда прицепить (forwardMessage не поддерживает reply_markup) — там
+    # это ЕДИНСТВЕННЫЙ способ закрыть тикет. В copy-режиме работает как
+    # равноценная альтернатива кнопке.
+    @r.message(Command("close"))
+    async def cmd_close(m: Message, bot: Bot, bot_db_id: int):
+        if not await is_bot_admin(bot_db_id, m.from_user.id):
+            return
+        ticket_id = None
+        if m.reply_to_message:
+            uid = await _target_from_reply(bot_db_id, m)
+            if uid is not None:
+                async with Session() as s:
+                    t = await s.scalar(select(Ticket).where(
+                        Ticket.bot_id == bot_db_id, Ticket.user_id == uid, Ticket.is_open))
+                if t:
+                    ticket_id = t.id
+        elif m.message_thread_id:
+            async with Session() as s:
+                t = await s.scalar(select(Ticket).where(
+                    Ticket.bot_id == bot_db_id, Ticket.topic_id == m.message_thread_id,
+                    Ticket.is_open))
+            if t:
+                ticket_id = t.id
+        if ticket_id is None:
+            await m.answer(f"{em('warn')} Не нашёл открытое обращение — ответьте (реплай) "
+                           "на сообщение пользователя командой /close, либо напишите /close "
+                           "прямо в топике этого обращения.")
+            return
+        err = await _close_ticket_core(bot, bot_db_id, ticket_id)
+        await m.answer(f"{em('cross') if err else em('check')} {err or 'Обращение закрыто.'}")
 
     @r.callback_query(F.data.startswith("reopen_ticket:"))
     async def cb_reopen_ticket(c: CallbackQuery, bot: Bot, bot_db_id: int):
