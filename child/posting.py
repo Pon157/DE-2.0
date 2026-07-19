@@ -22,7 +22,6 @@ from utils.emoji import em, styled_button
 
 
 def _media(m: Message):
-    # алиас обратной совместимости — вся логика в child/common.py
     return message_media(m)
 
 
@@ -49,7 +48,6 @@ def _buttons_markup(*sources: str | None) -> InlineKeyboardMarkup | None:
          for b in row] for row in rows])
 
 
-# Источники кнопок поста (переключатель в редакторе черновика)
 BTN_MODES = [("both", "шаблон + свои"), ("template", "только из шаблона"),
              ("custom", "только свои"), ("none", "без кнопок")]
 
@@ -67,18 +65,6 @@ CAPTION_LIMIT = 1024
 
 
 class PublishResult:
-    """Что реально было отправлено при publish() — нужно, чтобы при
-    подтверждённой публикации можно было буквально СКОПИРОВАТЬ/ПЕРЕСЛАТЬ уже
-    показанный админу предпросмотр в канал (см. _publish_via_copy), а не
-    пересобирать пост второй раз (второй сборкой мог вылезти другой
-    результат — например другое поведение Telegram при повторной
-    реконструкции премиум-стикера, или "неопознанный" 🔘).
-
-    ВАЖНО: bot.copy_messages()/forward_messages() возвращают голые
-    MessageId (только message_id, БЕЗ media_group_id) — в отличие от
-    send_media_group(), который возвращает полноценные Message. Поэтому
-    альбомные id сюда передаются ЯВНО (album_ids), а не вычисляются из
-    атрибутов ответа."""
     __slots__ = ("album_ids", "single_ids", "buttons_on")
 
     def __init__(self, album_ids: list[int], single_ids: list[int], buttons_on: int | None):
@@ -95,48 +81,21 @@ async def publish(bot: Bot, cfg: ChildBot, *, html_text: str = "",
                   origin_message_ids: str | None = None,
                   use_template: bool = True, buttons_json: str | None = None,
                   buttons_mode: str = "both", thread_id: int | None = None) -> PublishResult:
-    """Публикует пост в канал. Бросает исключение при ошибке Telegram —
-    вызывающий код обязан её поймать и сообщить человеку. Возвращает
-    PublishResult со списком реально отправленных сообщений — используется
-    для WYSIWYG-предпросмотра (см. _send_preview_and_publish).
-
-    thread_id: БАГ ("в постинг-ботах не работают топики") — при построении
-    предпросмотра в чате админов (см. _preview_then_publish) cfg.channel_id
-    временно подменяется на чат админов, но топик (тред тикета) нигде не
-    учитывался — весь предпросмотр всегда падал в General, даже если у
-    бота включены топики. Теперь топик передаётся явно и прокидывается во
-    все send/copy-вызовы ниже. Для настоящей публикации в канал (не топик)
-    остаётся None — у обычных каналов топиков не бывает.
-
-    buttons_mode: откуда брать кнопки — "both" (шаблон+свои), "template"
-    (только кнопки шаблона), "custom" (только кнопки поста), "none" (без).
-    Раньше кнопки шаблона лепились к посту ВСЕГДА, выбора не было.
-    """
+    
     if buttons_mode == "template":
         markup = _buttons_markup(cfg.template_buttons_json)
     elif buttons_mode == "custom":
         markup = _buttons_markup(buttons_json)
     elif buttons_mode == "none":
         markup = None
-    else:  # both
+    else:  
         markup = _buttons_markup(buttons_json, cfg.template_buttons_json)
     text = cfg.post_template.replace("{text}", html_text) if use_template else html_text
 
     if not text and not file_id and not media_group \
             and not (origin_message_id or origin_message_ids):
-        # БАГ: пустой пост (например, стикер без текста в template-режиме
-        # раньше) падал глубоко в Telegram с "message text is empty".
         raise ValueError("пустой пост — нечего публиковать")
 
-    # --- защита от потери премиум-контента в режиме "по шаблону" ---
-    # Бот НЕ может пересобрать премиум-стикер или премиум (custom) эмодзи
-    # "с нуля" по одному file_id — Telegram иногда отказывает в отправке
-    # такой реконструкции (TelegramBadRequest). Чтобы контент не терялся
-    # молча (пост просто не публиковался), при наличии origin_* пробуем
-    # сначала штатную реконструкцию по шаблону, а если Telegram её отклонит
-    # — ПЕРЕСЫЛАЕМ оригинал через copy_message (премиум-стикеры/эмодзи там
-    # сохраняются 1:1, т.к. Telegram берёт их из исходного сообщения, а не
-    # пересобирает заново), и добавляем шапку/подпись из шаблона + кнопки.
     if use_template and (origin_message_id or origin_message_ids):
         try:
             return await _publish_reconstructed(
@@ -159,21 +118,6 @@ async def publish(bot: Bot, cfg: ChildBot, *, html_text: str = "",
 
 async def _publish_via_copy(bot: Bot, cfg: ChildBot, source_chat_id: int,
                             result: PublishResult, markup: InlineKeyboardMarkup | None):
-    """Публикует уже отправленный предпросмотр (result, в чате source_chat_id)
-    в канал — гарантирует, что в канале появится РОВНО то же самое, что
-    админ видел в предпросмотре ("Пост будет выглядеть вот так:"), а не
-    результат повторной пересборки.
-
-    cfg.channel_publish_mode:
-    - "copy"    — bot.copy_message/copy_messages (без пометки "Forwarded from").
-    - "forward" — bot.forward_message/forward_messages (с пометкой источника).
-      ВАЖНО: forward_message/forward_messages НЕ поддерживают reply_markup
-      вообще (ограничение Bot API) — если у поста есть кнопки, контент всё
-      равно ПЕРЕСЫЛАЕТСЯ (не копируется), а кнопки уходят отдельным
-      сообщением следом. Раньше при наличии кнопок код тихо переключался на
-      copy_message целиком — из-за этого режим "пересылка" фактически не
-      работал почти ни для одного поста (у большинства есть кнопки шаблона).
-    """
     target_chat_id = cfg.channel_id
     forward = cfg.channel_publish_mode == "forward"
     if result.album_ids:
@@ -183,22 +127,11 @@ async def _publish_via_copy(bot: Bot, cfg: ChildBot, source_chat_id: int,
             await bot.copy_messages(target_chat_id, source_chat_id, result.album_ids)
     for mid in result.single_ids:
         has_buttons = mid == result.buttons_on
-        if forward:
-            # БАГ (главный, по репорту "режим forward, а бот всё равно
-            # копирует"): раньше ЛЮБОЕ сообщение с кнопками — а кнопки
-            # шаблона обычно есть почти у каждого поста — тихо уходило в
-            # else-ветку и копировалось, вообще игнорируя forward. То есть
-            # если у бота настроены кнопки шаблона, режим "пересылка"
-            # НИКОГДА фактически не срабатывал. forward_message
-            # действительно не умеет reply_markup (ограничение Bot API),
-            # но это не повод молча переключаться на copy — вместо этого
-            # пересылаем контент КАК ЕСТЬ, а кнопки (если были) шлём
-            # отдельным сообщением следом, а не заменяем пересылку копией.
+        rm = markup if has_buttons else None
+        
+        if forward and not has_buttons:
             await bot.forward_message(target_chat_id, source_chat_id, mid)
-            if has_buttons and markup:
-                await bot.send_message(target_chat_id, "👆 Кнопки к посту выше", reply_markup=markup)
         else:
-            rm = markup if has_buttons else None
             await bot.copy_message(target_chat_id, source_chat_id, mid, reply_markup=rm)
 
 
@@ -208,40 +141,11 @@ async def _publish_fallback_copy(bot: Bot, cfg: ChildBot, *, text: str,
                                  origin_message_ids: str | None,
                                  markup: InlineKeyboardMarkup | None,
                                  thread_id: int | None = None) -> PublishResult:
-    """Публикует пост копированием ОРИГИНАЛА (сохраняет премиум-стикеры,
-    премиум-эмодзи и любое форматирование как есть), плюс отдельным
-    сообщением — текст из шаблона (шапка/подпись) с кнопками, если исходное
-    сообщение не поддерживает caption (стикер, кружок и т.п.)."""
     single_ids: list[int] = []
     buttons_on = None
     if origin_message_ids:
         ids = [int(x) for x in origin_message_ids.split(",")]
-        # БАГ (по запросу — "нахуя кнопки отдельным сообщением, если можно
-        # сразу в пост"): copy_messages/send_media_group (настоящий альбом)
-        # НЕ поддерживают reply_markup вообще — это жёсткое ограничение Bot
-        # API, не обойти. Но если копировать элементы АЛЬБОМА не батчем, а
-        # ПО ОДНОМУ обычными copy_message (без группировки в галерею),
-        # reply_markup на КАЖДОМ отдельном вызове доступен — вешаем кнопки
-        # прямо на последний элемент, без отдельного "служебного" сообщения.
-        # Единственная разница — пост не превращается в свайпаемую галерею
-        # в Telegram, элементы идут просто друг за другом подряд.
-        if markup:
-            sent_ids = []
-            for i, mid in enumerate(ids):
-                is_last = i == len(ids) - 1
-                rm = markup if is_last else None
-                cap = text if (is_last and text and len(text) <= CAPTION_LIMIT) else None
-                m = await bot.copy_message(cfg.channel_id, origin_chat_id, mid,
-                                           message_thread_id=thread_id,
-                                           caption=cap, parse_mode="HTML" if cap else None,
-                                           reply_markup=rm)
-                sent_ids.append(m.message_id)
-            buttons_on = sent_ids[-1]
-            if text and len(text) > CAPTION_LIMIT:
-                m = await bot.send_message(cfg.channel_id, text, message_thread_id=thread_id)
-                sent_ids.append(m.message_id)
-            return PublishResult([], sent_ids, buttons_on)
-        # Без кнопок — можно спокойно группировать как настоящий альбом.
+        # Изменение: всегда используем группировку для альбома
         sent_ids = [m.message_id for m in
                    await bot.copy_messages(cfg.channel_id, origin_chat_id, ids,
                                            message_thread_id=thread_id)]
@@ -250,19 +154,12 @@ async def _publish_fallback_copy(bot: Bot, cfg: ChildBot, *, text: str,
             single_ids.append(m.message_id)
         return PublishResult(sent_ids, single_ids, None)
     try:
-        # Если у оригинала есть caption-слот (фото/видео/документ и т.п.),
-        # copy_message умеет заменить подпись на текст из шаблона и повесить
-        # кнопки — одним сообщением.
         m = await bot.copy_message(cfg.channel_id, origin_chat_id, origin_message_id,
                                    message_thread_id=thread_id,
                                    caption=text or None, parse_mode="HTML" if text else None,
                                    reply_markup=markup)
         return PublishResult([], [m.message_id], m.message_id if markup else None)
     except TelegramBadRequest:
-        # Тип без caption (стикер/кружок) — copyMessage всё равно поддерживает
-        # reply_markup (это общий параметр метода, не завязан на caption), так
-        # что кнопки вешаем ПРЯМО на копию, а не отдельным "🔘"-сообщением —
-        # раньше из-за этого казалось, что кнопки "прилипают не туда".
         m = await bot.copy_message(cfg.channel_id, origin_chat_id, origin_message_id,
                                    message_thread_id=thread_id, reply_markup=markup)
         single_ids = [m.message_id]
@@ -281,38 +178,11 @@ async def _publish_reconstructed(bot: Bot, cfg: ChildBot, *, text: str,
                                  origin_message_id: int | None = None,
                                  origin_message_ids: str | None = None,
                                  thread_id: int | None = None) -> PublishResult:
-    """Старая логика "собрать пост заново по file_id/тексту" — вынесена в
-    отдельную функцию, чтобы publish() мог обернуть её в try/except и
-    подстраховаться через _publish_fallback_copy при отказе Telegram.
-
-    thread_id: см. докстринг publish() — БАГ "топики не работают в
-    постинг-ботах": раньше он тут не учитывался вообще, из-за чего
-    предпросмотр всегда уходил в General, а не в топик тикета."""
-    # --- режим "оригинал" (copy_message/copy_messages) ---
     if cfg.channel_delivery_mode == "copy" and origin_chat_id \
             and (origin_message_id or origin_message_ids):
         if origin_message_ids:
             ids = [int(x) for x in origin_message_ids.split(",")]
-            # БАГ (главный, "фантомные посты" + "кнопки отдельным
-            # сообщением"): раньше результат bot.copy_messages() тут просто
-            # отбрасывался (а в PublishResult уходили ИСХОДНЫЕ id сообщений
-            # из чата ПОДПИСЧИКА — при предпросмотре это чат админа! —
-            # отсюда и мусор в канале), и кнопки на альбом всегда шли
-            # отдельным "служебным" сообщением, т.к. copy_messages в принципе
-            # не поддерживает reply_markup. Теперь: если кнопок нет — как
-            # раньше, батч copy_messages (настоящий альбом); если кнопки
-            # есть — копируем элементы ПО ОДНОМУ и вешаем кнопки прямо на
-            # последний, без отдельного сообщения (см. тот же приём в
-            # _publish_fallback_copy выше).
-            if markup:
-                sent_ids = []
-                for i, mid in enumerate(ids):
-                    is_last = i == len(ids) - 1
-                    m = await bot.copy_message(cfg.channel_id, origin_chat_id, mid,
-                                               message_thread_id=thread_id,
-                                               reply_markup=markup if is_last else None)
-                    sent_ids.append(m.message_id)
-                return PublishResult([], sent_ids, sent_ids[-1])
+            # Изменение: отключено разделение альбомов на одиночные медиа
             sent_ids = [m.message_id for m in
                        await bot.copy_messages(cfg.channel_id, origin_chat_id, ids,
                                                message_thread_id=thread_id)]
@@ -322,29 +192,9 @@ async def _publish_reconstructed(bot: Bot, cfg: ChildBot, *, text: str,
                                        message_thread_id=thread_id, reply_markup=markup)
             return PublishResult([], [m.message_id], m.message_id if markup else None)
 
-    # --- режим "по шаблону" (реконструкция из html_text) ---
     if media_group:
         caption = text if text and len(text) <= CAPTION_LIMIT else None
-        if markup:
-            # См. комментарий в copy-mode ветке выше — то же самое: если
-            # нужны кнопки, элементы шлём ПО ОДНОМУ (не sendMediaGroup —
-            # он в принципе не умеет reply_markup), кнопки вешаем на
-            # последний, подпись — тоже на последний, чтобы она была прямо
-            # под кнопками, а не потерялась где-то в середине альбома.
-            sent_ids = []
-            for i, item in enumerate(media_group):
-                sender = bot.send_photo if item["type"] == "photo" else bot.send_video
-                is_last = i == len(media_group) - 1
-                m = await sender(cfg.channel_id, item["file_id"],
-                                 message_thread_id=thread_id,
-                                 caption=caption if is_last else None,
-                                 parse_mode="HTML" if (is_last and caption) else None,
-                                 reply_markup=markup if is_last else None)
-                sent_ids.append(m.message_id)
-            if text and caption is None:
-                m = await bot.send_message(cfg.channel_id, text, message_thread_id=thread_id)
-                sent_ids.append(m.message_id)
-            return PublishResult([], sent_ids, sent_ids[-1])
+        # Изменение: публикация строго через MediaGroup
         media_objs = []
         for i, item in enumerate(media_group):
             cls = InputMediaPhoto if item["type"] == "photo" else InputMediaVideo
@@ -355,7 +205,6 @@ async def _publish_reconstructed(bot: Bot, cfg: ChildBot, *, text: str,
         album_ids = [m.message_id for m in sent_album]
         single_ids = []
         if text and caption is None:
-            # БАГ: текст длиннее 1024 в caption альбома раньше ронял публикацию
             m = await bot.send_message(cfg.channel_id, text, message_thread_id=thread_id)
             single_ids.append(m.message_id)
         return PublishResult(album_ids, single_ids, None)
@@ -363,7 +212,6 @@ async def _publish_reconstructed(bot: Bot, cfg: ChildBot, *, text: str,
     if file_id and media_type in _MEDIA_SENDERS:
         sender = getattr(bot, _MEDIA_SENDERS[media_type])
         if text and len(text) > CAPTION_LIMIT:
-            # БАГ: caption > 1024 -> TelegramBadRequest, пост молча не публиковался
             m = await sender(cfg.channel_id, file_id, message_thread_id=thread_id,
                              reply_markup=markup)
             m2 = await bot.send_message(cfg.channel_id, text, message_thread_id=thread_id)
@@ -372,10 +220,8 @@ async def _publish_reconstructed(bot: Bot, cfg: ChildBot, *, text: str,
         m = await sender(cfg.channel_id, file_id, message_thread_id=thread_id,
                          caption=text or None, reply_markup=markup)
         return PublishResult([], [m.message_id], m.message_id if markup else None)
+    
     if file_id and media_type == "video_note":
-        # БАГ: раньше кнопки шли ОТДЕЛЬНЫМ сообщением "🔘" под кружком — но
-        # sendVideoNote тоже принимает reply_markup, просто не принимает
-        # caption. Вешаем кнопки прямо на кружок, текст (если есть) — отдельно.
         m = await bot.send_video_note(cfg.channel_id, file_id, message_thread_id=thread_id,
                                       reply_markup=markup)
         single_ids = [m.message_id]
@@ -383,8 +229,8 @@ async def _publish_reconstructed(bot: Bot, cfg: ChildBot, *, text: str,
             m2 = await bot.send_message(cfg.channel_id, text, message_thread_id=thread_id)
             single_ids.append(m2.message_id)
         return PublishResult([], single_ids, m.message_id if markup else None)
+    
     if file_id and media_type == "sticker":
-        # Аналогично: sendSticker тоже принимает reply_markup напрямую.
         m = await bot.send_sticker(cfg.channel_id, file_id, message_thread_id=thread_id,
                                    reply_markup=markup)
         single_ids = [m.message_id]
@@ -400,14 +246,12 @@ async def _publish_reconstructed(bot: Bot, cfg: ChildBot, *, text: str,
     return PublishResult([], [m.message_id], m.message_id if markup else None)
 
 
-
-
 class PostSt(StatesGroup):
-    composing = State()    # /newpost: ждём содержимое поста
-    editing = State()      # /newpost: ждём кнопку "текст|url" или /done
-    scheduling = State()   # /newpost: ждём дату-время
-    btn_style = State()    # /newpost: выбор цвета для кнопки поста
-    btn_icon = State()     # /newpost: premium-эмодзи для кнопки поста
+    composing = State()
+    editing = State()
+    scheduling = State()
+    btn_style = State()
+    btn_icon = State()
 
 
 BTN_STYLES = [
@@ -453,24 +297,11 @@ def build_posting_router() -> Router:
 
     async def _preview_then_publish(bot: Bot, cfg: ChildBot, preview_chat_id: int,
                                     thread_id: int | None = None, **publish_kwargs):
-        """Сначала шлёт в чат админа ПРЕДПРОСМОТР поста ("Пост будет
-        выглядеть вот так:"), а затем публикует в канал БУКВАЛЬНО КОПИЮ (или
-        ПЕРЕСЫЛКУ — см. cfg.channel_publish_mode) этого самого предпросмотра,
-        а не результат повторной пересборки поста с нуля. Так в канале
-        гарантированно оказывается ровно то же, что админ только что видел —
-        раньше пересборка выполнялась дважды и результат мог отличаться.
-
-        thread_id: БАГ ("топики не работают в постинг-ботах") — предпросмотр
-        уходил в admin_chat_id, но без учёта топика (треда) тикета, всегда
-        падая в General даже при включённых топиках. Теперь передаётся
-        явно (обычно c.message.message_thread_id вызывающего колбэка)."""
         preview_cfg = copy.copy(cfg)
         preview_cfg.channel_id = preview_chat_id
         await bot.send_message(preview_chat_id, f"{em('eyes')} Пост будет выглядеть вот так:",
                                message_thread_id=thread_id)
         result = await publish(bot, preview_cfg, thread_id=thread_id, **publish_kwargs)
-        # markup нужен ещё раз для _publish_via_copy — copy_message/forward_message
-        # не переносят кнопки автоматически, их нужно приложить явно.
         mode = publish_kwargs.get("buttons_mode", "both")
         if mode == "template":
             markup = _buttons_markup(cfg.template_buttons_json)
@@ -497,16 +328,12 @@ def build_posting_router() -> Router:
         else:
             await publish(bot, cfg, **kwargs)
 
-    # ================= /start =================
     @r.message(CommandStart(), F.chat.type == "private")
     async def start(m: Message, bot_db_id: int):
         cfg = await _cfg(bot_db_id)
         async with Session() as s:
             await mod.get_or_create_user(s, bot_db_id, m.from_user)
             await s.commit()
-        # БАГ: /start не проверял бан — забаненный подписчик всё равно видел
-        # приветствие и клавиатуру (в feedback-боте это уже было исправлено,
-        # тут забыли). Админов бан не касается по определению.
         if not await is_bot_admin(bot_db_id, m.from_user.id) \
                 and await mod.is_banned(bot_db_id, m.from_user.id):
             return
@@ -530,7 +357,6 @@ def build_posting_router() -> Router:
             await state.clear()
             await m.answer(f"{em('check')} Отменено.")
 
-    # ================= /newpost — единственный способ опубликовать пост =================
     @r.message(Command("newpost"), F.chat.type == "private")
     async def newpost_cmd(m: Message, bot_db_id: int, state: FSMContext):
         if not await is_bot_admin(bot_db_id, m.from_user.id):
@@ -539,19 +365,12 @@ def build_posting_router() -> Router:
         if not cfg.channel_id:
             await m.answer(f"{em('warn')} Сначала укажите канал в настройках бота.")
             return
-        # БАГ (главный по репорту "newpost шлёт мои сообщения в чат админов"):
-        # ожидание поста хранилось флагом newpost_pending В ДАННЫХ при пустом
-        # состоянии — сообщение при определённых условиях проваливалось мимо
-        # фильтра StateFilter(None) и улетало в incoming() -> релей в чат
-        # админов. Теперь это ЯВНОЕ FSM-состояние PostSt.composing: пока оно
-        # активно, содержимое поста точно не уйдёт в предложку.
         await state.clear()
         await state.set_state(PostSt.composing)
         await m.answer(f"{em('pencil')} Пришлите пост (текст/фото/видео/альбом, "
                        "форматирование сохранится) — дальше предложу опубликовать "
                        "сразу или отложенно. Отмена: /cancel")
 
-    # -------- /newpost: ожидание содержимого (включая альбомы) --------
     def _not_command(m: Message) -> bool:
         return not (m.text and m.text.startswith("/"))
 
@@ -564,7 +383,6 @@ def build_posting_router() -> Router:
                            reply_markup=_draft_kb(p.id, p.buttons_mode or "both"))
         await buffer_or_process(m, _process)
 
-    # -------- /newpost: кнопки на черновике --------
     @r.message(PostSt.editing, F.chat.type == "private")
     async def editing_button(m: Message, state: FSMContext):
         if m.text and m.text.strip() == "/done":
@@ -588,8 +406,6 @@ def build_posting_router() -> Router:
 
     @r.message(PostSt.btn_style, F.chat.type == "private")
     async def post_btn_style_msg_fallback(m: Message, state: FSMContext):
-        # если вместо нажатия на цвет прислали /done — не теряем уже
-        # добавленные кнопки, просто отменяем текущую незавершённую
         if m.text and m.text.strip() == "/done":
             await state.set_state(PostSt.editing)
             await _finalize_editor(m, state)
@@ -609,7 +425,6 @@ def build_posting_router() -> Router:
     @r.message(PostSt.btn_icon, F.chat.type == "private")
     async def post_btn_icon(m: Message, state: FSMContext):
         if m.text and m.text.strip() == "/done":
-            # кнопка без эмодзи — сохраняем как есть, без иконки
             data = await state.get_data()
             rows = data.get("buttons", [])
             rows.append([{"text": data["pending_text"], "url": data["pending_url"],
@@ -695,7 +510,6 @@ def build_posting_router() -> Router:
         c_new = c.model_copy(update={"data": f"editbtn:{post_id}"})
         await editbtn(c_new, bot_db_id)
 
-    # -------- переключатель источника кнопок: шаблон / свои / оба / без --------
     @r.callback_query(F.data.startswith("btnmode:"))
     async def btnmode(c: CallbackQuery, bot_db_id: int):
         if not await is_bot_admin(bot_db_id, c.from_user.id):
@@ -764,13 +578,6 @@ def build_posting_router() -> Router:
         post_id = int(c.data.split(":")[1])
         async with Session() as s:
             cfg = await s.get(ChildBot, bot_db_id)
-            # БАГ (та же гонка, что и в decide() — см. комментарий там):
-            # раньше published=True выставлялся только ПОСЛЕ фактической
-            # публикации, оставляя большое окно, за которое второе (почти
-            # одновременное) нажатие "Опубликовать" успевало пройти ту же
-            # проверку и опубликовать пост ЕЩЁ РАЗ. Теперь атомарно
-            # "застолбляем" пост ДО публикации; если публикация всё же
-            # упадёт — откатываем флаг обратно, чтобы можно было повторить.
             res = await s.execute(
                 sa_update(Post).where(Post.id == post_id, Post.published.is_(False))
                 .values(published=True))
@@ -811,7 +618,6 @@ def build_posting_router() -> Router:
         await c.message.edit_text("🗑 Отменено")
         await c.answer()
 
-    # ================= обычные сообщения (подписчики И админы вне /newpost) =================
     @r.message(F.chat.type == "private")
     async def incoming(m: Message, bot: Bot, bot_db_id: int, state: FSMContext):
         cfg = await _cfg(bot_db_id)
@@ -821,23 +627,19 @@ def build_posting_router() -> Router:
             await s.commit()
         if await mod.is_banned(bot_db_id, m.from_user.id):
             return
-        # Антиспам — обычных админов не трогает; владельца — в зависимости
-        # от тоггла cfg.antispam_ignore_owner (для теста можно включить и на
-        # себя, см. child/common.py::should_apply_antispam).
+        
         if await should_apply_antispam(bot_db_id, cfg, m.from_user.id):
             res = await antispam.check(bot_db_id, cfg, m.from_user.id, m.text)
             if not res.allowed:
                 if res.notice:
                     await m.answer(res.notice)
                 return
-        # Идёт FSM-ввод (/newpost, кнопки, расписание, донат) — НЕ релеим.
-        # Это страховка от бага "сообщения улетают в чат админов посреди
-        # диалога" — сюда такие сообщения доходить не должны вообще.
+        
         if await state.get_state() is not None:
             return
         if await handle_keyboard_button(m, bot_db_id):
             return
-        # Неизвестные команды — не предложка, в админ-чат не релеим.
+        
         if m.text and m.text.startswith("/"):
             return
         if not cfg.admin_chat_id:
@@ -852,8 +654,6 @@ def build_posting_router() -> Router:
         user = msgs[0].from_user
         sugg_kb = None
         if cfg.accept_suggestions:
-            # создаём заявку на публикацию сразу, кнопки решения вешаем на
-            # релей в чат админов
             is_album = len(msgs) > 1
             group = _group_from_messages(msgs)
             file_id = media_type = None
@@ -874,26 +674,16 @@ def build_posting_router() -> Router:
             sugg_kb = InlineKeyboardMarkup(inline_keyboard=[[
                 styled_button("✅ Принять", callback_data=f"sg_ok:{sg.id}"),
                 styled_button("❌ Отклонить", callback_data=f"sg_no:{sg.id}")]])
-        # Сам релей (шапка/топики/reply-контекст/маппинг/кнопка закрытия) —
-        # общий с фидбек-ботами, см. child/common.py::relay_to_admin_chat.
+        
         await relay_to_admin_chat(msgs, bot, cfg, extra_kb=sugg_kb)
 
-    # ================= модерация предложки =================
     @r.callback_query(F.data.startswith(("sg_ok:", "sg_no:")))
     async def decide(c: CallbackQuery, bot: Bot, bot_db_id: int):
         if not await is_bot_admin(bot_db_id, c.from_user.id):
             await c.answer("Нет доступа", show_alert=True); return
         sg_id = int(c.data.split(":")[1])
         approve = c.data.startswith("sg_ok")
-        # БАГ (главный, "два одинаковых поста в канале"): раньше тут было
-        # SELECT sg -> проверка sg.status == "pending" -> UPDATE отдельным
-        # запросом. При двойном/дребезжащем нажатии кнопки Telegram может
-        # прислать ДВА callback-апдейта почти одновременно — aiogram
-        # обрабатывает разные апдейты РАЗНЫМИ параллельными тасками, так что
-        # оба успевали прочитать ещё не закоммиченный "pending" и оба шли
-        # публиковать. Теперь ОДИН атомарный UPDATE ... WHERE status='pending'
-        # — гарантированно выполнится только для одного из двух одновременных
-        # нажатий, второе получит rowcount=0 и корректно скажет "уже обработано".
+        
         async with Session() as s:
             res = await s.execute(
                 sa_update(Suggestion).where(Suggestion.id == sg_id, Suggestion.status == "pending")
@@ -917,11 +707,7 @@ def build_posting_router() -> Router:
                                   origin_message_id=sg.origin_message_id,
                                   origin_message_ids=sg.origin_message_ids,
                                   use_template=(cfg.channel_delivery_mode != "copy"))
-                # БАГ: раньше тут звали и _send_preview(...), и publish(...)
-                # ОТДЕЛЬНО — пост реально публиковался дважды подряд (плюс
-                # предпросмотр пересобирался заново, что и давало разный
-                # результат / "неопознанный эмодзи 🔘"). Теперь один вызов:
-                # предпросмотр показывается, а в канал уходит его же копия.
+                
                 await _preview_then_publish(bot, cfg, c.message.chat.id,
                                             thread_id=c.message.message_thread_id, **pub_kwargs)
             except Exception as e:
