@@ -65,6 +65,11 @@ _MEDIA_SENDERS = {
 
 CAPTION_LIMIT = 1024
 
+_ALBUM_BUTTONS_MSG = (
+    "К сожалению, Телеграм мне не позволяет прикреплять кнопки к альбомам. "
+    "Но я могу отправить кнопки следующим сообщением."
+)
+
 
 class PublishResult:
     """Что реально было отправлено при publish() — нужно, чтобы при
@@ -173,6 +178,13 @@ async def _publish_via_copy(bot: Bot, cfg: ChildBot, source_chat_id: int,
       сообщением следом. Раньше при наличии кнопок код тихо переключался на
       copy_message целиком — из-за этого режим "пересылка" фактически не
       работал почти ни для одного поста (у большинства есть кнопки шаблона).
+
+    Альбомы: Telegram не позволяет прикреплять reply_markup к альбому
+    (copy_messages/forward_messages/send_media_group). Если есть кнопки —
+    отправляем их отдельным сообщением с пояснением.
+    Одиночные сообщения в forward-режиме: forward не поддерживает кнопки,
+    и отдельное сообщение «Кнопки к посту выше» убрано — для одиночных
+    сообщений кнопки в этом режиме не отправляются.
     """
     target_chat_id = cfg.channel_id
     forward = cfg.channel_publish_mode == "forward"
@@ -181,22 +193,17 @@ async def _publish_via_copy(bot: Bot, cfg: ChildBot, source_chat_id: int,
             await bot.forward_messages(target_chat_id, source_chat_id, result.album_ids)
         else:
             await bot.copy_messages(target_chat_id, source_chat_id, result.album_ids)
+        # Telegram не позволяет прикреплять кнопки к альбомам — отправляем
+        # отдельным сообщением с пояснением.
+        if markup:
+            await bot.send_message(target_chat_id, _ALBUM_BUTTONS_MSG, reply_markup=markup)
     for mid in result.single_ids:
         has_buttons = mid == result.buttons_on
         if forward:
-            # БАГ (главный, по репорту "режим forward, а бот всё равно
-            # копирует"): раньше ЛЮБОЕ сообщение с кнопками — а кнопки
-            # шаблона обычно есть почти у каждого поста — тихо уходило в
-            # else-ветку и копировалось, вообще игнорируя forward. То есть
-            # если у бота настроены кнопки шаблона, режим "пересылка"
-            # НИКОГДА фактически не срабатывал. forward_message
-            # действительно не умеет reply_markup (ограничение Bot API),
-            # но это не повод молча переключаться на copy — вместо этого
-            # пересылаем контент КАК ЕСТЬ, а кнопки (если были) шлём
-            # отдельным сообщением следом, а не заменяем пересылку копией.
+            # forward_message не поддерживает reply_markup (ограничение Bot API).
+            # Для одиночных сообщений отдельное сообщение «Кнопки к посту выше»
+            # убрано — пересылаем контент как есть, без кнопок.
             await bot.forward_message(target_chat_id, source_chat_id, mid)
-            if has_buttons and markup:
-                await bot.send_message(target_chat_id, "👆 Кнопки к посту выше", reply_markup=markup)
         else:
             rm = markup if has_buttons else None
             await bot.copy_message(target_chat_id, source_chat_id, mid, reply_markup=rm)
@@ -216,39 +223,22 @@ async def _publish_fallback_copy(bot: Bot, cfg: ChildBot, *, text: str,
     buttons_on = None
     if origin_message_ids:
         ids = [int(x) for x in origin_message_ids.split(",")]
-        # БАГ (по запросу — "нахуя кнопки отдельным сообщением, если можно
-        # сразу в пост"): copy_messages/send_media_group (настоящий альбом)
-        # НЕ поддерживают reply_markup вообще — это жёсткое ограничение Bot
-        # API, не обойти. Но если копировать элементы АЛЬБОМА не батчем, а
-        # ПО ОДНОМУ обычными copy_message (без группировки в галерею),
-        # reply_markup на КАЖДОМ отдельном вызове доступен — вешаем кнопки
-        # прямо на последний элемент, без отдельного "служебного" сообщения.
-        # Единственная разница — пост не превращается в свайпаемую галерею
-        # в Telegram, элементы идут просто друг за другом подряд.
-        if markup:
-            sent_ids = []
-            for i, mid in enumerate(ids):
-                is_last = i == len(ids) - 1
-                rm = markup if is_last else None
-                cap = text if (is_last and text and len(text) <= CAPTION_LIMIT) else None
-                m = await bot.copy_message(cfg.channel_id, origin_chat_id, mid,
-                                           message_thread_id=thread_id,
-                                           caption=cap, parse_mode="HTML" if cap else None,
-                                           reply_markup=rm)
-                sent_ids.append(m.message_id)
-            buttons_on = sent_ids[-1]
-            if text and len(text) > CAPTION_LIMIT:
-                m = await bot.send_message(cfg.channel_id, text, message_thread_id=thread_id)
-                sent_ids.append(m.message_id)
-            return PublishResult([], sent_ids, buttons_on)
-        # Без кнопок — можно спокойно группировать как настоящий альбом.
+        # Альбомы: copy_messages/send_media_group не поддерживают reply_markup —
+        # копируем батчем, затем при наличии кнопок отправляем отдельным
+        # сообщением с пояснением.
         sent_ids = [m.message_id for m in
-                   await bot.copy_messages(cfg.channel_id, origin_chat_id, ids,
-                                           message_thread_id=thread_id)]
+                    await bot.copy_messages(cfg.channel_id, origin_chat_id, ids,
+                                            message_thread_id=thread_id)]
+        extra_ids: list[int] = []
         if text:
             m = await bot.send_message(cfg.channel_id, text, message_thread_id=thread_id)
-            single_ids.append(m.message_id)
-        return PublishResult(sent_ids, single_ids, None)
+            extra_ids.append(m.message_id)
+        if markup:
+            btn_msg = await bot.send_message(cfg.channel_id, _ALBUM_BUTTONS_MSG,
+                                             message_thread_id=thread_id, reply_markup=markup)
+            extra_ids.append(btn_msg.message_id)
+            buttons_on = btn_msg.message_id
+        return PublishResult(sent_ids, extra_ids, buttons_on)
     try:
         # Если у оригинала есть caption-слот (фото/видео/документ и т.п.),
         # copy_message умеет заменить подпись на текст из шаблона и повесить
@@ -293,29 +283,16 @@ async def _publish_reconstructed(bot: Bot, cfg: ChildBot, *, text: str,
             and (origin_message_id or origin_message_ids):
         if origin_message_ids:
             ids = [int(x) for x in origin_message_ids.split(",")]
-            # БАГ (главный, "фантомные посты" + "кнопки отдельным
-            # сообщением"): раньше результат bot.copy_messages() тут просто
-            # отбрасывался (а в PublishResult уходили ИСХОДНЫЕ id сообщений
-            # из чата ПОДПИСЧИКА — при предпросмотре это чат админа! —
-            # отсюда и мусор в канале), и кнопки на альбом всегда шли
-            # отдельным "служебным" сообщением, т.к. copy_messages в принципе
-            # не поддерживает reply_markup. Теперь: если кнопок нет — как
-            # раньше, батч copy_messages (настоящий альбом); если кнопки
-            # есть — копируем элементы ПО ОДНОМУ и вешаем кнопки прямо на
-            # последний, без отдельного сообщения (см. тот же приём в
-            # _publish_fallback_copy выше).
-            if markup:
-                sent_ids = []
-                for i, mid in enumerate(ids):
-                    is_last = i == len(ids) - 1
-                    m = await bot.copy_message(cfg.channel_id, origin_chat_id, mid,
-                                               message_thread_id=thread_id,
-                                               reply_markup=markup if is_last else None)
-                    sent_ids.append(m.message_id)
-                return PublishResult([], sent_ids, sent_ids[-1])
+            # Альбомы: копируем батчем, при наличии кнопок — отдельным
+            # сообщением с пояснением.
             sent_ids = [m.message_id for m in
-                       await bot.copy_messages(cfg.channel_id, origin_chat_id, ids,
-                                               message_thread_id=thread_id)]
+                        await bot.copy_messages(cfg.channel_id, origin_chat_id, ids,
+                                                message_thread_id=thread_id)]
+            if markup:
+                btn_msg = await bot.send_message(
+                    cfg.channel_id, _ALBUM_BUTTONS_MSG,
+                    message_thread_id=thread_id, reply_markup=markup)
+                return PublishResult(sent_ids, [btn_msg.message_id], btn_msg.message_id)
             return PublishResult(sent_ids, [], None)
         else:
             m = await bot.copy_message(cfg.channel_id, origin_chat_id, origin_message_id,
@@ -325,26 +302,9 @@ async def _publish_reconstructed(bot: Bot, cfg: ChildBot, *, text: str,
     # --- режим "по шаблону" (реконструкция из html_text) ---
     if media_group:
         caption = text if text and len(text) <= CAPTION_LIMIT else None
-        if markup:
-            # См. комментарий в copy-mode ветке выше — то же самое: если
-            # нужны кнопки, элементы шлём ПО ОДНОМУ (не sendMediaGroup —
-            # он в принципе не умеет reply_markup), кнопки вешаем на
-            # последний, подпись — тоже на последний, чтобы она была прямо
-            # под кнопками, а не потерялась где-то в середине альбома.
-            sent_ids = []
-            for i, item in enumerate(media_group):
-                sender = bot.send_photo if item["type"] == "photo" else bot.send_video
-                is_last = i == len(media_group) - 1
-                m = await sender(cfg.channel_id, item["file_id"],
-                                 message_thread_id=thread_id,
-                                 caption=caption if is_last else None,
-                                 parse_mode="HTML" if (is_last and caption) else None,
-                                 reply_markup=markup if is_last else None)
-                sent_ids.append(m.message_id)
-            if text and caption is None:
-                m = await bot.send_message(cfg.channel_id, text, message_thread_id=thread_id)
-                sent_ids.append(m.message_id)
-            return PublishResult([], sent_ids, sent_ids[-1])
+        # Альбомы: send_media_group не поддерживает reply_markup — отправляем
+        # батчем (настоящая галерея), затем при наличии кнопок — отдельным
+        # сообщением с пояснением.
         media_objs = []
         for i, item in enumerate(media_group):
             cls = InputMediaPhoto if item["type"] == "photo" else InputMediaVideo
@@ -358,6 +318,11 @@ async def _publish_reconstructed(bot: Bot, cfg: ChildBot, *, text: str,
             # БАГ: текст длиннее 1024 в caption альбома раньше ронял публикацию
             m = await bot.send_message(cfg.channel_id, text, message_thread_id=thread_id)
             single_ids.append(m.message_id)
+        if markup:
+            btn_msg = await bot.send_message(cfg.channel_id, _ALBUM_BUTTONS_MSG,
+                                             message_thread_id=thread_id, reply_markup=markup)
+            single_ids.append(btn_msg.message_id)
+            return PublishResult(album_ids, single_ids, btn_msg.message_id)
         return PublishResult(album_ids, single_ids, None)
 
     if file_id and media_type in _MEDIA_SENDERS:
@@ -881,8 +846,9 @@ def build_posting_router() -> Router:
     # ================= модерация предложки =================
     @r.callback_query(F.data.startswith(("sg_ok:", "sg_no:")))
     async def decide(c: CallbackQuery, bot: Bot, bot_db_id: int):
-        if not await is_bot_admin(bot_db_id, c.from_user.id):
-            await c.answer("Нет доступа", show_alert=True); return
+        # Одобрять/отклонять может любой участник админ-чата (не только
+        # зарегистрированные в роутере админы). После действия в чат пишется
+        # кто именно одобрил или отказал.
         sg_id = int(c.data.split(":")[1])
         approve = c.data.startswith("sg_ok")
         # БАГ (главный, "два одинаковых поста в канале"): раньше тут было
@@ -937,8 +903,15 @@ def build_posting_router() -> Router:
                 await bot.send_message(sg.user_id, f"{em('cross')} Ваш пост отклонён.")
             except Exception:
                 pass
+        uname = c.from_user.username
+        actor = f"@{uname}" if uname else str(c.from_user.id)
+        action_text = f"✅ Одобрил — {actor}" if approve else f"❌ Отказал — {actor}"
         try:
             await c.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        try:
+            await c.message.answer(action_text)
         except Exception:
             pass
         await c.answer("✅ Готово")
