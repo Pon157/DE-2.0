@@ -187,7 +187,7 @@ async def _publish_via_copy(bot: Bot, cfg: ChildBot, source_chat_id: int,
             # отдельным сообщением следом, а не заменяем пересылку копией.
             await bot.forward_message(target_chat_id, source_chat_id, mid)
             if has_buttons and markup:
-                await bot.send_message(target_chat_id, "🔘", reply_markup=markup)
+                await bot.send_message(target_chat_id, "👆 Кнопки к посту выше", reply_markup=markup)
         else:
             rm = markup if has_buttons else None
             await bot.copy_message(target_chat_id, source_chat_id, mid, reply_markup=rm)
@@ -206,16 +206,19 @@ async def _publish_fallback_copy(bot: Bot, cfg: ChildBot, *, text: str,
     buttons_on = None
     if origin_message_ids:
         ids = [int(x) for x in origin_message_ids.split(",")]
-        await bot.copy_messages(cfg.channel_id, origin_chat_id, ids)
+        # Тот же баг, что и в _publish_reconstructed выше — нужны id
+        # НОВЫХ копий (в cfg.channel_id), а не исходные id из чата подписчика.
+        sent_ids = [m.message_id for m in
+                   await bot.copy_messages(cfg.channel_id, origin_chat_id, ids)]
         if text:
             m = await bot.send_message(cfg.channel_id, text, reply_markup=markup)
             single_ids.append(m.message_id)
             buttons_on = m.message_id if markup else None
         elif markup:
-            m = await bot.send_message(cfg.channel_id, "🔘", reply_markup=markup)
+            m = await bot.send_message(cfg.channel_id, "👆 Кнопки к посту выше", reply_markup=markup)
             single_ids.append(m.message_id)
             buttons_on = m.message_id
-        return PublishResult(ids, single_ids, buttons_on)
+        return PublishResult(sent_ids, single_ids, buttons_on)
     try:
         # Если у оригинала есть caption-слот (фото/видео/документ и т.п.),
         # copy_message умеет заменить подпись на текст из шаблона и повесить
@@ -254,16 +257,26 @@ async def _publish_reconstructed(bot: Bot, cfg: ChildBot, *, text: str,
             and (origin_message_id or origin_message_ids):
         if origin_message_ids:
             ids = [int(x) for x in origin_message_ids.split(",")]
-            await bot.copy_messages(cfg.channel_id, origin_chat_id, ids)
+            # БАГ (главный, "фантомные посты"): раньше результат
+            # bot.copy_messages() тут просто отбрасывался, а в PublishResult
+            # уходили ИСХОДНЫЕ id сообщений — из чата ПОДПИСЧИКА, а не из
+            # только что созданных копий в cfg.channel_id (при
+            # предпросмотре это чат админа!). Дальше _publish_via_copy
+            # пытался переслать/скопировать "из чата админа" сообщения с
+            # этими id — а в чате админа под такими же номерами почти
+            # наверняка лежат СОВСЕМ ДРУГИЕ, случайные сообщения (например,
+            # старое уведомление о предложке) — отсюда и мусор в канале.
+            sent_ids = [m.message_id for m in
+                       await bot.copy_messages(cfg.channel_id, origin_chat_id, ids)]
             single_ids = []
             buttons_on = None
             if markup:
                 # copy_messages (альбом) не поддерживает reply_markup —
                 # ограничение Bot API. Кнопки шлём отдельным сообщением.
-                m = await bot.send_message(cfg.channel_id, "🔘", reply_markup=markup)
+                m = await bot.send_message(cfg.channel_id, "👆 Кнопки к посту выше", reply_markup=markup)
                 single_ids.append(m.message_id)
                 buttons_on = m.message_id
-            return PublishResult(ids, single_ids, buttons_on)
+            return PublishResult(sent_ids, single_ids, buttons_on)
         else:
             m = await bot.copy_message(cfg.channel_id, origin_chat_id, origin_message_id,
                                        reply_markup=markup)
@@ -286,7 +299,7 @@ async def _publish_reconstructed(bot: Bot, cfg: ChildBot, *, text: str,
             single_ids.append(m.message_id)
         buttons_on = None
         if markup:
-            m = await bot.send_message(cfg.channel_id, "🔘", reply_markup=markup)
+            m = await bot.send_message(cfg.channel_id, "👆 Кнопки к посту выше", reply_markup=markup)
             single_ids.append(m.message_id)
             buttons_on = m.message_id
         return PublishResult(album_ids, single_ids, buttons_on)
