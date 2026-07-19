@@ -77,7 +77,7 @@ class BotManager:
                 await s.delete(row)
                 await s.commit()
 
-    async def _heartbeat_loop(self, bot_id: int):
+    async def _heartbeat_loop(self, bot_id: int, dp: Dispatcher):
         try:
             while True:
                 await asyncio.sleep(HEARTBEAT_EVERY)
@@ -86,6 +86,18 @@ class BotManager:
                     if row and row.holder == self._instance_id:
                         row.last_seen = datetime.utcnow()
                         await s.commit()
+                    cb = await s.get(ChildBot, bot_id)
+                # БАГ "бот не выключается из роутера": is_active могли
+                # поменять из ДРУГОГО процесса (например если старый
+                # контейнер после редеплоя не был до конца убит и всё ещё
+                # держит поллинг этого бота) — локальный stop_bot() в таком
+                # случае ничего не находит и тихо не срабатывает. Теперь
+                # процесс, который РЕАЛЬНО крутит поллинг, сам периодически
+                # сверяется с БД и гасит себя штатно через dp.stop_polling(),
+                # если увидел, что бота выключили.
+                if cb is not None and not cb.is_active:
+                    await dp.stop_polling()
+                    return
         except asyncio.CancelledError:
             pass
 
@@ -130,7 +142,7 @@ class BotManager:
             dp.include_router(build_posting_router())
 
         async def _run():
-            heartbeat = asyncio.create_task(self._heartbeat_loop(cb.id))
+            heartbeat = asyncio.create_task(self._heartbeat_loop(cb.id, dp))
             backoff = 5
             try:
                 while True:
