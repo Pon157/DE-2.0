@@ -28,6 +28,20 @@ log = logging.getLogger("child.common")
 
 
 async def safe_call(coro_func, *args, retries: int = 2, **kwargs):
+    """Вызывает Telegram-метод (aiogram coroutine factory) с автоповтором при
+    flood control (TelegramRetryAfter).
+
+    БАГ из прод-логов: при вспышке сообщений от подписчиков (несколько
+    альбомов/сообщений подряд) Telegram отвечает "Flood control exceeded...
+    Retry in N seconds" на send_message в чат админов. Раньше это исключение
+    нигде не ловилось — апдейт падал необработанным (видно в логах пачками
+    "is not handled"), сообщение молча терялось и админ его не видел вообще.
+    Теперь ждём подсказанное Telegram время и повторяем (до `retries` раз).
+
+    coro_func — вызываемое, возвращающее awaitable (например
+    `lambda: bot.send_message(...)`), НЕ уже awaited-корутина — её нельзя
+    было бы повторно await'нуть после первой попытки.
+    """
     for attempt in range(retries + 1):
         try:
             return await coro_func(*args, **kwargs)
@@ -43,6 +57,7 @@ class DonateSt(StatesGroup):
     amount = State()
 
 
+# Команды, которые нельзя переопределить триггер-командой из конструктора.
 RESERVED_COMMANDS = {"start", "restart", "cancel", "donate", "newpost", "done",
                      "ads", "ban", "unban", "warn", "unwarn", "ref", "pro"}
 
@@ -61,6 +76,12 @@ async def is_bot_admin(bot_db_id: int, user_id: int) -> bool:
 
 
 async def should_apply_antispam(bot_db_id: int, cfg: ChildBot, user_id: int) -> bool:
+    """Раньше антиспам ВСЕГДА пропускал и админов, и владельца — из-за этого
+    при проверке настроек владельцем казалось, что антиспам "не работает".
+    Теперь: обычные админы по-прежнему не проверяются (иначе они не смогут
+    модерировать во время наплыва сообщений), а владелец проверяется или нет
+    в зависимости от `cfg.antispam_ignore_owner` (тоггл в настройках —
+    удобно, чтобы протестировать антиспам на себе)."""
     if not cfg.antispam_enabled:
         return False
     is_admin = await is_bot_admin(bot_db_id, user_id)
@@ -71,10 +92,17 @@ async def should_apply_antispam(bot_db_id: int, cfg: ChildBot, user_id: int) -> 
     return False
 
 
-ALBUM_DEBOUNCE = 0.8
+# =========================================================================
+# Медиа и альбомы — перенесено сюда из child/posting.py, т.к. теперь ЭТИМ ЖЕ
+# пользуется и фидбек-бот (альбомы там раньше релеились по одному фото,
+# каждое с ОТДЕЛЬНОЙ шапкой — "с фотками всё сложно").
+# =========================================================================
+ALBUM_DEBOUNCE = 0.8  # секунд ждём остальные части альбома, прежде чем обработать
 
 
 def message_media(m: Message):
+    """(file_id, media_type) для ВСЕХ типов медиа, которые умеем релеить и
+    публиковать. Раньше voice/video_note/sticker молча терялись."""
     if m.photo:
         return m.photo[-1].file_id, "photo"
     if m.video:
@@ -99,6 +127,8 @@ _album_timers: dict[str, asyncio.Task] = {}
 
 
 async def buffer_or_process(m: Message, process):
+    """Копит сообщения альбома (media_group_id) и обрабатывает всей пачкой
+    через короткую паузу после последнего пришедшего сообщения группы."""
     if not m.media_group_id:
         await process([m])
         return
@@ -140,7 +170,12 @@ def text_from_messages(msgs: list[Message]) -> str:
     return ""
 
 
+# =========================================================================
+# Анон-id и шаблоны шапки/топика
+# =========================================================================
 def anon_id_for(bot_id: int, user_id: int) -> str:
+    """Стабильный анонимный короткий id пользователя в рамках конкретного
+    бота — админам есть на что ссылаться, не светя лишний раз настоящий id."""
     h = hashlib.md5(f"de:{bot_id}:{user_id}".encode()).hexdigest()[:8]
     return f"#{h}"
 
@@ -155,6 +190,9 @@ def _tpl_vars(bot_id: int, user_id: int, full_name: str | None, username: str | 
 
 
 def build_header(cfg: ChildBot, user) -> str:
+    """Шапка сообщения в админ-чате по шаблону владельца. Переменные:
+    {name}, {username}, {id}, {anon_id}. При любой ошибке в шаблоне —
+    безопасный дефолт (раньше битый шаблон ронял весь релей с исключением)."""
     try:
         return cfg.copy_header.format(**_tpl_vars(cfg.id, user.id, user.full_name, user.username))
     except Exception:
@@ -167,6 +205,9 @@ _TAG_RE = re.compile(r"<[^>]+>")
 
 def build_topic_name(cfg: ChildBot, user_id: int,
                      full_name: str | None, username: str | None) -> str:
+    """Имя форум-топика по шаблону владельца ({name}/{username}/{id}/{anon_id}
+    — можно всё вместе или по одной). HTML-теги вырезаются — имя топика в
+    Telegram всегда чистый текст."""
     tpl = cfg.topic_name_template or "✉️ {name} · {id}"
     try:
         name = tpl.format(**_tpl_vars(cfg.id, user_id, full_name, username))
@@ -177,6 +218,10 @@ def build_topic_name(cfg: ChildBot, user_id: int,
 
 
 async def inject_ad(bot_db_id: int, text: str) -> str:
+    """Добавляет активную оплаченную рекламу в конец стартового сообщения и
+    засчитывает показ. Реклама показывается ТОЛЬКО в том боте, в котором она
+    куплена (см. services/ads.py::get_active_ad_for_display). Автоматически
+    отключена, если владелец бота — Pro-подписчик."""
     ad = await ads_service.get_active_ad_for_display(bot_db_id)
     if not ad:
         return text
@@ -185,6 +230,8 @@ async def inject_ad(bot_db_id: int, text: str) -> str:
 
 
 async def inject_footer(bot_db_id: int, text: str) -> str:
+    """Приписка 'создано на платформе @Dialogue_Enginebot' — не показывается
+    у Pro-владельцев (часть привилегий подписки)."""
     async with Session() as s:
         cfg = await s.get(ChildBot, bot_db_id)
     if not cfg:
@@ -195,14 +242,28 @@ async def inject_footer(bot_db_id: int, text: str) -> str:
 
 
 async def inject_extras(bot_db_id: int, text: str) -> str:
+    """Реклама + приписка — единая точка вызова для приветственных сообщений."""
+    # strip: если приветствие — только фото без текста, без этого приписки
+    # начинались с пустых строк.
     text = (text or "").strip()
     text = await inject_ad(bot_db_id, text)
     text = await inject_footer(bot_db_id, text)
     return text
 
 
+# =========================================================================
+# Кнопки (inline-ссылки/триггеры, reply-клавиатура) — ОБЩИЙ билдер для
+# фидбек- и постинг-ботов.
+# =========================================================================
 async def build_keyboards(bot_db_id: int, cfg: ChildBot, extra_inline: list | None = None,
                           with_close_ticket: bool = False):
+    """Возвращает (InlineKeyboardMarkup|None, ReplyKeyboardMarkup|None).
+    with_close_ticket=True добавляет в reply-клавиатуру кнопку
+    "❌ Закрыть обращение" (см. open_ticket) — вместе с кнопкой доната, если
+    она тоже reply-типа, т.к. Telegram позволяет только ОДНУ активную
+    reply-клавиатуру в чате: раньше при появлении кнопки закрытия она бы
+    молча заменила собой кнопку доната (или наоборот) — здесь строятся
+    вместе, в одном вызове."""
     async with Session() as s:
         btns = (await s.scalars(select(BotButton).where(
             BotButton.bot_id == bot_db_id).order_by(BotButton.position))).all()
@@ -236,7 +297,31 @@ async def build_keyboards(bot_db_id: int, cfg: ChildBot, extra_inline: list | No
 
 
 async def send_with_keyboards(m: Message, text: str, ikb, rkb, photo: str | None = None):
+    """Отправляет сообщение с клавиатурами.
+
+    Telegram не позволяет прикрепить одновременно inline и reply клавиатуру к
+    одному сообщению — если нужны оба вида, отправляем инлайн с текстом/фото,
+    а следом отдельным сообщением выставляем reply-клавиатуру. У caption к
+    фото лимит 1024 символа — если текст не влезает, шлём фото и текст
+    отдельными сообщениями.
+
+    БАГ из прод-логов ("wrong file identifier/HTTP URL specified"):
+    file_id в Telegram привязан к конкретному боту, которым он был получен.
+    welcome_photo сохраняется в конструкторе через МАСТЕР-бота (владелец
+    присылает фото ЕМУ), а отправляет его уже ДОЧЕРНИЙ бот — с точки зрения
+    Telegram это два разных бота, и file_id одного для другого невалиден.
+    Итог — ЛЮБОЕ приветствие с фото падало с необработанным исключением при
+    первом же /start. Раз конвертировать file_id между ботами без лишнего
+    запроса к пользователю нельзя, здесь — защита: если фото не отправилось,
+    не роняем весь апдейт, а тихо откатываемся на отправку текста.
+    """
     PHOTO_CAPTION_LIMIT = 1024
+    # БАГ: если текст приветствия пуст (например, владелец прислал фото без
+    # подписи) И отправка фото падает (невалидный для этого бота file_id —
+    # см. комментарий выше), старый код делал `if text else None` — при
+    # пустом text это давало None и ЮЗЕР НЕ ПОЛУЧАЛ ВООБЩЕ НИЧЕГО на /start,
+    # без единой ошибки в логах. Теперь всегда гарантируем хоть какое-то
+    # сообщение — при пустом тексте подставляем нейтральный плейсхолдер.
     safe_text = text if text and text.strip() else f"{em('wave')} Привет!"
     if photo:
         try:
@@ -256,6 +341,17 @@ async def send_with_keyboards(m: Message, text: str, ikb, rkb, photo: str | None
 
 
 async def send_response(m: Message, text: str | None, photo: str | None = None):
+    """Ответ на триггер/команду/кейборд-кнопку.
+
+    БАГ: если владелец ставил на триггер ответ-фото БЕЗ текста, хендлеры
+    проверяли `if b.response_text:` и молча ничего не отправляли. Плюс лимит
+    caption 1024 — длинный текст с фото раньше ронял отправку.
+
+    Фото триггера тоже настраивается через МАСТЕР-бота и отправляется потом
+    ДОЧЕРНИМ — тот же класс бага, что и с welcome_photo (см.
+    send_with_keyboards): file_id может быть невалиден для этого бота.
+    Не роняем обработку — при ошибке отправки фото откатываемся на текст.
+    """
     text = text or ""
     if photo:
         try:
@@ -273,6 +369,8 @@ async def send_response(m: Message, text: str | None, photo: str | None = None):
 
 
 async def handle_keyboard_button(m: Message, bot_db_id: int) -> bool:
+    """Если m.text совпадает с текстом reply-кнопки — отвечает и возвращает
+    True (значит, апдейт обработан и дальше по цепочке идти не нужно)."""
     if not m.text:
         return False
     async with Session() as s:
@@ -286,6 +384,12 @@ async def handle_keyboard_button(m: Message, bot_db_id: int) -> bool:
 
 
 async def _notify_user(bot: Bot, bot_db_id: int, user_id: int, text: str):
+    """Best-effort ЛС пользователю. БАГ (статистика "заблокировали бота"):
+    раньше любая ошибка (включая TelegramForbiddenError — юзер заблокировал
+    бота) просто молча проглатывалась и НИГДЕ не фиксировалась — флаг
+    is_blocked_bot выставляла только массовая рассылка. Теперь при отказе
+    именно "заблокировал бота" статус сохраняется сразу, и пользователь
+    корректно появляется в статистике/списке заблокировавших."""
     try:
         await bot.send_message(user_id, text)
     except TelegramForbiddenError:
@@ -296,6 +400,14 @@ async def _notify_user(bot: Bot, bot_db_id: int, user_id: int, text: str):
 
 async def open_ticket(bot: Bot, cfg: ChildBot, user_id: int,
                       force_new: bool = False) -> tuple[Ticket, bool]:
+    """Открывает (или переиспользует) тикет-переписку с пользователем —
+    возвращает (ticket, created). created=True, если тикет только что создан
+    (по этому флагу на первое сообщение вешается кнопка закрытия обращения).
+
+    БАГ: если чат админов НЕ форум, а топики включены, create_forum_topic
+    падал с исключением и сообщение пользователя терялось ВООБЩЕ (не
+    релеилось). Теперь — мягкий фолбэк на режим без топика.
+    """
     async with Session() as s:
         t = await s.scalar(select(Ticket).where(
             Ticket.bot_id == cfg.id, Ticket.user_id == user_id, Ticket.is_open))
@@ -328,6 +440,12 @@ async def open_ticket(bot: Bot, cfg: ChildBot, user_id: int,
 
 
 async def _send_ticket_opened_keyboard(bot: Bot, cfg: ChildBot, user_id: int):
+    """БАГ: у пользователя не было НИКАКОГО способа самому закрыть
+    обращение — только админ мог закрыть его инлайн-кнопкой у себя. Здесь —
+    reply-клавиатура с кнопкой закрытия, отправляется пользователю сразу
+    при открытии тикета (в т.ч. когда это происходит "по факту" — например,
+    подписчик просто прислал предложку в постинг-боте, ему тоже нужно и
+    подтверждение, что сообщение дошло, и способ закрыть переписку)."""
     ikb, rkb = await build_keyboards(cfg.id, cfg, with_close_ticket=True)
     if rkb:
         try:
@@ -337,6 +455,11 @@ async def _send_ticket_opened_keyboard(bot: Bot, cfg: ChildBot, user_id: int):
             pass
 
 
+# =========================================================================
+# Релей сообщений пользователя в админ-чат (ЕДИНЫЙ для фидбек- и
+# постинг-ботов): forward/copy, шапка off/separate/merge, топики, альбомы,
+# reply-контекст, маппинг для ответов/реакций, кнопка закрытия обращения.
+# =========================================================================
 async def _map_msg(bot_db_id: int, admin_msg_id: int, user_id: int,
                    user_msg_id: int | None = None):
     async with Session() as s:
@@ -353,6 +476,11 @@ def _combine_kb(kb1, kb2):
 
 async def relay_to_admin_chat(msgs: list[Message], bot: Bot, cfg: ChildBot,
                               extra_kb: InlineKeyboardMarkup | None = None):
+    """Пересылает сообщения пользователя в админ-чат.
+
+    extra_kb — доп. кнопки (например "Принять/Отклонить" предложки). Кнопка
+    "🔒 Закрыть обращение" вешается на первое сообщение нового тикета.
+    """
     user = msgs[0].from_user
     ticket, created = await open_ticket(bot, cfg, user.id)
     thread = ticket.topic_id if cfg.use_topics else None
@@ -361,6 +489,9 @@ async def relay_to_admin_chat(msgs: list[Message], bot: Bot, cfg: ChildBot,
     is_album = len(msgs) > 1
     first = msgs[0]
 
+    # reply-контекст: если юзер ответил на сообщение, копия которого уже есть
+    # в админ-чате, — прикрепляем нашу копию ответом на ту же копию, чтобы
+    # админы ВИДЕЛИ, на что именно отвечает пользователь.
     reply_params = None
     if first.reply_to_message:
         async with Session() as s:
@@ -373,9 +504,17 @@ async def relay_to_admin_chat(msgs: list[Message], bot: Bot, cfg: ChildBot,
 
     close_kb = None
     if cfg.forward_mode == ForwardMode.copy:
+        # БАГ (по запросу): раньше кнопка "Закрыть обращение" вешалась
+        # ТОЛЬКО на первое сообщение нового тикета — на всех последующих
+        # сообщениях пользователя её не было вообще, приходилось скроллить
+        # вверх. В режиме copy у каждой копии есть свой reply_markup —
+        # вешаем кнопку на КАЖДОЕ сообщение. В режиме forward это
+        # невозможно (forwardMessage не поддерживает reply_markup вообще) —
+        # там вместо кнопки работает команда /close (реплаем или в топике).
         close_kb = InlineKeyboardMarkup(inline_keyboard=[[
             styled_button("🔒 Закрыть обращение", callback_data=f"close_ticket:{ticket.id}")]])
 
+    # --- режим "шапка слитно с сообщением" (только copy + одиночное сообщение)
     if header_mode == "merge" and cfg.forward_mode == ForwardMode.copy and not is_album:
         markup = _combine_kb(extra_kb, close_kb)
         if first.text:
@@ -393,17 +532,23 @@ async def relay_to_admin_chat(msgs: list[Message], bot: Bot, cfg: ChildBot,
                 cap = first.html_text or ""
                 merged = f"{header}\n\n{cap}" if cap else header
                 if len(merged) <= 1024:
+                    # copyMessage умеет заменять caption у медиа — шапка
+                    # становится частью подписи, одно сообщение вместо двух.
                     sent = await safe_call(
                         bot.copy_message, cfg.admin_chat_id, first.chat.id, first.message_id,
                         message_thread_id=thread, caption=merged,
                         reply_markup=markup, reply_parameters=reply_params)
                     await _map_msg(cfg.id, sent.message_id, user.id, first.message_id)
                     return
+        # не влезло/неподходящий тип — проваливаемся в режим отдельной шапки
 
+    # --- отдельная шапка
     if header_mode != "off":
         hm = await safe_call(bot.send_message, cfg.admin_chat_id, header,
                              message_thread_id=thread)
         await _map_msg(cfg.id, hm.message_id, user.id, None)
+        # close_kb НЕ обнуляем — теперь кнопка вешается на КАЖДОЕ сообщение
+        # пользователя (см. комментарий выше), а не только на шапку.
 
     if is_album:
         ids = [mm.message_id for mm in msgs]
@@ -414,18 +559,35 @@ async def relay_to_admin_chat(msgs: list[Message], bot: Bot, cfg: ChildBot,
             for mm, cp in zip(msgs, copies):
                 await _map_msg(cfg.id, cp.message_id, user.id, mm.message_id)
             if markup:
-                sm_expl = await safe_call(bot.send_message, cfg.admin_chat_id, "к сожалению, телеграм мне не позволяет прикреплять кнопки к альбомам. Но я могу отправить кнопки следующим сообщением.", message_thread_id=thread)
-                sm_btn = await safe_call(bot.send_message, cfg.admin_chat_id, "👆 Кнопки к посту выше",
+                # forwardMessages не поддерживает reply_markup вообще —
+                # ограничение Bot API, тут отдельное сообщение неизбежно.
+                # По запросу: явно объясняем админам, почему кнопки идут
+                # отдельным сообщением именно для альбомов (для одиночных
+                # сообщений этой проблемы нет — см. ветку ниже, там markup
+                # вешается через copy_message напрямую).
+                await safe_call(bot.send_message, cfg.admin_chat_id,
+                                f"{em('warn')} К сожалению, Telegram не позволяет прикреплять "
+                                "кнопки к альбомам при пересылке. Но я могу отправить кнопки "
+                                "следующим сообщением.",
+                                message_thread_id=thread)
+                sm = await safe_call(bot.send_message, cfg.admin_chat_id, "👆 Кнопки к посту выше",
                                      message_thread_id=thread, reply_markup=markup)
-                await _map_msg(cfg.id, sm_btn.message_id, user.id, None)
+                await _map_msg(cfg.id, sm.message_id, user.id, None)
         elif markup:
-            copies = await safe_call(bot.copy_messages, cfg.admin_chat_id, first.chat.id, ids, message_thread_id=thread)
+            # БАГ (по запросу — "кнопки отдельным сообщением"): copy_messages
+            # (батч) не поддерживает reply_markup ни на одном элементе — но
+            # обычный copy_message ПО ОДНОМУ поддерживает. Копируем элементы
+            # альбома по очереди и вешаем кнопки прямо на последний, без
+            # отдельного служебного сообщения.
+            copies = []
+            for i, mm in enumerate(msgs):
+                is_last = i == len(msgs) - 1
+                cp = await safe_call(bot.copy_message, cfg.admin_chat_id, first.chat.id,
+                                     mm.message_id, message_thread_id=thread,
+                                     reply_markup=markup if is_last else None)
+                copies.append(cp)
             for mm, cp in zip(msgs, copies):
                 await _map_msg(cfg.id, cp.message_id, user.id, mm.message_id)
-
-            sm_expl = await safe_call(bot.send_message, cfg.admin_chat_id, "к сожалению, телеграм мне не позволяет прикреплять кнопки к альбомам. Но я могу отправить кнопки следующим сообщением.", message_thread_id=thread)
-            sm_btn = await safe_call(bot.send_message, cfg.admin_chat_id, "👆 Кнопки к посту выше", message_thread_id=thread, reply_markup=markup)
-            await _map_msg(cfg.id, sm_btn.message_id, user.id, None)
         else:
             copies = await safe_call(bot.copy_messages, cfg.admin_chat_id, first.chat.id, ids,
                                      message_thread_id=thread)
@@ -435,6 +597,14 @@ async def relay_to_admin_chat(msgs: list[Message], bot: Bot, cfg: ChildBot,
 
     markup = _combine_kb(extra_kb, close_kb)
     if cfg.forward_mode == ForwardMode.forward and not markup:
+        # forwardMessage не поддерживает reply_markup вообще (ограничение Bot
+        # API) — но это ок, только когда кнопок нет. Если под сообщением
+        # нужны кнопки (например "Принять/Отклонить" предложки), forward
+        # такое молча не прикрепит, и раньше кнопки уходили ОТДЕЛЬНЫМ
+        # сообщением ПОСЛЕ фото/текста — визуально выглядело как "разрыв".
+        # Поэтому при наличии markup ниже используем copy_message вместо
+        # forward: копия поддерживает reply_markup и приходит ОДНИМ
+        # сообщением вместе с фото/текстом/подписью.
         sent = await safe_call(bot.forward_message, cfg.admin_chat_id, first.chat.id,
                                first.message_id, message_thread_id=thread)
         await _map_msg(cfg.id, sent.message_id, user.id, first.message_id)
@@ -446,6 +616,8 @@ async def relay_to_admin_chat(msgs: list[Message], bot: Bot, cfg: ChildBot,
 
 
 async def _mirror_reaction(bot: Bot, chat_id: int, message_id: int, reactions):
+    """Ставит на сообщение те же реакции-эмодзи. Кастомные (премиум) реакции
+    бот ставить не может — пропускаем; недопустимые эмодзи — молча игнорим."""
     emojis = [ReactionTypeEmoji(emoji=r.emoji) for r in reactions
               if getattr(r, "type", None) == "emoji" and getattr(r, "emoji", None)]
     try:
@@ -454,6 +626,12 @@ async def _mirror_reaction(bot: Bot, chat_id: int, message_id: int, reactions):
         pass
 
 
+# Защита от того, что один и тот же апдейт с /ban, /warn, /unban, /unwarn
+# обработается дважды (например если сеть/Telegram ретраит доставку, или
+# апдейт долетел до бота более одного раза) — тогда бан/варн "не работает",
+# т.к. warn+autoban сразу гасится следующим unwarn и т.п. Держим в памяти
+# последние обработанные (bot_db_id, message_id) недолго — этого достаточно,
+# ретраи приходят почти сразу друг за другом.
 _recent_mod_cmds: dict[tuple[int, int], float] = {}
 _MOD_CMD_DEDUP_TTL = 30.0
 
@@ -461,6 +639,7 @@ _MOD_CMD_DEDUP_TTL = 30.0
 def _mod_cmd_already_handled(bot_db_id: int, message_id: int) -> bool:
     now = _time.monotonic()
     key = (bot_db_id, message_id)
+    # чистим старое, чтобы словарь не рос бесконечно
     stale = [k for k, ts in _recent_mod_cmds.items() if now - ts > _MOD_CMD_DEDUP_TTL]
     for k in stale:
         _recent_mod_cmds.pop(k, None)
@@ -471,6 +650,9 @@ def _mod_cmd_already_handled(bot_db_id: int, message_id: int) -> bool:
 
 
 async def _target_from_reply(bot_db_id: int, m: Message) -> int | None:
+    """Если /ban, /warn и т.п. отправлены РЕПЛАЕМ на копию сообщения
+    пользователя в админ-чате (топик или нет — не важно), достаём айди
+    пользователя из MsgMap, чтобы не приходилось вручную вводить ID."""
     if not m.reply_to_message:
         return None
     async with Session() as s:
@@ -483,6 +665,11 @@ async def _target_from_reply(bot_db_id: int, m: Message) -> int | None:
 def build_common_router() -> Router:
     r = Router()
 
+    # ---------- модерация (работает и в ЛС, и в админ-чате) ----------
+    # /ban, /warn, /unban, /unwarn можно писать РЕПЛАЕМ на сообщение
+    # пользователя в админ-чате (с топиками или без) — тогда ID не нужен,
+    # причина/срок передаются как есть в аргументах. Без реплая работает
+    # как раньше — первым словом обязателен числовой Telegram ID.
     @r.message(Command("ban"))
     async def cmd_ban(m: Message, command: CommandObject, bot_db_id: int, bot: Bot):
         if not await is_bot_admin(bot_db_id, m.from_user.id):
@@ -580,7 +767,14 @@ def build_common_router() -> Router:
         await m.answer(f"{em('check')} " + text)
         await _notify_user(bot, bot_db_id, uid, f"{em('check')} С вас снято предупреждение.")
 
+    # ---------- донат в Stars ----------
     class _DonateKbText(BaseFilter):
+        """Текст reply-кнопки доната из настроек бота.
+
+        БАГ: раньше хендлер был прибит гвоздями к дефолтному тексту
+        «⭐️ Донат» — если владелец переименовал кнопку, нажатие улетало в
+        админ-чат как обычное сообщение вместо запуска доната.
+        """
         async def __call__(self, m: Message, bot_db_id: int) -> bool:
             if not m.text:
                 return False
@@ -592,6 +786,9 @@ def build_common_router() -> Router:
     @r.message(Command("donate"), F.chat.type == "private")
     @r.message(_DonateKbText(), F.chat.type == "private")
     async def donate_start(m: Message, bot_db_id: int, state: FSMContext):
+        # БАГ "блокировка не мешает писать": /donate и кнопка доната не
+        # проверяли бан вообще — забаненный пользователь мог продолжать
+        # пользоваться ботом через донат-флоу в обход бана.
         if await mod.is_banned(bot_db_id, m.from_user.id):
             return
         cfg = await get_cfg(bot_db_id)
@@ -606,6 +803,7 @@ def build_common_router() -> Router:
             await state.clear()
             return
         if m.text and m.text.startswith("/"):
+            # команда в середине ввода — отменяем донат и отдаём команду дальше
             await state.clear()
             raise SkipHandler
         await state.clear()
@@ -646,11 +844,18 @@ def build_common_router() -> Router:
         if not cfg or not cfg.donate_enabled:
             await c.answer()
             return
+        # БАГ (главный по репорту): после нажатия инлайн-кнопки доната НЕ
+        # выставлялось состояние DonateSt.amount — введённое число не
+        # обрабатывалось хендлером доната, а улетало в админ-чат как обычное
+        # сообщение. Теперь состояние ставится и здесь, и в /donate.
         await state.set_state(DonateSt.amount)
         await c.message.answer(f"{em('star')} Введите количество звёзд для доната (1–10000):")
         await c.answer()
 
+    # ---------- самостоятельное закрытие обращения пользователем ----------
     class _CloseTicketKbText(BaseFilter):
+        """Текст reply-кнопки закрытия обращения — по тому же принципу, что
+        и _DonateKbText выше (учитывает переименование кнопки владельцем)."""
         async def __call__(self, m: Message, bot_db_id: int) -> bool:
             if not m.text:
                 return False
@@ -673,6 +878,8 @@ def build_common_router() -> Router:
         cfg = await get_cfg(bot_db_id)
         await m.answer(f"{em('check')} Обращение закрыто. Спасибо!",
                        reply_markup=ReplyKeyboardRemove())
+        # уведомляем админ-чат, что обращение закрыто САМИМ пользователем
+        # (а не админом) — чтобы не было впечатления, будто оно повисло
         if cfg and cfg.admin_chat_id:
             try:
                 await bot.send_message(
@@ -681,8 +888,11 @@ def build_common_router() -> Router:
             except Exception:
                 pass
 
+    # ---------- триггер-кнопки и кнопка "открыть обращение" ----------
     @r.callback_query(F.data.startswith("trg:"))
     async def cb_trigger(c: CallbackQuery, bot_db_id: int):
+        # БАГ: триггер-кнопки не проверяли бан — забаненный мог продолжать
+        # получать авто-ответы бота как ни в чём не бывало.
         if await mod.is_banned(bot_db_id, c.from_user.id):
             await c.answer("Вы забанены в этом боте.", show_alert=True)
             return
@@ -695,6 +905,8 @@ def build_common_router() -> Router:
 
     @r.callback_query(F.data == "open_ticket")
     async def cb_open_ticket(c: CallbackQuery, bot: Bot, bot_db_id: int):
+        # БАГ: кнопка "открыть обращение" не проверяла бан — самый прямой
+        # путь для забаненного снова начать писать в чат админов в обход бана.
         if await mod.is_banned(bot_db_id, c.from_user.id):
             await c.answer("Вы забанены в этом боте.", show_alert=True)
             return
@@ -702,11 +914,17 @@ def build_common_router() -> Router:
         await open_ticket(bot, cfg, c.from_user.id, force_new=True)
         await c.answer("Обращение открыто! Напишите сообщение.", show_alert=True)
 
+    # ---------- триггер-команды (ОБЩИЕ для обоих типов ботов) ----------
+    # БАГ: раньше жили только в фидбек-роутере — в постинг-ботах
+    # триггер-команды не работали вообще, а сами команды улетали в админ-чат
+    # как предложка.
     @r.message(F.chat.type == "private", F.text.startswith("/"))
     async def custom_command(m: Message, bot_db_id: int):
         cmd = m.text.split()[0].lstrip("/").split("@")[0].lower()
         if cmd in RESERVED_COMMANDS:
             raise SkipHandler
+        # БАГ: пользовательские триггер-команды не проверяли бан —
+        # забаненный мог продолжать получать авто-ответы через них.
         if await mod.is_banned(bot_db_id, m.from_user.id):
             return
         cfg = await get_cfg(bot_db_id)
@@ -715,10 +933,19 @@ def build_common_router() -> Router:
                 BotButton.bot_id == bot_db_id, BotButton.kind == "command",
                 BotButton.text == cmd))
         if not b:
+            # КРИТИЧНО: неизвестную/чужую команду нельзя "съедать" молча —
+            # пропускаем дальше по роутерам (/newpost, /cancel и т.п. живут в
+            # роутере конкретного типа бота).
             raise SkipHandler
         await send_response(m, b.response_text, b.response_photo)
 
+    # ---------- закрытие / переоткрытие обращения ----------
     async def _close_ticket_core(bot: Bot, bot_db_id: int, tid: int) -> str | None:
+        """Общая логика закрытия тикета — используется и инлайн-кнопкой
+        (доступна только в copy-режиме), и командой /close (работает в
+        любом режиме — единственный способ закрыть тикет при forward, и
+        альтернативный способ при copy). Возвращает текст ошибки (если
+        что-то пошло не так) или None при успехе."""
         async with Session() as s:
             t = await s.get(Ticket, tid)
             cfg = await s.get(ChildBot, bot_db_id)
@@ -746,33 +973,45 @@ def build_common_router() -> Router:
 
     @r.callback_query(F.data.startswith("close_ticket:"))
     async def cb_close_ticket(c: CallbackQuery, bot: Bot, bot_db_id: int):
+        # БАГ (по запросу): раньше закрыть обращение мог только admin,
+        # явно добавленный в BotAdmin — обычные участники админ-чата (у
+        # которых и так есть доступ к этой кнопке, т.к. она видна только в
+        # admin_chat_id) получали "Только администраторы бота". Доступ к
+        # самому чату — уже достаточный контроль, отдельная проверка
+        # is_bot_admin тут больше не нужна; кто именно нажал — подписываем
+        # в ответе ниже.
         tid = int(c.data.split(":")[1])
         err = await _close_ticket_core(bot, bot_db_id, tid)
         if err:
             await c.answer(err, show_alert=(err == "Обращение не найдено"))
             return
-        
-        uname = c.from_user.username or c.from_user.first_name
-        user_str = f"@{uname}" if c.from_user.username else uname
-        
         try:
-            markup = InlineKeyboardMarkup(
+            await c.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[[styled_button("🔓 Открыть снова",
-                                                callback_data=f"reopen_ticket:{tid}")]])
-            
-            text = c.message.html_text or c.message.caption or ""
-            text += f"\n\n🔒 закрыл - {user_str}"
-            if c.message.text:
-                await c.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
-            else:
-                await c.message.edit_caption(caption=text, reply_markup=markup, parse_mode="HTML")
+                                                callback_data=f"reopen_ticket:{tid}")]]))
+        except Exception:
+            pass
+        actor = f"@{c.from_user.username}" if c.from_user.username else c.from_user.full_name
+        try:
+            await c.message.reply(f"🔒 Закрыл: {actor}")
         except Exception:
             pass
         await c.answer("Обращение закрыто")
 
+    # ---------- /close: закрыть обращение командой (реплаем или в топике) ----------
+    # БАГ (по запросу): в режиме forward инлайн-кнопку закрытия вообще
+    # некуда прицепить (forwardMessage не поддерживает reply_markup) — там
+    # это ЕДИНСТВЕННЫЙ способ закрыть тикет. В copy-режиме работает как
+    # равноценная альтернатива кнопке.
     @r.message(Command("close"))
     async def cmd_close(m: Message, bot: Bot, bot_db_id: int):
-        if not await is_bot_admin(bot_db_id, m.from_user.id):
+        # БАГ (по запросу): раньше /close работал только для admin из
+        # BotAdmin. Теперь достаточно писать команду из самого админ-чата
+        # бота (m.chat.id == cfg.admin_chat_id) — это уже надёжный контроль
+        # доступа, т.к. посторонние в этот чат не попадают; в приватном
+        # чате (не админ-чат) команда по-прежнему никому не доступна.
+        cfg = await get_cfg(bot_db_id)
+        if not cfg or m.chat.id != cfg.admin_chat_id:
             return
         ticket_id = None
         if m.reply_to_message:
@@ -796,10 +1035,16 @@ def build_common_router() -> Router:
                            "прямо в топике этого обращения.")
             return
         err = await _close_ticket_core(bot, bot_db_id, ticket_id)
-        await m.answer(f"{em('cross') if err else em('check')} {err or 'Обращение закрыто.'}")
+        if err:
+            await m.answer(f"{em('cross')} {err}")
+            return
+        actor = f"@{m.from_user.username}" if m.from_user.username else m.from_user.full_name
+        await m.answer(f"{em('check')} Обращение закрыто. Закрыл: {actor}")
 
     @r.callback_query(F.data.startswith("reopen_ticket:"))
     async def cb_reopen_ticket(c: CallbackQuery, bot: Bot, bot_db_id: int):
+        # См. комментарий в cb_close_ticket — кнопка видна только в
+        # admin_chat_id, отдельная проверка is_bot_admin избыточна.
         tid = int(c.data.split(":")[1])
         async with Session() as s:
             t = await s.get(Ticket, tid)
@@ -817,32 +1062,27 @@ def build_common_router() -> Router:
                 await bot.reopen_forum_topic(cfg.admin_chat_id, t.topic_id)
             except Exception:
                 pass
-        
-        uname = c.from_user.username or c.from_user.first_name
-        user_str = f"@{uname}" if c.from_user.username else uname
-
         try:
-            markup = InlineKeyboardMarkup(
+            await c.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[[styled_button("🔒 Закрыть обращение",
-                                                callback_data=f"close_ticket:{tid}")]])
-            
-            text = c.message.html_text or c.message.caption or ""
-            text += f"\n\n🔓 открыл - {user_str}"
-            if c.message.text:
-                await c.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
-            else:
-                await c.message.edit_caption(caption=text, reply_markup=markup, parse_mode="HTML")
+                                                callback_data=f"close_ticket:{tid}")]]))
+        except Exception:
+            pass
+        actor = f"@{c.from_user.username}" if c.from_user.username else c.from_user.full_name
+        try:
+            await c.message.reply(f"🔓 Открыл снова: {actor}")
         except Exception:
             pass
         await c.answer("Обращение снова открыто")
 
+    # ---------- админ-чат: ответы пользователям (ОБЩИЕ для обоих типов) ----------
     @r.message(F.chat.type.in_({"group", "supergroup"}))
     async def admin_reply(m: Message, bot: Bot, bot_db_id: int):
         cfg = await get_cfg(bot_db_id)
         if not cfg or m.chat.id != cfg.admin_chat_id or m.from_user.is_bot:
             return
         if m.text and m.text.startswith("/"):
-            return
+            return  # команды модерации обработаны выше; неизвестные — игнорим
         target_uid = None
         reply_params = None
         if cfg.use_topics and m.message_thread_id:
@@ -859,6 +1099,8 @@ def build_common_router() -> Router:
                 ).order_by(MsgMap.id.desc()))
             if mp:
                 target_uid = target_uid or mp.user_id
+                # reply-контекст в обратную сторону: юзер видит, на какое его
+                # сообщение ответил админ.
                 if mp.user_chat_msg_id and mp.user_id == target_uid:
                     reply_params = ReplyParameters(message_id=mp.user_chat_msg_id)
         if not target_uid:
@@ -873,11 +1115,19 @@ def build_common_router() -> Router:
                 await s.commit()
             await m.react([{"type": "emoji", "emoji": "👍"}])
         except TelegramForbiddenError:
+            # БАГ: сообщение об ошибке говорило "заблокировал бота", но
+            # нигде это не сохранялось — в статистике человек всё равно
+            # числился активным, пока его случайно не задевала рассылка.
             await mod.mark_blocked_bot(bot_db_id, target_uid)
             await m.reply(f"{em('cross')} Не доставлено (пользователь заблокировал бота).")
         except Exception:
             await m.reply(f"{em('cross')} Не доставлено (пользователь заблокировал бота).")
 
+    # ---------- реакции-эмодзи: зеркалим в обе стороны ----------
+    # Юзер ставит реакцию в ЛС -> та же реакция появляется на копии в
+    # админ-чате. Админ ставит реакцию в админ-чате -> она появляется на
+    # сообщении юзера. (allowed_updates подхватывается автоматически, т.к.
+    # дочерние диспетчеры используют resolve_used_update_types().)
     @r.message_reaction(F.chat.type == "private")
     async def user_reaction(ev: MessageReactionUpdated, bot: Bot, bot_db_id: int):
         cfg = await get_cfg(bot_db_id)
