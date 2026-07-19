@@ -12,7 +12,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (Message, PreCheckoutQuery, LabeledPrice,
                            CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-                           ReplyKeyboardMarkup, KeyboardButton,
+                           ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton,
                            MessageReactionUpdated, ReactionTypeEmoji, ReplyParameters)
 from sqlalchemy import select
 from db.base import Session
@@ -255,8 +255,15 @@ async def inject_extras(bot_db_id: int, text: str) -> str:
 # Кнопки (inline-ссылки/триггеры, reply-клавиатура) — ОБЩИЙ билдер для
 # фидбек- и постинг-ботов.
 # =========================================================================
-async def build_keyboards(bot_db_id: int, cfg: ChildBot, extra_inline: list | None = None):
-    """Возвращает (InlineKeyboardMarkup|None, ReplyKeyboardMarkup|None)."""
+async def build_keyboards(bot_db_id: int, cfg: ChildBot, extra_inline: list | None = None,
+                          with_close_ticket: bool = False):
+    """Возвращает (InlineKeyboardMarkup|None, ReplyKeyboardMarkup|None).
+    with_close_ticket=True добавляет в reply-клавиатуру кнопку
+    "❌ Закрыть обращение" (см. open_ticket) — вместе с кнопкой доната, если
+    она тоже reply-типа, т.к. Telegram позволяет только ОДНУ активную
+    reply-клавиатуру в чате: раньше при появлении кнопки закрытия она бы
+    молча заменила собой кнопку доната (или наоборот) — здесь строятся
+    вместе, в одном вызове."""
     async with Session() as s:
         btns = (await s.scalars(select(BotButton).where(
             BotButton.bot_id == bot_db_id).order_by(BotButton.position))).all()
@@ -282,6 +289,8 @@ async def build_keyboards(bot_db_id: int, cfg: ChildBot, extra_inline: list | No
             inline_rows.append([styled_button(cfg.donate_button_text, callback_data="donate_btn")])
         else:
             kb_rows.append([KeyboardButton(text=cfg.donate_button_text)])
+    if with_close_ticket:
+        kb_rows.append([KeyboardButton(text=cfg.close_ticket_button_text)])
     ikb = InlineKeyboardMarkup(inline_keyboard=inline_rows) if inline_rows else None
     rkb = ReplyKeyboardMarkup(keyboard=kb_rows, resize_keyboard=True) if kb_rows else None
     return ikb, rkb
@@ -426,7 +435,24 @@ async def open_ticket(bot: Bot, cfg: ChildBot, user_id: int,
         t = Ticket(bot_id=cfg.id, user_id=user_id, topic_id=topic_id)
         s.add(t)
         await s.commit()
-        return t, True
+    await _send_ticket_opened_keyboard(bot, cfg, user_id)
+    return t, True
+
+
+async def _send_ticket_opened_keyboard(bot: Bot, cfg: ChildBot, user_id: int):
+    """БАГ: у пользователя не было НИКАКОГО способа самому закрыть
+    обращение — только админ мог закрыть его инлайн-кнопкой у себя. Здесь —
+    reply-клавиатура с кнопкой закрытия, отправляется пользователю сразу
+    при открытии тикета (в т.ч. когда это происходит "по факту" — например,
+    подписчик просто прислал предложку в постинг-боте, ему тоже нужно и
+    подтверждение, что сообщение дошло, и способ закрыть переписку)."""
+    ikb, rkb = await build_keyboards(cfg.id, cfg, with_close_ticket=True)
+    if rkb:
+        try:
+            await bot.send_message(user_id, f"{em('check')} Обращение открыто — "
+                                   "можно продолжать писать сюда.", reply_markup=rkb)
+        except Exception:
+            pass
 
 
 # =========================================================================
@@ -793,6 +819,42 @@ def build_common_router() -> Router:
         await c.message.answer(f"{em('star')} Введите количество звёзд для доната (1–10000):")
         await c.answer()
 
+    # ---------- самостоятельное закрытие обращения пользователем ----------
+    class _CloseTicketKbText(BaseFilter):
+        """Текст reply-кнопки закрытия обращения — по тому же принципу, что
+        и _DonateKbText выше (учитывает переименование кнопки владельцем)."""
+        async def __call__(self, m: Message, bot_db_id: int) -> bool:
+            if not m.text:
+                return False
+            cfg = await get_cfg(bot_db_id)
+            return bool(cfg and m.text.strip() == cfg.close_ticket_button_text.strip())
+
+    @r.message(_CloseTicketKbText(), F.chat.type == "private")
+    async def user_close_ticket(m: Message, bot: Bot, bot_db_id: int):
+        if await mod.is_banned(bot_db_id, m.from_user.id):
+            return
+        async with Session() as s:
+            t = await s.scalar(select(Ticket).where(
+                Ticket.bot_id == bot_db_id, Ticket.user_id == m.from_user.id, Ticket.is_open))
+            if not t:
+                await m.answer(f"{em('info')} У вас нет открытых обращений.",
+                               reply_markup=ReplyKeyboardRemove())
+                return
+            t.is_open = False
+            await s.commit()
+        cfg = await get_cfg(bot_db_id)
+        await m.answer(f"{em('check')} Обращение закрыто. Спасибо!",
+                       reply_markup=ReplyKeyboardRemove())
+        # уведомляем админ-чат, что обращение закрыто САМИМ пользователем
+        # (а не админом) — чтобы не было впечатления, будто оно повисло
+        if cfg and cfg.admin_chat_id:
+            try:
+                await bot.send_message(
+                    cfg.admin_chat_id, f"{em('info')} Пользователь сам закрыл обращение.",
+                    message_thread_id=t.topic_id if cfg.use_topics else None)
+            except Exception:
+                pass
+
     # ---------- триггер-кнопки и кнопка "открыть обращение" ----------
     @r.callback_query(F.data.startswith("trg:"))
     async def cb_trigger(c: CallbackQuery, bot_db_id: int):
@@ -873,9 +935,19 @@ def build_common_router() -> Router:
                                                 callback_data=f"reopen_ticket:{tid}")]]))
         except Exception:
             pass
-        await _notify_user(bot, bot_db_id, t.user_id,
-                           f"{em('lock')} Обращение закрыто администрацией. "
-                           "Ваше новое сообщение откроет новое обращение.")
+        # БАГ: у пользователя оставалась висеть reply-клавиатура с кнопкой
+        # "Закрыть обращение" даже после того, как админ уже закрыл его —
+        # нажатие на неё просто отвечало "нет открытых обращений", что
+        # выглядело странно. Убираем клавиатуру сразу же.
+        try:
+            await bot.send_message(t.user_id,
+                                   f"{em('lock')} Обращение закрыто администрацией. "
+                                   "Ваше новое сообщение откроет новое обращение.",
+                                   reply_markup=ReplyKeyboardRemove())
+        except TelegramForbiddenError:
+            await mod.mark_blocked_bot(bot_db_id, t.user_id)
+        except Exception:
+            pass
         await c.answer("Обращение закрыто")
 
     @r.callback_query(F.data.startswith("reopen_ticket:"))
