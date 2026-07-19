@@ -83,6 +83,12 @@ class ChildBot(Base):
     ticket_button_text: Mapped[str] = mapped_column(String(64), default="✉️ Открыть обращение")
     ticket_button_style: Mapped[str | None] = mapped_column(String(16), nullable=True)
     ticket_button_icon: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # БАГ (по запросу): у пользователя не было НИКАКОГО способа самому
+    # закрыть своё обращение — кнопка "🔒 Закрыть обращение" вешалась
+    # инлайн ТОЛЬКО в копии сообщения у админа (см. relay_to_admin_chat),
+    # для самого пользователя её не было вообще. Reply-клавиатура — потому
+    # что это разговорное действие, аналогично кнопке доната.
+    close_ticket_button_text: Mapped[str] = mapped_column(String(64), default="❌ Закрыть обращение")
     always_new_ticket: Mapped[bool] = mapped_column(Boolean, default=False)  # /start или restart-кнопка -> новый тикет/топик
 
     # ---- настройки posting ----
@@ -276,6 +282,12 @@ class Advertisement(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     decided_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     paid_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Если это заявка на ПРОДЛЕНИЕ уже активной кампании (см.
+    # services/ads.py::extend_active_ad) — id той кампании. Идёт через
+    # обычный цикл модерации/оплаты как самостоятельная заявка, чтобы не
+    # трогать статус ещё показывающейся кампании (не прерывать её показы),
+    # а после оплаты просто добавляет свои показы к оригиналу.
+    extends_ad_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class AdCooldown(Base):
