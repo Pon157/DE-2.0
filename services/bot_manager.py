@@ -72,11 +72,10 @@ class BotManager:
                         await s.commit()
                     cb = await s.get(ChildBot, bot_id)
                 
-                # ИСПРАВЛЕНО: гасим поллинг и если выключен, и если совсем удален из БД
+                # ДЕБАГ: Логируем реакцию фонового хертбита на изменение записи в БД
                 if cb is None or not cb.is_active:
-                    log.info("Heartbeat: бот %s деактивирован или удален, тушим поллинг", bot_id)
+                    log.info("[DEBUG_BOT] Хертбит: Бот %s деактивирован (is_active=False) или удален. Сигнализирую stop_polling()", bot_id)
                     await dp.stop_polling()
-                    # УБРАЛИ return! Цикл должен жить, пока его не отменит finally основного воркера
         except asyncio.CancelledError:
             pass
 
@@ -118,32 +117,47 @@ class BotManager:
             backoff = 5
             try:
                 while True:
-                    # ИСПРАВЛЕНО: Жесткая проверка статуса в БД перед каждым запуском поллинга.
-                    # Если бот проснулся после бэкоффа/ошибки сети, а его выключили — завершаем цикл.
+                    # ДЕБАГ: Логируем факт новой итерации цикла и запрос к БД
+                    log.info("[DEBUG_BOT] Воркер @%s: Проверяю актуальный статус в БД перед стартом сессии...", cb.username)
                     async with Session() as s:
                         current_cb = await s.get(ChildBot, cb.id)
-                    if current_cb is None or not current_cb.is_active:
-                        log.info("Воркер: бот @%s деактивирован в БД. Корректно завершаем работу.", cb.username)
+                    
+                    if current_cb is None:
+                        log.warning("[DEBUG_BOT] Воркер @%s: Бот полностью удален из БД. Завершаю поток воркера.", cb.username)
+                        return
+                    
+                    log.info("[DEBUG_BOT] Воркер @%s: Ответ БД получен. Текущий флаг is_active = %s", cb.username, current_cb.is_active)
+                    
+                    if not current_cb.is_active:
+                        log.info("[DEBUG_BOT] Воркер @%s: Обнаружен флаг остановки (is_active=False). Мягко выхожу из цикла.", cb.username)
                         return
 
                     try:
+                        log.info("[DEBUG_BOT] Воркер @%s: Инициализирую вызов dp.start_polling()", cb.username)
                         await dp.start_polling(
                             bot, handle_signals=False,
                             allowed_updates=dp.resolve_used_update_types())
+                        
+                        log.info("[DEBUG_BOT] Воркер @%s: Сессия dp.start_polling() завершилась штатно.", cb.username)
                         return  # штатная остановка (stop_polling / отмена)
                     except TelegramConflictError:
-                        log.warning("Conflict for bot %s (@%s), retry in %ss",
-                                    cb.id, cb.username, backoff)
+                        log.warning("[DEBUG_BOT] Воркер @%s: Конфликт токенов (TelegramConflictError). Засыпаю на %ss перед ретраем.",
+                                    cb.username, backoff)
                         await asyncio.sleep(backoff)
                         backoff = min(backoff * 2, 60)
                     except TelegramUnauthorizedError:
-                        log.error("Bot @%s: token revoked, stopping", cb.username)
+                        log.error("[DEBUG_BOT] Воркер @%s: Токен заблокирован ТГ (TelegramUnauthorizedError). Выхожу.", cb.username)
                         return
+                    except Exception as e:
+                        log.exception("[DEBUG_BOT] Воркер @%s: Поймано исключение внутри старта поллинга: %s", cb.username, e)
+                        await asyncio.sleep(backoff)
             except asyncio.CancelledError:
+                log.info("[DEBUG_BOT] Воркер @%s: Получена жесткая отмена задачи (CancelledError).", cb.username)
                 raise
             except Exception as e:
                 log.exception("Bot %s crashed: %s", cb.username, e)
             finally:
+                log.info("[DEBUG_BOT] Воркер @%s: Вхожу в блок finally очистки ресурсов воркера.", cb.username)
                 heartbeat.cancel()
                 try:
                     await heartbeat
@@ -152,6 +166,7 @@ class BotManager:
                 await self._release_runtime_lock(cb.id)
                 try:
                     await bot.session.close()
+                    log.info("[DEBUG_BOT] Воркер @%s: Сессия aiohttp закрыта успешно.", cb.username)
                 except Exception:
                     pass
 
@@ -167,6 +182,7 @@ class BotManager:
         task = self.tasks.pop(bot_id, None)
         bot = self.bots.pop(bot_id, None)
         if task:
+            log.info("[DEBUG_BOT] stop_bot: Вызываю явный cancel() для таски бота id=%s", bot_id)
             task.cancel()
             try:
                 await asyncio.wait_for(asyncio.shield(task), timeout=10)
