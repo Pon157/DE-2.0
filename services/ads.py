@@ -139,6 +139,25 @@ async def mark_paid(ad_id: int, payment_id: str) -> Advertisement | None:
         ad.paid = True
         ad.payment_id = payment_id
         ad.paid_at = datetime.utcnow()
+        if ad.extends_ad_id:
+            # Это заявка на ПРОДЛЕНИЕ уже активной (или любой другой)
+            # кампании — не переключаем в active сама по себе (не создаём
+            # вторую параллельно "живую" запись на тот же текст/бота),
+            # вместо этого сразу вливаем оплаченные показы в оригинал.
+            # Оригинал при этом ни на миг не останавливается — его
+            # status/shown_count не трогаем, только увеличиваем лимит.
+            parent = await s.get(Advertisement, ad.extends_ad_id)
+            if parent:
+                parent.target_impressions += ad.target_impressions
+                if parent.status == AdStatus.finished:
+                    # если оригинал успел исчерпаться, пока продление ждало
+                    # оплаты — реактивируем его, показы снова пойдут
+                    parent.status = AdStatus.active
+            ad.status = AdStatus.finished  # сама запись-продление больше нигде не участвует
+            ad.shown_count = ad.target_impressions
+            await s.commit()
+            await s.refresh(parent) if parent else None
+            return parent or ad
         ad.status = AdStatus.active
         await s.commit()
         await s.refresh(ad)
@@ -228,22 +247,28 @@ async def get_ad_for_owner(ad_id: int, buyer_id: int) -> Advertisement | None:
 
 
 async def extend_ad(ad_id: int, buyer_id: int, extra_impressions: int) -> Advertisement | None:
-    """"Продлить" кампанию — докупить ещё показов к УЖЕ ИСЧЕРПАННОЙ
-    impressions-кампании (kind=impressions, status=finished). Специально не
-    позволяем продлевать ещё АКТИВНУЮ кампанию через смену статуса на
-    awaiting_payment — это бы прервало её текущий показ до новой оплаты.
-    Для активной кампании корректный путь — просто дождаться, пока она
-    закончится, либо купить новую через /ads."""
+    """"Продлить" кампанию — докупить ещё показов к impressions-кампании,
+    ДАЖЕ ПОКА ОНА ЕЩЁ АКТИВНА и показывается. Раньше это было возможно
+    только для уже полностью исчерпанной (finished) кампании — расширение
+    активной штатно требовало бы временно переводить её в awaiting_payment,
+    что прервало бы показы до оплаты.
+
+    Реализовано через ОТДЕЛЬНУЮ заявку (Advertisement.extends_ad_id) —
+    проходит обычную модерацию/оплату независимо, а после оплаты (см.
+    mark_paid) её показы вливаются в оригинал одним increment'ом, без
+    единой секунды простоя исходной кампании."""
     async with Session() as s:
         ad = await s.get(Advertisement, ad_id)
         if not ad or ad.buyer_id != buyer_id or ad.kind != AdKind.impressions:
             return None
-        if ad.status != AdStatus.finished:
+        if ad.status not in (AdStatus.active, AdStatus.finished):
             return None
-        ad.target_impressions += extra_impressions
-        ad.price_rub += price_for_impressions(extra_impressions)
-        ad.status = AdStatus.awaiting_payment  # новая оплата за добавленные показы
-        ad.paid = False
+        price = price_for_impressions(extra_impressions)
+        extension = Advertisement(buyer_id=buyer_id, source_bot_id=ad.source_bot_id,
+                                  kind=AdKind.impressions, text=ad.text,
+                                  target_impressions=extra_impressions, price_rub=price,
+                                  status=AdStatus.pending, extends_ad_id=ad.id)
+        s.add(extension)
         await s.commit()
-        await s.refresh(ad)
-        return ad
+        await s.refresh(extension)
+        return extension
