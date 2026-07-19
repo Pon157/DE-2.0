@@ -1,4 +1,5 @@
 from aiogram import Router, F, Bot
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart, Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -56,8 +57,15 @@ async def _mark_terms_accepted(user_id: int):
 from collections import deque
 import time as _time
 
-_ROUTER_RATE_MAX = 15       # сообщений
-_ROUTER_RATE_WINDOW = 10.0  # за столько секунд
+_ROUTER_RATE_MAX = 40       # сообщений/нажатий кнопок
+_ROUTER_RATE_WINDOW = 15.0  # за столько секунд
+# БАГ ("кнопка плохо прожимается" в /pro и вообще где угодно в конструкторе):
+# порог 15 действий/10с был общим на сообщения+нажатия кнопок сразу — при
+# обычной быстрой навигации по меню (несколько тапов подряд) он легко
+# выбивался, и нажатие просто тихо игнорировалось (`await event.answer()`
+# без изменения экрана — визуально неотличимо от "кнопка не сработала").
+# Подняли порог заметно выше — он всё ещё призван ловить именно флуд-ботов,
+# а не наказывать человека за то, что он быстро тыкает по меню.
 _router_hits: dict[int, deque] = {}
 
 
@@ -318,10 +326,16 @@ async def buy_pro(c: CallbackQuery):
     except RuntimeError as e:
         await c.answer(str(e), show_alert=True)
         return
-    await c.message.edit_text(
-        f"{em('sparkles')} Оплата Pro-подписки ({config.PRO_PRICE_RUB} ₽/мес). "
-        "После оплаты Pro активируется автоматически в течение минуты.",
-        reply_markup=kb([[(f"💳 Оплатить {config.PRO_PRICE_RUB} ₽", None, url)]]))
+    try:
+        await c.message.edit_text(
+            f"{em('sparkles')} Оплата Pro-подписки ({config.PRO_PRICE_RUB} ₽/мес). "
+            "После оплаты Pro активируется автоматически в течение минуты.",
+            reply_markup=kb([[(f"💳 Оплатить {config.PRO_PRICE_RUB} ₽", None, url)]]))
+    except TelegramBadRequest:
+        # Двойное нажатие ("кнопка плохо прожимается") — редактирование тем
+        # же текстом падает с "message is not modified" и раньше просто
+        # падало необработанным исключением, будто кнопка не сработала.
+        pass
     await c.answer()
 
 
