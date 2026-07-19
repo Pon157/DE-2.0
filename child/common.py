@@ -561,15 +561,6 @@ async def relay_to_admin_chat(msgs: list[Message], bot: Bot, cfg: ChildBot,
             if markup:
                 # forwardMessages не поддерживает reply_markup вообще —
                 # ограничение Bot API, тут отдельное сообщение неизбежно.
-                # По запросу: явно объясняем админам, почему кнопки идут
-                # отдельным сообщением именно для альбомов (для одиночных
-                # сообщений этой проблемы нет — см. ветку ниже, там markup
-                # вешается через copy_message напрямую).
-                await safe_call(bot.send_message, cfg.admin_chat_id,
-                                f"{em('warn')} К сожалению, Telegram не позволяет прикреплять "
-                                "кнопки к альбомам при пересылке. Но я могу отправить кнопки "
-                                "следующим сообщением.",
-                                message_thread_id=thread)
                 sm = await safe_call(bot.send_message, cfg.admin_chat_id, "👆 Кнопки к посту выше",
                                      message_thread_id=thread, reply_markup=markup)
                 await _map_msg(cfg.id, sm.message_id, user.id, None)
@@ -973,27 +964,23 @@ def build_common_router() -> Router:
 
     @r.callback_query(F.data.startswith("close_ticket:"))
     async def cb_close_ticket(c: CallbackQuery, bot: Bot, bot_db_id: int):
-        # БАГ (по запросу): раньше закрыть обращение мог только admin,
-        # явно добавленный в BotAdmin — обычные участники админ-чата (у
-        # которых и так есть доступ к этой кнопке, т.к. она видна только в
-        # admin_chat_id) получали "Только администраторы бота". Доступ к
-        # самому чату — уже достаточный контроль, отдельная проверка
-        # is_bot_admin тут больше не нужна; кто именно нажал — подписываем
-        # в ответе ниже.
+        # Закрыть обращение может любой участник админ-чата.
+        # После действия в чат пишется кто именно закрыл.
         tid = int(c.data.split(":")[1])
         err = await _close_ticket_core(bot, bot_db_id, tid)
         if err:
             await c.answer(err, show_alert=(err == "Обращение не найдено"))
             return
+        uname = c.from_user.username
+        actor = f"@{uname}" if uname else str(c.from_user.id)
         try:
             await c.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[[styled_button("🔓 Открыть снова",
                                                 callback_data=f"reopen_ticket:{tid}")]]))
         except Exception:
             pass
-        actor = f"@{c.from_user.username}" if c.from_user.username else c.from_user.full_name
         try:
-            await c.message.reply(f"🔒 Закрыл: {actor}")
+            await c.message.answer(f"🔒 Закрыл — {actor}")
         except Exception:
             pass
         await c.answer("Обращение закрыто")
@@ -1005,13 +992,7 @@ def build_common_router() -> Router:
     # равноценная альтернатива кнопке.
     @r.message(Command("close"))
     async def cmd_close(m: Message, bot: Bot, bot_db_id: int):
-        # БАГ (по запросу): раньше /close работал только для admin из
-        # BotAdmin. Теперь достаточно писать команду из самого админ-чата
-        # бота (m.chat.id == cfg.admin_chat_id) — это уже надёжный контроль
-        # доступа, т.к. посторонние в этот чат не попадают; в приватном
-        # чате (не админ-чат) команда по-прежнему никому не доступна.
-        cfg = await get_cfg(bot_db_id)
-        if not cfg or m.chat.id != cfg.admin_chat_id:
+        if not await is_bot_admin(bot_db_id, m.from_user.id):
             return
         ticket_id = None
         if m.reply_to_message:
@@ -1035,16 +1016,12 @@ def build_common_router() -> Router:
                            "прямо в топике этого обращения.")
             return
         err = await _close_ticket_core(bot, bot_db_id, ticket_id)
-        if err:
-            await m.answer(f"{em('cross')} {err}")
-            return
-        actor = f"@{m.from_user.username}" if m.from_user.username else m.from_user.full_name
-        await m.answer(f"{em('check')} Обращение закрыто. Закрыл: {actor}")
+        await m.answer(f"{em('cross') if err else em('check')} {err or 'Обращение закрыто.'}")
 
     @r.callback_query(F.data.startswith("reopen_ticket:"))
     async def cb_reopen_ticket(c: CallbackQuery, bot: Bot, bot_db_id: int):
-        # См. комментарий в cb_close_ticket — кнопка видна только в
-        # admin_chat_id, отдельная проверка is_bot_admin избыточна.
+        # Переоткрыть обращение может любой участник админ-чата.
+        # После действия в чат пишется кто именно переоткрыл.
         tid = int(c.data.split(":")[1])
         async with Session() as s:
             t = await s.get(Ticket, tid)
@@ -1062,15 +1039,16 @@ def build_common_router() -> Router:
                 await bot.reopen_forum_topic(cfg.admin_chat_id, t.topic_id)
             except Exception:
                 pass
+        uname = c.from_user.username
+        actor = f"@{uname}" if uname else str(c.from_user.id)
         try:
             await c.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[[styled_button("🔒 Закрыть обращение",
                                                 callback_data=f"close_ticket:{tid}")]]))
         except Exception:
             pass
-        actor = f"@{c.from_user.username}" if c.from_user.username else c.from_user.full_name
         try:
-            await c.message.reply(f"🔓 Открыл снова: {actor}")
+            await c.message.answer(f"🔓 Переоткрыл — {actor}")
         except Exception:
             pass
         await c.answer("Обращение снова открыто")
