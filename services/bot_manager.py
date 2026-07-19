@@ -23,9 +23,6 @@ class BotManager:
         self._instance_id = str(uuid.uuid4())
 
     def _lock(self, bot_id: int) -> asyncio.Lock:
-        # Отдельный лок на каждого бота, чтобы конкурентные старт/стоп/рестарт
-        # (например, несколько настроек сохранены подряд -> несколько restart_bot)
-        # не порождали два параллельных getUpdates для одного токена -> TelegramConflictError.
         lock = self._locks.get(bot_id)
         if lock is None:
             lock = asyncio.Lock()
@@ -43,19 +40,6 @@ class BotManager:
             await self._start_bot_locked(cb)
 
     async def _claim_runtime_lock(self, bot_id: int) -> bool:
-        """Пытается атомарно "застолбить" бота за этим процессом.
-
-        КОРЕНЬ ПРОБЛЕМЫ "TelegramConflictError" на протяжении долгого времени
-        (не единичный реконнект, а минуты подряд) почти всегда означает, что
-        ДВА процесса одновременно держат getUpdates для одного токена — самый
-        частый случай: старый контейнер/деплой не был до конца остановлен,
-        когда поднялся новый. Раньше приложение никак не могло это обнаружить
-        и просто запускало поллинг, полагаясь, что "снаружи" всё чисто.
-        Теперь перед стартом каждый процесс пишет в БД свою метку-heartbeat;
-        если свежую метку уже держит ДРУГОЙ instance_id — второй экземпляр
-        не запускает поллинг, а только предупреждает в лог, вместо того чтобы
-        бесконечно конфликтовать с "живым" инстансом.
-        """
         now = datetime.utcnow()
         async with Session() as s:
             row = await s.get(BotRuntimeLock, bot_id)
@@ -87,17 +71,12 @@ class BotManager:
                         row.last_seen = datetime.utcnow()
                         await s.commit()
                     cb = await s.get(ChildBot, bot_id)
-                # БАГ "бот не выключается из роутера": is_active могли
-                # поменять из ДРУГОГО процесса (например если старый
-                # контейнер после редеплоя не был до конца убит и всё ещё
-                # держит поллинг этого бота) — локальный stop_bot() в таком
-                # случае ничего не находит и тихо не срабатывает. Теперь
-                # процесс, который РЕАЛЬНО крутит поллинг, сам периодически
-                # сверяется с БД и гасит себя штатно через dp.stop_polling(),
-                # если увидел, что бота выключили.
-                if cb is not None and not cb.is_active:
+                
+                # ИСПРАВЛЕНО: гасим поллинг и если выключен, и если совсем удален из БД
+                if cb is None or not cb.is_active:
+                    log.info("Heartbeat: бот %s деактивирован или удален, тушим поллинг", bot_id)
                     await dp.stop_polling()
-                    return
+                    # УБРАЛИ return! Цикл должен жить, пока его не отменит finally основного воркера
         except asyncio.CancelledError:
             pass
 
@@ -106,17 +85,13 @@ class BotManager:
         if existing and not existing.done():
             return
         if existing and existing.done():
-            # Задача когда-то упала/завершилась сама, но не была вычищена — чистим,
-            # иначе бот никогда не перезапустится (баг: "бот навсегда мёртв после креша").
             self.tasks.pop(cb.id, None)
             self.bots.pop(cb.id, None)
 
         if not await self._claim_runtime_lock(cb.id):
             log.warning(
                 "Bot %s (@%s) уже поднят ДРУГИМ процессом (по метке в БД) — "
-                "не запускаю второй поллинг. Если это ошибка (например, старый "
-                "контейнер завис) — проверьте, что запущен только один "
-                "инстанс приложения на эту БД.", cb.id, cb.username)
+                "не запускаю второй поллинг.", cb.id, cb.username)
             return
 
         from child.feedback import build_feedback_router
@@ -125,9 +100,6 @@ class BotManager:
 
         bot = Bot(cb.token, default=DefaultBotProperties(parse_mode="HTML"))
 
-        # Гарантируем, что предыдущая long-poll сессия (если была) закрыта
-        # ПЕРЕД тем, как открывать новую — иначе Telegram какое-то время видит
-        # два getUpdates-подключения на один токен и отдаёт TelegramConflictError.
         try:
             await bot.delete_webhook(drop_pending_updates=False)
         except Exception:
@@ -146,18 +118,22 @@ class BotManager:
             backoff = 5
             try:
                 while True:
+                    # ИСПРАВЛЕНО: Жесткая проверка статуса в БД перед каждым запуском поллинга.
+                    # Если бот проснулся после бэкоффа/ошибки сети, а его выключили — завершаем цикл.
+                    async with Session() as s:
+                        current_cb = await s.get(ChildBot, cb.id)
+                    if current_cb is None or not current_cb.is_active:
+                        log.info("Воркер: бот @%s деактивирован в БД. Корректно завершаем работу.", cb.username)
+                        return
+
                     try:
                         await dp.start_polling(
                             bot, handle_signals=False,
                             allowed_updates=dp.resolve_used_update_types())
                         return  # штатная остановка (stop_polling / отмена)
                     except TelegramConflictError:
-                        # aiogram сам ретраит конфликты внутри start_polling и
-                        # обычно не пробрасывает исключение сюда, но на случай
-                        # если пробросит — не долбим Telegram мгновенными
-                        # реконнектами, ждём и пробуем снова с нарастанием.
                         log.warning("Conflict for bot %s (@%s), retry in %ss",
-                                   cb.id, cb.username, backoff)
+                                    cb.id, cb.username, backoff)
                         await asyncio.sleep(backoff)
                         backoff = min(backoff * 2, 60)
                     except TelegramUnauthorizedError:
@@ -193,13 +169,6 @@ class BotManager:
         if task:
             task.cancel()
             try:
-                # БАГ "бот не останавливается": раньше `await task` ждал
-                # ЛЮБОЕ время — если polling завис (сетевой хвост, Telegram
-                # не отдаёт соединение и т.п.), stop_bot зависал вместе с
-                # ним и toggle/restart в конструкторе выглядели так, будто
-                # "ничего не происходит". Теперь ждём максимум 10 секунд —
-                # после этого просто идём дальше (задача всё равно cancel()
-                # получила и рано или поздно завершится сама).
                 await asyncio.wait_for(asyncio.shield(task), timeout=10)
             except asyncio.TimeoutError:
                 log.warning("Bot %s: остановка зависла дольше 10с, продолжаю без ожидания", bot_id)
@@ -210,15 +179,9 @@ class BotManager:
                 await bot.session.close()
             except Exception:
                 pass
-        # Лок в БД снимаем ЯВНО и здесь тоже (а не только в finally у _run()):
-        # если задача зависла и wait_for вышел по таймауту, _run() ещё не
-        # успел дойти до своего finally, и следующий _start_bot_locked() мог
-        # решить, что бот "занят другим процессом", и отказаться стартовать.
         await self._release_runtime_lock(bot_id)
 
     async def restart_bot(self, bot_id: int):
-        # Стоп и старт под одним локом — исключает гонку, когда несколько
-        # быстрых сохранений настроек шлют несколько restart_bot() подряд.
         async with self._lock(bot_id):
             await self._stop_bot_locked(bot_id)
             async with Session() as s:
@@ -227,7 +190,6 @@ class BotManager:
                 await self._start_bot_locked(cb)
 
     async def stop_all(self):
-        """Аккуратно останавливает всех дочерних ботов (используется при shutdown)."""
         ids = list(self.tasks.keys())
         await asyncio.gather(*(self.stop_bot(i) for i in ids), return_exceptions=True)
 
@@ -237,27 +199,6 @@ manager = BotManager()
 
 async def reupload_photo_for_bot(source_bot: Bot, bot_id: int, file_id: str,
                                  target_chat_id: int) -> str | None:
-    """Конвертирует file_id, полученный ЧЕРЕЗ ОДНОГО бота (например мастер-бот
-    при настройке в конструкторе), в file_id, валидный для ДОЧЕРНЕГО бота.
-
-    Корень бага "wrong file identifier/HTTP URL specified": file_id в
-    Telegram Bot API привязан к конкретному боту, которым файл был получен.
-    Когда владелец присылает фото приветствия/кнопки МАСТЕР-боту, а его потом
-    пытается отправить ДОЧЕРНИЙ бот (другой токен) — Telegram отвечает
-    ошибкой, потому что для него это чужой, непонятный идентификатор.
-
-    Единственный способ "перенести" файл между ботами — скачать его байты и
-    заново загрузить от имени целевого бота. Отправляем результат в личный
-    чат владельца (target_chat_id) и сразу удаляем служебное сообщение —
-    остаётся только новый, валидный для ДОЧЕРНЕГО бота file_id.
-
-    Возвращает None, если конвертация не удалась (например, владелец ещё ни
-    разу не писал дочернему боту, и слать ему нельзя — Forbidden). В этом
-    случае вызывающий код должен либо не сохранять фото, либо сохранить
-    исходный file_id как best-effort (тогда сработает defensive fallback в
-    child/common.py::send_with_keyboards — приветствие уйдёт текстом, без
-    падения, но без фото).
-    """
     child_bot = manager.bots.get(bot_id)
     if not child_bot:
         return None
@@ -270,9 +211,9 @@ async def reupload_photo_for_bot(source_bot: Bot, bot_id: int, file_id: str,
         try:
             await child_bot.delete_message(target_chat_id, sent.message_id)
         except Exception:
-            pass  # неважно, удалилось служебное сообщение или нет — file_id уже получен
+            pass
         return sent.photo[-1].file_id
     except Exception as e:
         log.warning("reupload_photo_for_bot: не удалось перенести file_id для бота %s: %s",
-                   bot_id, e)
+                    bot_id, e)
         return None
