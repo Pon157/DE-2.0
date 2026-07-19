@@ -19,6 +19,7 @@ class BotManager:
     def __init__(self):
         self.tasks: dict[int, asyncio.Task] = {}   # bot_id -> polling task
         self.bots: dict[int, Bot] = {}
+        self.dispatchers: dict[int, Dispatcher] = {}  # bot_id -> Dispatcher object
         self._locks: dict[int, asyncio.Lock] = {}
         self._instance_id = str(uuid.uuid4())
 
@@ -86,6 +87,7 @@ class BotManager:
         if existing and existing.done():
             self.tasks.pop(cb.id, None)
             self.bots.pop(cb.id, None)
+            self.dispatchers.pop(cb.id, None)
 
         if not await self._claim_runtime_lock(cb.id):
             log.warning(
@@ -171,6 +173,7 @@ class BotManager:
                     pass
 
         self.bots[cb.id] = bot
+        self.dispatchers[cb.id] = dp
         self.tasks[cb.id] = asyncio.create_task(_run(), name=f"bot-{cb.username}")
         log.info("Started child bot @%s (%s)", cb.username, cb.bot_type.value)
 
@@ -179,8 +182,16 @@ class BotManager:
             await self._stop_bot_locked(bot_id)
 
     async def _stop_bot_locked(self, bot_id: int):
+        dp = self.dispatchers.pop(bot_id, None)
         task = self.tasks.pop(bot_id, None)
         bot = self.bots.pop(bot_id, None)
+
+        if dp:
+            log.info("[DEBUG_BOT] stop_bot: Сигнализирую dp.stop_polling() для корректного завершения сетевого цикла.")
+            await dp.stop_polling()
+            # Короткая пауза, чтобы aiogram успел обработать изменение флага running
+            await asyncio.sleep(0.2)
+
         if task:
             log.info("[DEBUG_BOT] stop_bot: Вызываю явный cancel() для таски бота id=%s", bot_id)
             task.cancel()
