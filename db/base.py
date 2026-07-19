@@ -232,6 +232,9 @@ async def init_db():
         # дублей, раз сам зашифрованный токен для этого больше не годится.
         "ALTER TABLE child_bots ALTER COLUMN token TYPE VARCHAR(512)",
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS token_fingerprint VARCHAR(64)",
+        # кнопка самостоятельного закрытия обращения пользователем (reply-клавиатура)
+        "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS close_ticket_button_text VARCHAR(64) DEFAULT '❌ Закрыть обращение'",
+        "ALTER TABLE advertisements ADD COLUMN IF NOT EXISTS extends_ad_id INTEGER",
     ):
         await _exec(stmt)
 
