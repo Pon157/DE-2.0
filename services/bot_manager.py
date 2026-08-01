@@ -15,6 +15,9 @@ LOCK_STALE_AFTER = timedelta(seconds=15)   # если heartbeat старше —
 HEARTBEAT_EVERY = 5
 
 
+TOKEN_WATCHDOG_EVERY = 45  # секунд между проверками валидности токена
+
+
 class BotManager:
     def __init__(self):
         self.tasks: dict[int, asyncio.Task] = {}   # bot_id -> polling task
@@ -80,6 +83,71 @@ class BotManager:
         except asyncio.CancelledError:
             pass
 
+    async def _deactivate_invalid_token(self, cb_id: int, username: str):
+        """БАГ/ресурсная проблема (по запросу): если токен дочернего бота
+        отозван/невалиден (TelegramUnauthorizedError), aiogram'овский
+        dp.start_polling() НЕ пробрасывает это исключение наружу — его
+        внутренний бесконечный цикл _listen_updates() ловит ЛЮБОЕ
+        исключение (это его штатное поведение "so you may not worry that
+        the polling will stop working") и просто ретраит get_updates раз в
+        1-5 секунд НАВСЕГДА. Отсюда в логах тысячи строк "Sleep for N
+        seconds and try again... (tryings = 57199...)" и постоянная
+        нагрузка на CPU/сеть от бота, который заведомо не может работать.
+        Наш собственный except TelegramUnauthorizedError вокруг
+        dp.start_polling() в _run() из-за этого никогда не срабатывал.
+        Решение — активно проверять токен (см. _token_watchdog и
+        preflight-проверку в _start_bot_locked) и при невалидности
+        ОСТАНАВЛИВАТЬ поллинг самим, а не полагаться на то, что aiogram
+        когда-нибудь перестанет ретраить (он не перестанет)."""
+        log.error("Bot %s (@%s): токен недействителен (TelegramUnauthorizedError) — "
+                  "останавливаю бота и отключаю (is_active=False), чтобы не "
+                  "жечь ресурсы на бесконечный ретрай.", cb_id, username)
+        async with Session() as s:
+            cb = await s.get(ChildBot, cb_id)
+            if cb and cb.is_active:
+                cb.is_active = False
+                owner_id = cb.owner_id
+                await s.commit()
+            else:
+                owner_id = None
+        if owner_id:
+            try:
+                from config import MASTER_BOT_TOKEN
+                notifier = Bot(MASTER_BOT_TOKEN)
+                try:
+                    await notifier.send_message(
+                        owner_id,
+                        f"⚠️ Бот @{username} остановлен: его токен недействителен "
+                        "(отозван или отсутствует в Telegram — TelegramUnauthorizedError). "
+                        "Скорее всего, токен был отозван через @BotFather. "
+                        "Создайте нового бота или обновите токен и включите бота заново.")
+                finally:
+                    await notifier.session.close()
+            except Exception:
+                pass
+
+    async def _token_watchdog(self, cb_id: int, bot: Bot, dp: Dispatcher, username: str):
+        """Периодически (раз в TOKEN_WATCHDOG_EVERY сек) проверяет, что токен
+        всё ещё валиден (bot.get_me()) — см. докстринг
+        _deactivate_invalid_token про то, почему это нельзя переложить на
+        встроенный ретрай aiogram. При TelegramUnauthorizedError сразу же
+        останавливает поллинг этого бота вместо бесконечных ретраев."""
+        try:
+            while True:
+                await asyncio.sleep(TOKEN_WATCHDOG_EVERY)
+                try:
+                    await bot.get_me()
+                except TelegramUnauthorizedError:
+                    await self._deactivate_invalid_token(cb_id, username)
+                    await dp.stop_polling()
+                    return
+                except Exception:
+                    # Сетевые/временные ошибки — не повод останавливать бота,
+                    # это дело самого get_updates внутри aiogram.
+                    pass
+        except asyncio.CancelledError:
+            pass
+
     async def _start_bot_locked(self, cb: ChildBot):
         existing = self.tasks.get(cb.id)
         if existing and not existing.done():
@@ -101,6 +169,23 @@ class BotManager:
 
         bot = Bot(cb.token, default=DefaultBotProperties(parse_mode="HTML"))
 
+        # Preflight-проверка (по запросу): если токен уже невалиден на
+        # момент запуска — не поднимаем поллинг вообще (см. докстринг
+        # _deactivate_invalid_token — иначе он бы молча ушёл в бесконечный
+        # ретрай внутри aiogram и жёг ресурсы).
+        try:
+            await bot.get_me()
+        except TelegramUnauthorizedError:
+            await self._release_runtime_lock(cb.id)
+            await self._deactivate_invalid_token(cb.id, cb.username)
+            try:
+                await bot.session.close()
+            except Exception:
+                pass
+            return
+        except Exception:
+            pass  # временная сетевая ошибка — не блокируем запуск из-за неё
+
         try:
             await bot.delete_webhook(drop_pending_updates=False)
         except Exception:
@@ -116,6 +201,7 @@ class BotManager:
 
         async def _run():
             heartbeat = asyncio.create_task(self._heartbeat_loop(cb.id, dp))
+            watchdog = asyncio.create_task(self._token_watchdog(cb.id, bot, dp, cb.username))
             backoff = 5
             try:
                 while True:
@@ -148,7 +234,14 @@ class BotManager:
                         await asyncio.sleep(backoff)
                         backoff = min(backoff * 2, 60)
                     except TelegramUnauthorizedError:
+                        # На практике сюда aiogram обычно НЕ доходит (см.
+                        # докстринг _deactivate_invalid_token — сам
+                        # start_polling эту ошибку проглатывает и ретраит
+                        # бесконечно) — оставлено как доп. защита на случай
+                        # если исключение всё же прилетит сюда напрямую
+                        # (например, из delete_webhook() чуть выше).
                         log.error("[DEBUG_BOT] Воркер @%s: Токен заблокирован ТГ (TelegramUnauthorizedError). Выхожу.", cb.username)
+                        await self._deactivate_invalid_token(cb.id, cb.username)
                         return
                     except Exception as e:
                         log.exception("[DEBUG_BOT] Воркер @%s: Поймано исключение внутри старта поллинга: %s", cb.username, e)
@@ -161,8 +254,13 @@ class BotManager:
             finally:
                 log.info("[DEBUG_BOT] Воркер @%s: Вхожу в блок finally очистки ресурсов воркера.", cb.username)
                 heartbeat.cancel()
+                watchdog.cancel()
                 try:
                     await heartbeat
+                except asyncio.CancelledError:
+                    pass
+                try:
+                    await watchdog
                 except asyncio.CancelledError:
                     pass
                 await self._release_runtime_lock(cb.id)
