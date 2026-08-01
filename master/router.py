@@ -479,6 +479,8 @@ async def cfg_menu(c: CallbackQuery):
             [(f"📨 Пересылка сообщений в чат админов: {cb.forward_mode.value}", f"cyc_fwd:{bot_id}")],
             [("🧵 Топики: " + ("вкл" if cb.use_topics else "выкл"), f"cyc_topics:{bot_id}"),
              ("🧵 Имя топика", f"topicname:{bot_id}")],
+            [(f"📌 Закреп 1-го сообщения (без топиков): {'вкл' if cb.pin_first_message else 'выкл'}",
+              f"cyc_pinfirst:{bot_id}")],
             [("👋 Приветствие", f"welcome:{bot_id}"),
              ("🏷 Шаблон шапки", f"header:{bot_id}")],
             [(f"🏷 Шапка: {header_label}", f"cyc_header:{bot_id}")],
@@ -530,6 +532,7 @@ CYCLES = {
     "cyc_donbtn": ("donate_button_type", ["inline", "keyboard"]),
     "cyc_sugg": ("accept_suggestions", [False, True]),
     "cyc_newticket": ("always_new_ticket", [False, True]),
+    "cyc_pinfirst": ("pin_first_message", [False, True]),
     "cyc_delivery": ("channel_delivery_mode", ["template", "copy"]),
     "cyc_pubmode": ("channel_publish_mode", ["copy", "forward"]),
     # шапка в админ-чате: отдельным сообщением / слитно с сообщением / выкл
@@ -834,7 +837,15 @@ async def btnadd(c: CallbackQuery, state: FSMContext):
     await state.update_data(bot_id=bot_id, last_msg_id=c.message.message_id)
     await c.message.edit_text("Тип элемента?", reply_markup=kb([
         [("🔗 Инлайн-ссылка", "bk:inline_url"), ("⚡️ Инлайн-триггер", "bk:inline_trigger")],
-        [("⌨️ Кейборд-кнопка", "bk:keyboard"), ("/ Триггер-команда", "bk:command")]
+        [("⌨️ Кейборд-кнопка", "bk:keyboard"), ("/ Триггер-команда", "bk:command")],
+        # НОВОЕ (по запросу): отдельные инлайн/кейборд кнопки для открытия
+        # обращения по конкретной ТЕМЕ — в отличие от общей кнопки "Открыть
+        # обращение" (см. cfg -> "✉️ Кнопка обращения"), таких кнопок может
+        # быть несколько, каждая открывает СВОЁ, независимое обращение
+        # (текст кнопки = название темы). Текст/фото, введённые на шаге
+        # ответа, отправляются пользователю сразу при открытии.
+        [("✉️➕ Инлайн: открыть тему", "bk:inline_ticket"),
+         ("✉️➕ Кейборд: открыть тему", "bk:keyboard_ticket")],
     ]))
     await c.answer()
 
@@ -844,7 +855,9 @@ async def btn_kind(c: CallbackQuery, state: FSMContext):
     kind = c.data.split(":")[1]
     await state.update_data(kind=kind, last_msg_id=c.message.message_id)
     await state.set_state(St.btn_text)
-    hint = "имя команды без /" if kind == "command" else "текст кнопки"
+    hint = "имя команды без /" if kind == "command" else \
+        "название темы (это же текст кнопки)" if kind in ("inline_ticket", "keyboard_ticket") \
+        else "текст кнопки"
     await c.message.edit_text(f"Пришлите {hint}:")
     await c.answer()
 
@@ -878,7 +891,12 @@ async def btn_text(m: Message, state: FSMContext):
         next_text = "Пришлите URL:"
     else:
         await state.set_state(St.btn_response)
-        next_text = "Пришлите ответ триггера (текст/фото, форматирование сохранится):"
+        if data["kind"] in ("inline_ticket", "keyboard_ticket"):
+            next_text = ("Пришлите текст (и/или фото), который получит пользователь "
+                        "при открытии обращения по этой теме (текст/фото, "
+                        "форматирование сохранится):")
+        else:
+            next_text = "Пришлите ответ триггера (текст/фото, форматирование сохранится):"
 
     # Редактируем прошлое сообщение бота, чтобы форма плавно перетекала в следующий шаг
     try:
@@ -915,7 +933,7 @@ async def btn_response(m: Message, state: FSMContext):
             await m.answer(f"{em('warn')} Не удалось прикрепить фото к ответу — сохраню "
                            "только текст. (Напишите что-нибудь дочернему боту и попробуйте снова.)")
     await state.update_data(response_text=m.html_text or "", response_photo=response_photo)
-    if data["kind"] in ("keyboard", "command"):
+    if data["kind"] in ("keyboard", "command", "keyboard_ticket"):
         # Reply-клавиатура и команды — обычные Telegram-объекты без поддержки
         # цвета/premium-иконки, сохраняем сразу.
         await _save_button(m, state)
