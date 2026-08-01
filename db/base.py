@@ -235,6 +235,14 @@ async def init_db():
         # кнопка самостоятельного закрытия обращения пользователем (reply-клавиатура)
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS close_ticket_button_text VARCHAR(64) DEFAULT '❌ Закрыть обращение'",
         "ALTER TABLE advertisements ADD COLUMN IF NOT EXISTS extends_ad_id INTEGER",
+        # закреплять ли первое сообщение обращения в админ-чате (только вне топиков)
+        "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS pin_first_message BOOLEAN DEFAULT false",
+        # несколько параллельных обращений по темам (кнопки inline_ticket/keyboard_ticket)
+        "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS subject VARCHAR(128)",
+        "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS last_active_at TIMESTAMP DEFAULT now()",
+        "ALTER TABLE msg_map ADD COLUMN IF NOT EXISTS ticket_id INTEGER",
+        # ---- боты-анкеты (п.4) ----
+        "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS survey_start_text TEXT",
     ):
         await _exec(stmt)
 
