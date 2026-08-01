@@ -189,32 +189,47 @@ def _tpl_vars(bot_id: int, user_id: int, full_name: str | None, username: str | 
     }
 
 
-def build_header(cfg: ChildBot, user) -> str:
+def build_header(cfg: ChildBot, user, subject: str | None = None) -> str:
     """Шапка сообщения в админ-чате по шаблону владельца. Переменные:
     {name}, {username}, {id}, {anon_id}. При любой ошибке в шаблоне —
-    безопасный дефолт (раньше битый шаблон ронял весь релей с исключением)."""
+    безопасный дефолт (раньше битый шаблон ронял весь релей с исключением).
+
+    subject — тема обращения (см. п.3, несколько параллельных обращений по
+    разным темам через inline_ticket/keyboard_ticket кнопки). Если задана —
+    добавляется префиксом, чтобы админы сразу видели, к какой теме
+    относится сообщение (особенно важно вне режима топиков, где все
+    обращения идут одной лентой в один чат)."""
     try:
-        return cfg.copy_header.format(**_tpl_vars(cfg.id, user.id, user.full_name, user.username))
+        header = cfg.copy_header.format(**_tpl_vars(cfg.id, user.id, user.full_name, user.username))
     except Exception:
-        return (f"{user.full_name} | @{user.username or '—'} | <code>{user.id}</code> "
-                f"· {anon_id_for(cfg.id, user.id)}")
+        header = (f"{user.full_name} | @{user.username or '—'} | <code>{user.id}</code> "
+                 f"· {anon_id_for(cfg.id, user.id)}")
+    if subject:
+        header = f"🏷 {subject}\n{header}"
+    return header
 
 
 _TAG_RE = re.compile(r"<[^>]+>")
 
 
 def build_topic_name(cfg: ChildBot, user_id: int,
-                     full_name: str | None, username: str | None) -> str:
+                     full_name: str | None, username: str | None,
+                     subject: str | None = None) -> str:
     """Имя форум-топика по шаблону владельца ({name}/{username}/{id}/{anon_id}
     — можно всё вместе или по одной). HTML-теги вырезаются — имя топика в
-    Telegram всегда чистый текст."""
+    Telegram всегда чистый текст. subject (тема обращения, см. п.3) —
+    добавляется префиксом к имени топика, чтобы различать несколько
+    параллельно открытых топиков одного пользователя по разным темам."""
     tpl = cfg.topic_name_template or "✉️ {name} · {id}"
     try:
         name = tpl.format(**_tpl_vars(cfg.id, user_id, full_name, username))
     except Exception:
         name = f"✉️ {full_name or user_id} · {user_id}"
     name = _TAG_RE.sub("", name).strip()
-    return (name or f"✉️ {user_id}")[:120]
+    name = name or f"✉️ {user_id}"
+    if subject:
+        name = f"{subject} · {name}"
+    return name[:120]
 
 
 async def inject_ad(bot_db_id: int, text: str) -> str:
@@ -277,6 +292,12 @@ async def build_keyboards(bot_db_id: int, cfg: ChildBot, extra_inline: list | No
                 text=b.text, callback_data=f"trg:{b.id}",
                 style=b.style, icon_custom_emoji_id=b.icon_emoji_id)])
         elif b.kind == "keyboard":
+            kb_rows.append([KeyboardButton(text=b.text)])
+        elif b.kind == "inline_ticket":
+            inline_rows.append([InlineKeyboardButton(
+                text=b.text, callback_data=f"open_ticket_subj:{b.id}",
+                style=b.style, icon_custom_emoji_id=b.icon_emoji_id)])
+        elif b.kind == "keyboard_ticket":
             kb_rows.append([KeyboardButton(text=b.text)])
     if extra_inline:
         inline_rows = extra_inline + inline_rows
@@ -375,8 +396,18 @@ async def handle_keyboard_button(m: Message, bot_db_id: int) -> bool:
         return False
     async with Session() as s:
         b = await s.scalar(select(BotButton).where(
-            BotButton.bot_id == bot_db_id, BotButton.kind == "keyboard",
+            BotButton.bot_id == bot_db_id,
+            BotButton.kind.in_(("keyboard", "keyboard_ticket")),
             BotButton.text == m.text))
+    if b and b.kind == "keyboard_ticket":
+        # Открывает СВОЁ, отдельное обращение по теме = тексту кнопки (см.
+        # п.3) — работает независимо от того, сколько других обращений (по
+        # другим темам) у пользователя уже открыто.
+        cfg = await get_cfg(bot_db_id)
+        if cfg:
+            await open_ticket(m.bot, cfg, m.from_user.id, subject=b.text)
+            await send_response(m, b.response_text, b.response_photo)
+        return True
     if b and (b.response_text is not None or b.response_photo):
         await send_response(m, b.response_text, b.response_photo)
         return True
@@ -399,7 +430,8 @@ async def _notify_user(bot: Bot, bot_db_id: int, user_id: int, text: str):
 
 
 async def open_ticket(bot: Bot, cfg: ChildBot, user_id: int,
-                      force_new: bool = False) -> tuple[Ticket, bool]:
+                      force_new: bool = False,
+                      subject: str | None = None) -> tuple[Ticket, bool]:
     """Открывает (или переиспользует) тикет-переписку с пользователем —
     возвращает (ticket, created). created=True, если тикет только что создан
     (по этому флагу на первое сообщение вешается кнопка закрытия обращения).
@@ -407,14 +439,38 @@ async def open_ticket(bot: Bot, cfg: ChildBot, user_id: int,
     БАГ: если чат админов НЕ форум, а топики включены, create_forum_topic
     падал с исключением и сообщение пользователя терялось ВООБЩЕ (не
     релеилось). Теперь — мягкий фолбэк на режим без топика.
-    """
+
+    subject (п.3, "несколько обращений по разным темам"): None — обычное
+    поведение (как раньше, максимум одно открытое обращение "без темы" на
+    пользователя). Если передана конкретная тема (нажатие тематической
+    inline_ticket/keyboard_ticket кнопки) — ищем/создаём отдельное открытое
+    обращение ИМЕННО с этой темой; у пользователя при этом может быть
+    несколько разных открытых обращений одновременно (по разным темам), но
+    правило "1 обращение = 1 тема = максимум 1 открытый тикет" сохраняется
+    — повторное нажатие той же тематической кнопки просто возвращает уже
+    открытое обращение по этой теме, а не плодит дубли.
+
+    Когда subject не передан (обычное сообщение без нажатия кнопки, а также
+    /start-триггер и т.п.) — если у пользователя уже открыто НЕСКОЛЬКО
+    обращений по разным темам, сообщение уходит в то, что использовалось
+    последним (last_active_at) — это самый интуитивный вариант "текущего
+    диалога" для юзера, который просто продолжает переписку."""
     async with Session() as s:
-        t = await s.scalar(select(Ticket).where(
-            Ticket.bot_id == cfg.id, Ticket.user_id == user_id, Ticket.is_open))
+        q = select(Ticket).where(
+            Ticket.bot_id == cfg.id, Ticket.user_id == user_id, Ticket.is_open)
+        if subject is not None:
+            q = q.where(Ticket.subject == subject)
+        else:
+            q = q.order_by(Ticket.last_active_at.desc())
+        t = await s.scalar(q)
         if t and not force_new:
+            t.last_active_at = datetime.utcnow()
+            await s.commit()
             return t, False
         if t and force_new:
             if not getattr(cfg, "always_new_ticket", False):
+                t.last_active_at = datetime.utcnow()
+                await s.commit()
                 return t, False
             t.is_open = False
             await s.commit()
@@ -425,14 +481,15 @@ async def open_ticket(bot: Bot, cfg: ChildBot, user_id: int,
             topic_name = build_topic_name(
                 cfg, user_id,
                 full_name=(u.full_name if u else None),
-                username=(u.username if u else None))
+                username=(u.username if u else None),
+                subject=subject)
             try:
                 topic = await bot.create_forum_topic(cfg.admin_chat_id, topic_name)
                 topic_id = topic.message_thread_id
             except Exception as e:
                 log.warning("Bot %s: create_forum_topic failed (%s) — "
                             "продолжаю без топика", cfg.id, e)
-        t = Ticket(bot_id=cfg.id, user_id=user_id, topic_id=topic_id)
+        t = Ticket(bot_id=cfg.id, user_id=user_id, topic_id=topic_id, subject=subject)
         s.add(t)
         await s.commit()
     await _send_ticket_opened_keyboard(bot, cfg, user_id)
@@ -461,10 +518,11 @@ async def _send_ticket_opened_keyboard(bot: Bot, cfg: ChildBot, user_id: int):
 # reply-контекст, маппинг для ответов/реакций, кнопка закрытия обращения.
 # =========================================================================
 async def _map_msg(bot_db_id: int, admin_msg_id: int, user_id: int,
-                   user_msg_id: int | None = None):
+                   user_msg_id: int | None = None, ticket_id: int | None = None):
     async with Session() as s:
         s.add(MsgMap(bot_id=bot_db_id, admin_chat_msg_id=admin_msg_id,
-                     user_id=user_id, user_chat_msg_id=user_msg_id))
+                     user_id=user_id, user_chat_msg_id=user_msg_id,
+                     ticket_id=ticket_id))
         await s.commit()
 
 
@@ -472,6 +530,21 @@ def _combine_kb(kb1, kb2):
     if kb1 and kb2:
         return InlineKeyboardMarkup(inline_keyboard=kb1.inline_keyboard + kb2.inline_keyboard)
     return kb1 or kb2
+
+
+async def _maybe_pin_first_message(bot: Bot, cfg: ChildBot, created: bool,
+                                   chat_id: int, msg_id: int):
+    """Настройка (по запросу): закреплять ли первое сообщение пользователя в
+    админ-чате, когда бот НЕ по топикам (в топиках открытие обращения и так
+    прекрасно видно — свой топик, закреплять там нечего). Работает только
+    для только что созданного обращения (created=True) — чтобы НЕ дёргать
+    pin на каждое последующее сообщение в этой же переписке."""
+    if not created or cfg.use_topics or not getattr(cfg, "pin_first_message", False):
+        return
+    try:
+        await bot.pin_chat_message(chat_id, msg_id, disable_notification=True)
+    except Exception:
+        pass
 
 
 async def relay_to_admin_chat(msgs: list[Message], bot: Bot, cfg: ChildBot,
@@ -484,7 +557,7 @@ async def relay_to_admin_chat(msgs: list[Message], bot: Bot, cfg: ChildBot,
     user = msgs[0].from_user
     ticket, created = await open_ticket(bot, cfg, user.id)
     thread = ticket.topic_id if cfg.use_topics else None
-    header = build_header(cfg, user)
+    header = build_header(cfg, user, subject=ticket.subject)
     header_mode = getattr(cfg, "header_mode", "separate") or "separate"
     is_album = len(msgs) > 1
     first = msgs[0]
@@ -524,7 +597,8 @@ async def relay_to_admin_chat(msgs: list[Message], bot: Bot, cfg: ChildBot,
                                        message_thread_id=thread,
                                        reply_markup=markup,
                                        reply_parameters=reply_params)
-                await _map_msg(cfg.id, sent.message_id, user.id, first.message_id)
+                await _map_msg(cfg.id, sent.message_id, user.id, first.message_id, ticket_id=ticket.id)
+                await _maybe_pin_first_message(bot, cfg, created, cfg.admin_chat_id, sent.message_id)
                 return
         else:
             fid, mtype = message_media(first)
@@ -538,7 +612,8 @@ async def relay_to_admin_chat(msgs: list[Message], bot: Bot, cfg: ChildBot,
                         bot.copy_message, cfg.admin_chat_id, first.chat.id, first.message_id,
                         message_thread_id=thread, caption=merged,
                         reply_markup=markup, reply_parameters=reply_params)
-                    await _map_msg(cfg.id, sent.message_id, user.id, first.message_id)
+                    await _map_msg(cfg.id, sent.message_id, user.id, first.message_id, ticket_id=ticket.id)
+                    await _maybe_pin_first_message(bot, cfg, created, cfg.admin_chat_id, sent.message_id)
                     return
         # не влезло/неподходящий тип — проваливаемся в режим отдельной шапки
 
@@ -546,7 +621,9 @@ async def relay_to_admin_chat(msgs: list[Message], bot: Bot, cfg: ChildBot,
     if header_mode != "off":
         hm = await safe_call(bot.send_message, cfg.admin_chat_id, header,
                              message_thread_id=thread)
-        await _map_msg(cfg.id, hm.message_id, user.id, None)
+        await _map_msg(cfg.id, hm.message_id, user.id, None, ticket_id=ticket.id)
+        await _maybe_pin_first_message(bot, cfg, created, cfg.admin_chat_id, hm.message_id)
+        created = False  # шапка уже закреплена (если нужно) — ниже больше не закрепляем
         # close_kb НЕ обнуляем — теперь кнопка вешается на КАЖДОЕ сообщение
         # пользователя (см. комментарий выше), а не только на шапку.
 
@@ -557,13 +634,14 @@ async def relay_to_admin_chat(msgs: list[Message], bot: Bot, cfg: ChildBot,
             copies = await safe_call(bot.forward_messages, cfg.admin_chat_id, first.chat.id, ids,
                                      message_thread_id=thread)
             for mm, cp in zip(msgs, copies):
-                await _map_msg(cfg.id, cp.message_id, user.id, mm.message_id)
+                await _map_msg(cfg.id, cp.message_id, user.id, mm.message_id, ticket_id=ticket.id)
+            await _maybe_pin_first_message(bot, cfg, created, cfg.admin_chat_id, copies[0].message_id)
             if markup:
                 # forwardMessages не поддерживает reply_markup вообще —
                 # ограничение Bot API, тут отдельное сообщение неизбежно.
                 sm = await safe_call(bot.send_message, cfg.admin_chat_id, "👆 Кнопки к посту выше",
                                      message_thread_id=thread, reply_markup=markup)
-                await _map_msg(cfg.id, sm.message_id, user.id, None)
+                await _map_msg(cfg.id, sm.message_id, user.id, None, ticket_id=ticket.id)
         elif markup:
             # БАГ (по запросу — "кнопки отдельным сообщением"): copy_messages
             # (батч) не поддерживает reply_markup ни на одном элементе — но
@@ -578,12 +656,14 @@ async def relay_to_admin_chat(msgs: list[Message], bot: Bot, cfg: ChildBot,
                                      reply_markup=markup if is_last else None)
                 copies.append(cp)
             for mm, cp in zip(msgs, copies):
-                await _map_msg(cfg.id, cp.message_id, user.id, mm.message_id)
+                await _map_msg(cfg.id, cp.message_id, user.id, mm.message_id, ticket_id=ticket.id)
+            await _maybe_pin_first_message(bot, cfg, created, cfg.admin_chat_id, copies[0].message_id)
         else:
             copies = await safe_call(bot.copy_messages, cfg.admin_chat_id, first.chat.id, ids,
                                      message_thread_id=thread)
             for mm, cp in zip(msgs, copies):
-                await _map_msg(cfg.id, cp.message_id, user.id, mm.message_id)
+                await _map_msg(cfg.id, cp.message_id, user.id, mm.message_id, ticket_id=ticket.id)
+            await _maybe_pin_first_message(bot, cfg, created, cfg.admin_chat_id, copies[0].message_id)
         return
 
     markup = _combine_kb(extra_kb, close_kb)
@@ -598,12 +678,14 @@ async def relay_to_admin_chat(msgs: list[Message], bot: Bot, cfg: ChildBot,
         # сообщением вместе с фото/текстом/подписью.
         sent = await safe_call(bot.forward_message, cfg.admin_chat_id, first.chat.id,
                                first.message_id, message_thread_id=thread)
-        await _map_msg(cfg.id, sent.message_id, user.id, first.message_id)
+        await _map_msg(cfg.id, sent.message_id, user.id, first.message_id, ticket_id=ticket.id)
+        await _maybe_pin_first_message(bot, cfg, created, cfg.admin_chat_id, sent.message_id)
     else:
         sent = await safe_call(bot.copy_message, cfg.admin_chat_id, first.chat.id,
                                first.message_id, message_thread_id=thread,
                                reply_markup=markup, reply_parameters=reply_params)
-        await _map_msg(cfg.id, sent.message_id, user.id, first.message_id)
+        await _map_msg(cfg.id, sent.message_id, user.id, first.message_id, ticket_id=ticket.id)
+        await _maybe_pin_first_message(bot, cfg, created, cfg.admin_chat_id, sent.message_id)
 
 
 async def _mirror_reaction(bot: Bot, chat_id: int, message_id: int, reactions):
@@ -905,6 +987,26 @@ def build_common_router() -> Router:
         await open_ticket(bot, cfg, c.from_user.id, force_new=True)
         await c.answer("Обращение открыто! Напишите сообщение.", show_alert=True)
 
+    @r.callback_query(F.data.startswith("open_ticket_subj:"))
+    async def cb_open_ticket_subject(c: CallbackQuery, bot: Bot, bot_db_id: int):
+        """Открытие ОТДЕЛЬНОГО обращения по конкретной теме (п.3) — кнопка
+        inline_ticket. Текст/фото ответа (b.response_text/response_photo) —
+        то, что владелец настроил присылать при открытии темы."""
+        if await mod.is_banned(bot_db_id, c.from_user.id):
+            await c.answer("Вы забанены в этом боте.", show_alert=True)
+            return
+        btn_id = int(c.data.split(":")[1])
+        async with Session() as s:
+            b = await s.get(BotButton, btn_id)
+        if not b or b.bot_id != bot_db_id or b.kind != "inline_ticket":
+            await c.answer("Кнопка не найдена", show_alert=True)
+            return
+        cfg = await get_cfg(bot_db_id)
+        await open_ticket(bot, cfg, c.from_user.id, subject=b.text)
+        if b.response_text or b.response_photo:
+            await send_response(c.message, b.response_text, b.response_photo)
+        await c.answer(f"Обращение «{b.text}» открыто!", show_alert=True)
+
     # ---------- триггер-команды (ОБЩИЕ для обоих типов ботов) ----------
     # БАГ: раньше жили только в фидбек-роутере — в постинг-ботах
     # триггер-команды не работали вообще, а сами команды улетали в админ-чат
@@ -996,13 +1098,32 @@ def build_common_router() -> Router:
             return
         ticket_id = None
         if m.reply_to_message:
-            uid = await _target_from_reply(bot_db_id, m)
-            if uid is not None:
+            # НОВОЕ (п.3): у пользователя может быть НЕСКОЛЬКО параллельно
+            # открытых обращений (по разным темам) — раньше тут искалось
+            # "открытое обращение этого юзера" без уточнения, что при
+            # нескольких открытых стало бы неоднозначным. Теперь сначала
+            # пробуем достать ТОЧНОЕ обращение из MsgMap (по какому именно
+            # сообщению кликнули reply), и только если такой записи нет
+            # (старые сообщения без ticket_id) — откатываемся на прежний
+            # эвристический поиск по user_id.
+            async with Session() as s:
+                mp = await s.scalar(select(MsgMap).where(
+                    MsgMap.bot_id == bot_db_id,
+                    MsgMap.admin_chat_msg_id == m.reply_to_message.message_id))
+            if mp and mp.ticket_id is not None:
                 async with Session() as s:
-                    t = await s.scalar(select(Ticket).where(
-                        Ticket.bot_id == bot_db_id, Ticket.user_id == uid, Ticket.is_open))
-                if t:
+                    t = await s.get(Ticket, mp.ticket_id)
+                if t and t.is_open:
                     ticket_id = t.id
+            if ticket_id is None:
+                uid = await _target_from_reply(bot_db_id, m)
+                if uid is not None:
+                    async with Session() as s:
+                        t = await s.scalar(select(Ticket).where(
+                            Ticket.bot_id == bot_db_id, Ticket.user_id == uid,
+                            Ticket.is_open).order_by(Ticket.last_active_at.desc()))
+                    if t:
+                        ticket_id = t.id
         elif m.message_thread_id:
             async with Session() as s:
                 t = await s.scalar(select(Ticket).where(
