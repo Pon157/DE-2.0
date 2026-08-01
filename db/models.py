@@ -33,6 +33,7 @@ class EncryptedToken(TypeDecorator):
 class BotType(str, enum.Enum):
     feedback = "feedback"
     posting = "posting"
+    survey = "survey"
 
 
 class OpenMode(str, enum.Enum):
@@ -90,6 +91,13 @@ class ChildBot(Base):
     # что это разговорное действие, аналогично кнопке доната.
     close_ticket_button_text: Mapped[str] = mapped_column(String(64), default="❌ Закрыть обращение")
     always_new_ticket: Mapped[bool] = mapped_column(Boolean, default=False)  # /start или restart-кнопка -> новый тикет/топик
+    # НОВОЕ (по запросу): закреплять ли первое сообщение пользователя в
+    # админ-чате при открытии обращения — актуально ТОЛЬКО когда бот НЕ по
+    # топикам (use_topics=False): без топиков все переписки идут в один чат
+    # общей лентой, и закреп первого сообщения помогает не потерять начало
+    # обращения. При use_topics=True игнорируется — каждое обращение и так
+    # в своём отдельном топике.
+    pin_first_message: Mapped[bool] = mapped_column(Boolean, default=False)
 
     # ---- настройки posting ----
     channel_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
@@ -136,6 +144,10 @@ class BotButton(Base):
     response_text: Mapped[str | None] = mapped_column(Text, nullable=True)    # HTML ответ триггера
     response_photo: Mapped[str | None] = mapped_column(String(256), nullable=True)
     position: Mapped[int] = mapped_column(Integer, default=0)
+    # НОВОЕ (п.4): для kind in ("inline_survey","keyboard_survey") — какую
+    # анкету запускает эта кнопка.
+    survey_id: Mapped[int | None] = mapped_column(
+        ForeignKey("surveys.id", ondelete="CASCADE"), nullable=True)
 
 
 class BotUser(Base):
@@ -174,6 +186,18 @@ class Ticket(Base):
     topic_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)  # форум-топик
     is_open: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    # НОВОЕ (по запросу, п.3): "тема" обращения — если задана, это ОДНО из
+    # НЕСКОЛЬКИХ параллельно открытых обращений одного пользователя (по
+    # разным темам, открытым через отдельные инлайн/кейборд кнопки — см.
+    # BotButton.kind in ("inline_ticket","keyboard_ticket")). None — обычное
+    # "общее" обращение (старое поведение, когда тема не указана — правило
+    # 1 пользователь = максимум 1 такое открытое обращение сохраняется).
+    subject: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Когда по обращению последний раз было сообщение (от юзера ИЛИ админа)
+    # — нужно, чтобы понять, В КАКОЕ из НЕСКОЛЬКИХ параллельно открытых
+    # обращений пользователя направить его следующее "обычное" сообщение
+    # (не через тематическую кнопку) — см. child/common.py::open_ticket.
+    last_active_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
 class MessageLog(Base):
@@ -197,6 +221,14 @@ class MsgMap(Base):
     user_id: Mapped[int] = mapped_column(BigInteger)
     # id исходного сообщения в ЛС юзера (None для служебных сообщений — шапок и т.п.)
     user_chat_msg_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # НОВОЕ (по запросу, п.3): id конкретного обращения (Ticket), к которому
+    # относится сообщение. Раньше /close и подобные команды-реплаи искали
+    # "открытое обращение этого пользователя" по user_id — при ОДНОМ
+    # обращении на юзера это однозначно, но с несколькими параллельными
+    # обращениями по разным темам запрос стал бы неоднозначным (несколько
+    # строк). Явная ссылка убирает эту неоднозначность.
+    ticket_id: Mapped[int | None] = mapped_column(
+        ForeignKey("tickets.id", ondelete="SET NULL"), nullable=True)
 
 
 class Suggestion(Base):
@@ -357,3 +389,51 @@ class BotRuntimeLock(Base):
     bot_id: Mapped[int] = mapped_column(Integer, primary_key=True)
     holder: Mapped[str] = mapped_column(String(36))       # uuid процесса
     last_seen: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+# =========================================================================
+# Боты-анкеты (п.4, по запросу) — отдельный тип бота (BotType.survey).
+# Владелец настраивает одну или несколько анкет (Survey), каждая — набор
+# вопросов (SurveyQuestion, текстовых или с вариантами ответа-кнопками), и
+# привязывает анкету к inline/keyboard кнопке (BotButton.kind ==
+# "inline_survey"/"keyboard_survey", BotButton.survey_id -> Survey.id).
+# Ответы пользователя копятся в SurveyResponse, по завершении — сохраняются
+# и пересылаются в чат админов (как обычное обращение).
+# =========================================================================
+class Survey(Base):
+    __tablename__ = "surveys"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    bot_id: Mapped[int] = mapped_column(ForeignKey("child_bots.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(128))
+    position: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class SurveyQuestion(Base):
+    __tablename__ = "survey_questions"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    survey_id: Mapped[int] = mapped_column(ForeignKey("surveys.id", ondelete="CASCADE"), index=True)
+    position: Mapped[int] = mapped_column(Integer, default=0)
+    text: Mapped[str] = mapped_column(Text)
+    # "text" — свободный текстовый ответ; "choice" — варианты-кнопки (см. options_json)
+    qtype: Mapped[str] = mapped_column(String(16), default="text")
+    options_json: Mapped[str | None] = mapped_column(Text, nullable=True)  # ["Вариант 1", ...]
+
+
+class SurveyResponse(Base):
+    """Одно прохождение анкеты одним пользователем.
+
+    current_index — на каком вопросе пользователь сейчас (по нему
+    определяем, что его следующее сообщение/нажатие — ответ на ЭТОТ
+    вопрос, а не обычное сообщение боту). completed=False + не старше
+    разумного времени = "юзер сейчас проходит анкету"."""
+    __tablename__ = "survey_responses"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    survey_id: Mapped[int] = mapped_column(ForeignKey("surveys.id", ondelete="CASCADE"), index=True)
+    bot_id: Mapped[int] = mapped_column(Integer, index=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    current_index: Mapped[int] = mapped_column(Integer, default=0)
+    answers_json: Mapped[str] = mapped_column(Text, default="[]")  # [{"q":"...","a":"..."}]
+    completed: Mapped[bool] = mapped_column(Boolean, default=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
