@@ -6,10 +6,11 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (Message, CallbackQuery, InlineKeyboardMarkup,
                            InlineKeyboardButton, BufferedInputFile)
 from aiogram.utils.token import validate_token
-from sqlalchemy import select
+from sqlalchemy import select, func
 from db.base import Session
 from db.models import (ChildBot, BotAdmin, BotButton, BotType, OpenMode, ForwardMode,
-                       Advertisement, AdKind, AdStatus, PlatformUser, BotUser)
+                       Advertisement, AdKind, AdStatus, PlatformUser, BotUser,
+                       Survey, SurveyQuestion)
 from services.bot_manager import manager, reupload_photo_for_bot as manager_reupload
 from services.broadcast import run_broadcast
 from services.stats_image import build_stats_image
@@ -172,6 +173,11 @@ class St(StatesGroup):
     ap_ban_add = State()
     ban_by_id = State()
     antispam_cfg = State()
+    set_survey_finish = State()
+    survey_name = State()
+    survey_q_text = State()
+    survey_q_options = State()
+    btn_pick_survey = State()
 
 
 HEADER_MODE_LABELS = {
@@ -379,7 +385,8 @@ async def newbot(c: CallbackQuery, state: FSMContext):
     await state.set_state(St.add_type)
     await c.message.edit_text("Тип бота?", reply_markup=kb([
         [("💬 Обратная связь", "type:feedback")],
-        [("📣 Постинг в канал", "type:posting")]
+        [("📣 Постинг в канал", "type:posting")],
+        [("📝 Анкета", "type:survey")],
     ]))
     await c.answer()
 
@@ -491,6 +498,18 @@ async def cfg_menu(c: CallbackQuery):
             [("✉️ Кнопка обращения", f"ticketbtn:{bot_id}")],
             [("🔄 Restart/кнопка: " + ("новый тикет" if cb.always_new_ticket else "тот же тикет"),
               f"cyc_newticket:{bot_id}")],
+            [(f"🛡 Антиспам: {'вкл' if cb.antispam_enabled else 'выкл'}", f"cyc_antispam:{bot_id}"),
+             ("🛡 Пороги", f"antispamcfg:{bot_id}")],
+            [(f"🛡 Антиспам трогает владельца: {'нет' if cb.antispam_ignore_owner else 'да'}",
+              f"cyc_aspown:{bot_id}")],
+        ]
+    elif cb.bot_type == BotType.survey:
+        rows = [
+            [("👋 Приветствие", f"welcome:{bot_id}")],
+            [("📋 Анкеты (вопросы)", f"surveys:{bot_id}")],
+            [("✅ Текст после заполнения анкеты", f"surveyfinish:{bot_id}")],
+            [("🏠 Чат админов (куда приходят заполненные анкеты)", f"admchat:{bot_id}")],
+            [(f"⚠️ Лимит варнов: {cb.warn_limit}", f"warnlim:{bot_id}")],
             [(f"🛡 Антиспам: {'вкл' if cb.antispam_enabled else 'выкл'}", f"cyc_antispam:{bot_id}"),
              ("🛡 Пороги", f"antispamcfg:{bot_id}")],
             [(f"🛡 Антиспам трогает владельца: {'нет' if cb.antispam_ignore_owner else 'да'}",
@@ -610,7 +629,202 @@ async def welcome_save(m: Message, state: FSMContext):
     await m.answer(f"{em('check')} Приветствие сохранено!", reply_markup=nav_kb(bot_id))
 
 
-# --- чат админов / канал ---
+# --- боты-анкеты (п.4): текст благодарности после заполнения ---
+@router.callback_query(F.data.startswith("surveyfinish:"))
+async def surveyfinish(c: CallbackQuery, state: FSMContext):
+    await state.set_state(St.set_survey_finish)
+    await state.update_data(bot_id=int(c.data.split(":")[1]), last_msg_id=c.message.message_id)
+    await c.message.edit_text(
+        f"{em('pencil')} Пришлите текст, который увидит пользователь сразу после "
+        "заполнения анкеты (форматирование сохранится):")
+    await c.answer()
+
+
+@router.message(St.set_survey_finish)
+async def surveyfinish_save(m: Message, state: FSMContext):
+    data = await state.get_data()
+    await delete_previous(m, state)
+    if not m.text:
+        msg = await m.answer(f"{em('cross')} Нужен текст. Попробуйте снова.")
+        await state.update_data(last_msg_id=msg.message_id)
+        return
+    async with Session() as s:
+        obj = await s.get(ChildBot, data["bot_id"])
+        obj.survey_start_text = m.html_text
+        await s.commit()
+    await state.clear()
+    await m.answer(f"{em('check')} Текст сохранён!", reply_markup=nav_kb(data["bot_id"]))
+
+
+# --- боты-анкеты: список/CRUD анкет и их вопросов ---
+async def _show_surveys(target, bot_id: int, edit: bool):
+    async with Session() as s:
+        rows_db = (await s.scalars(select(Survey).where(Survey.bot_id == bot_id)
+                                   .order_by(Survey.position, Survey.id))).all()
+    rows = [[(f"📋 {sv.name}", f"survey:{sv.id}")] for sv in rows_db]
+    rows.append([("➕ Добавить анкету", f"survey_add:{bot_id}")])
+    rows.append([("⬅️ Назад", f"cfg:{bot_id}")])
+    text = "Анкеты бота:" if rows_db else "Анкет пока нет — добавьте первую."
+    if edit:
+        await target.edit_text(text, reply_markup=kb(rows))
+    else:
+        await target.answer(text, reply_markup=kb(rows))
+
+
+@router.callback_query(F.data.startswith("surveys:"))
+async def surveys_list(c: CallbackQuery):
+    await _show_surveys(c.message, int(c.data.split(":")[1]), edit=True)
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("survey_add:"))
+async def survey_add(c: CallbackQuery, state: FSMContext):
+    await state.set_state(St.survey_name)
+    await state.update_data(bot_id=int(c.data.split(":")[1]), last_msg_id=c.message.message_id)
+    await c.message.edit_text(f"{em('pencil')} Название анкеты (видно только вам, в конструкторе):")
+    await c.answer()
+
+
+@router.message(St.survey_name)
+async def survey_add_save(m: Message, state: FSMContext):
+    data = await state.get_data()
+    await delete_previous(m, state)
+    if not m.text or not m.text.strip():
+        msg = await m.answer(f"{em('cross')} Нужен текст. Попробуйте снова.")
+        await state.update_data(last_msg_id=msg.message_id)
+        return
+    bot_id = data["bot_id"]
+    async with Session() as s:
+        s.add(Survey(bot_id=bot_id, name=m.text.strip()[:128]))
+        await s.commit()
+    await state.clear()
+    msg = await m.answer(f"{em('check')} Анкета добавлена! Теперь привяжите к ней кнопку "
+                         "(⚙️ Настройки → 🔘 Кнопки → «📋 Инлайн/Кейборд: анкета») и добавьте вопросы.")
+    await _show_surveys(msg, bot_id, edit=False)
+
+
+async def _show_survey(target, survey_id: int, edit: bool):
+    async with Session() as s:
+        sv = await s.get(Survey, survey_id)
+        qs = (await s.scalars(select(SurveyQuestion).where(SurveyQuestion.survey_id == survey_id)
+                              .order_by(SurveyQuestion.position))).all()
+    rows = []
+    for q in qs:
+        tag = "🔘" if q.qtype == "choice" else "✏️"
+        label = q.text if len(q.text) <= 40 else q.text[:37] + "…"
+        rows.append([(f"{tag} {label}", f"survey_q_del:{q.id}:{survey_id}")])
+    rows.append([("➕ Добавить вопрос", f"survey_q_add:{survey_id}")])
+    rows.append([("🗑 Удалить анкету", f"survey_del:{survey_id}")])
+    rows.append([("⬅️ Назад", f"surveys:{sv.bot_id}")])
+    text = (f"📋 <b>{sv.name}</b>\n"
+           f"Вопросов: {len(qs)}. Нажмите на вопрос, чтобы удалить его.")
+    if edit:
+        await target.edit_text(text, reply_markup=kb(rows))
+    else:
+        await target.answer(text, reply_markup=kb(rows))
+
+
+@router.callback_query(F.data.startswith("survey:"))
+async def survey_open(c: CallbackQuery):
+    await _show_survey(c.message, int(c.data.split(":")[1]), edit=True)
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("survey_del:"))
+async def survey_del(c: CallbackQuery):
+    survey_id = int(c.data.split(":")[1])
+    async with Session() as s:
+        sv = await s.get(Survey, survey_id)
+        if sv:
+            bot_id = sv.bot_id
+            await s.delete(sv)
+            await s.commit()
+            await _show_surveys(c.message, bot_id, edit=True)
+    await c.answer("Анкета удалена")
+
+
+@router.callback_query(F.data.startswith("survey_q_del:"))
+async def survey_q_del(c: CallbackQuery):
+    _, q_id, survey_id = c.data.split(":")
+    async with Session() as s:
+        q = await s.get(SurveyQuestion, int(q_id))
+        if q:
+            await s.delete(q)
+            await s.commit()
+    await _show_survey(c.message, int(survey_id), edit=True)
+    await c.answer("Вопрос удалён")
+
+
+@router.callback_query(F.data.startswith("survey_q_add:"))
+async def survey_q_add(c: CallbackQuery, state: FSMContext):
+    survey_id = int(c.data.split(":")[1])
+    await state.update_data(survey_id=survey_id, last_msg_id=c.message.message_id)
+    await c.message.edit_text("Тип вопроса?", reply_markup=kb([
+        [("✏️ Свободный текст", f"survey_qtype:text"),
+         ("🔘 Варианты-кнопки", f"survey_qtype:choice")],
+        [("⬅️ Назад", f"survey:{survey_id}")],
+    ]))
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("survey_qtype:"))
+async def survey_qtype(c: CallbackQuery, state: FSMContext):
+    qtype = c.data.split(":")[1]
+    await state.update_data(qtype=qtype)
+    await state.set_state(St.survey_q_text)
+    await c.message.edit_text(f"{em('pencil')} Текст вопроса:")
+    await c.answer()
+
+
+@router.message(St.survey_q_text)
+async def survey_q_text_save(m: Message, state: FSMContext):
+    data = await state.get_data()
+    await delete_previous(m, state)
+    if not m.text or not m.text.strip():
+        msg = await m.answer(f"{em('cross')} Нужен текст. Попробуйте снова.")
+        await state.update_data(last_msg_id=msg.message_id)
+        return
+    await state.update_data(q_text=m.text.strip())
+    if data["qtype"] == "choice":
+        await state.set_state(St.survey_q_options)
+        msg = await m.answer("Пришлите варианты ответа через запятую "
+                             "(например: <i>Да, Нет, Не уверен</i>):")
+        await state.update_data(last_msg_id=msg.message_id)
+        return
+    survey_id = data["survey_id"]
+    async with Session() as s:
+        n = await s.scalar(select(func.count()).select_from(SurveyQuestion)
+                           .where(SurveyQuestion.survey_id == survey_id))
+        s.add(SurveyQuestion(survey_id=survey_id, position=n or 0,
+                             text=data["q_text"], qtype="text"))
+        await s.commit()
+    await state.clear()
+    msg = await m.answer(f"{em('check')} Вопрос добавлен!")
+    await _show_survey(msg, survey_id, edit=False)
+
+
+@router.message(St.survey_q_options)
+async def survey_q_options_save(m: Message, state: FSMContext):
+    data = await state.get_data()
+    await delete_previous(m, state)
+    opts = [o.strip() for o in (m.text or "").split(",") if o.strip()]
+    if len(opts) < 2:
+        msg = await m.answer(f"{em('cross')} Нужно минимум 2 варианта через запятую. Попробуйте снова.")
+        await state.update_data(last_msg_id=msg.message_id)
+        return
+    survey_id = data["survey_id"]
+    async with Session() as s:
+        n = await s.scalar(select(func.count()).select_from(SurveyQuestion)
+                           .where(SurveyQuestion.survey_id == survey_id))
+        s.add(SurveyQuestion(survey_id=survey_id, position=n or 0, text=data["q_text"],
+                             qtype="choice", options_json=json.dumps(opts, ensure_ascii=False)))
+        await s.commit()
+    await state.clear()
+    msg = await m.answer(f"{em('check')} Вопрос добавлен!")
+    await _show_survey(msg, survey_id, edit=False)
+
+
+
 @router.callback_query(F.data.startswith(("admchat:", "channel:")))
 async def set_chat(c: CallbackQuery, state: FSMContext):
     kind, bot_id = c.data.split(":")
@@ -846,6 +1060,11 @@ async def btnadd(c: CallbackQuery, state: FSMContext):
         # ответа, отправляются пользователю сразу при открытии.
         [("✉️➕ Инлайн: открыть тему", "bk:inline_ticket"),
          ("✉️➕ Кейборд: открыть тему", "bk:keyboard_ticket")],
+        # НОВОЕ (п.4): запуск анкеты (для ботов-анкет — см. cfg -> "📋
+        # Анкеты"). Нужна хотя бы одна созданная анкета — иначе на шаге
+        # выбора анкеты будет предложено сначала создать её.
+        [("📋 Инлайн: запустить анкету", "bk:inline_survey"),
+         ("📋 Кейборд: запустить анкету", "bk:keyboard_survey")],
     ]))
     await c.answer()
 
@@ -854,11 +1073,37 @@ async def btnadd(c: CallbackQuery, state: FSMContext):
 async def btn_kind(c: CallbackQuery, state: FSMContext):
     kind = c.data.split(":")[1]
     await state.update_data(kind=kind, last_msg_id=c.message.message_id)
+    if kind in ("inline_survey", "keyboard_survey"):
+        data = await state.get_data()
+        async with Session() as s:
+            surveys = (await s.scalars(select(Survey).where(
+                Survey.bot_id == data["bot_id"]).order_by(Survey.position, Survey.id))).all()
+        if not surveys:
+            await c.message.edit_text(
+                f"{em('warn')} У бота пока нет ни одной анкеты. Сначала создайте её: "
+                "⚙️ Настройки → «📋 Анкеты (вопросы)» → «➕ Добавить анкету».",
+                reply_markup=kb([[("⬅️ Назад", f"btnadd:{data['bot_id']}")]]))
+            await c.answer()
+            return
+        await state.set_state(St.btn_pick_survey)
+        await c.message.edit_text("Какую анкету запускает эта кнопка?", reply_markup=kb(
+            [[(sv.name, f"pick_survey:{sv.id}")] for sv in surveys]))
+        await c.answer()
+        return
     await state.set_state(St.btn_text)
     hint = "имя команды без /" if kind == "command" else \
         "название темы (это же текст кнопки)" if kind in ("inline_ticket", "keyboard_ticket") \
         else "текст кнопки"
     await c.message.edit_text(f"Пришлите {hint}:")
+    await c.answer()
+
+
+@router.callback_query(St.btn_pick_survey, F.data.startswith("pick_survey:"))
+async def btn_pick_survey(c: CallbackQuery, state: FSMContext):
+    survey_id = int(c.data.split(":")[1])
+    await state.update_data(survey_id=survey_id, last_msg_id=c.message.message_id)
+    await state.set_state(St.btn_text)
+    await c.message.edit_text("Пришлите текст кнопки:")
     await c.answer()
 
 
@@ -895,6 +1140,10 @@ async def btn_text(m: Message, state: FSMContext):
             next_text = ("Пришлите текст (и/или фото), который получит пользователь "
                         "при открытии обращения по этой теме (текст/фото, "
                         "форматирование сохранится):")
+        elif data["kind"] in ("inline_survey", "keyboard_survey"):
+            next_text = ("Пришлите текст (и/или фото), который получит пользователь "
+                        "ПЕРЕД первым вопросом анкеты — просто вступление "
+                        "(если не нужно — пришлите один пробел):")
         else:
             next_text = "Пришлите ответ триггера (текст/фото, форматирование сохранится):"
 
@@ -933,7 +1182,7 @@ async def btn_response(m: Message, state: FSMContext):
             await m.answer(f"{em('warn')} Не удалось прикрепить фото к ответу — сохраню "
                            "только текст. (Напишите что-нибудь дочернему боту и попробуйте снова.)")
     await state.update_data(response_text=m.html_text or "", response_photo=response_photo)
-    if data["kind"] in ("keyboard", "command", "keyboard_ticket"):
+    if data["kind"] in ("keyboard", "command", "keyboard_ticket", "keyboard_survey"):
         # Reply-клавиатура и команды — обычные Telegram-объекты без поддержки
         # цвета/premium-иконки, сохраняем сразу.
         await _save_button(m, state)
@@ -996,6 +1245,7 @@ async def _save_button(m: Message, state: FSMContext):
             url=data.get("url"),
             response_text=data.get("response_text"),
             response_photo=data.get("response_photo"),
+            survey_id=data.get("survey_id"),
             style=data.get("style"), icon_emoji_id=data.get("icon_emoji_id")))
         await s.commit()
     await state.clear()
