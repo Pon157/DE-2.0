@@ -243,6 +243,12 @@ async def init_db():
         "ALTER TABLE msg_map ADD COLUMN IF NOT EXISTS ticket_id INTEGER",
         # ---- боты-анкеты (п.4) ----
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS survey_start_text TEXT",
+        "ALTER TABLE bot_buttons ADD COLUMN IF NOT EXISTS survey_id INTEGER",
+        # У bot_type — нативный Postgres ENUM (создан SQLAlchemy как
+        # "bottype"), просто ADD COLUMN тут не поможет — новое значение
+        # 'survey' нужно явно добавить в сам тип. ADD VALUE IF NOT EXISTS
+        # безопасно вызывать повторно.
+        "ALTER TYPE bottype ADD VALUE IF NOT EXISTS 'survey'",
     ):
         await _exec(stmt)
 
