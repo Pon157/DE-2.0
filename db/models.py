@@ -98,6 +98,13 @@ class ChildBot(Base):
     # обращения. При use_topics=True игнорируется — каждое обращение и так
     # в своём отдельном топике.
     pin_first_message: Mapped[bool] = mapped_column(Boolean, default=False)
+    # БАГ: колонку добавляли миграцией в db/base.py, но забыли объявить сам
+    # атрибут модели — из-за этого SQLAlchemy ORM-объект ChildBot вообще не
+    # знал о такой колонке ("'ChildBot' object has no attribute
+    # 'survey_start_text'"), хотя в БД она уже была. Текст, который
+    # получает пользователь сразу после заполнения анкеты (п.4, боты-анкеты)
+    # — см. child/survey.py::_advance_or_finish.
+    survey_start_text: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # ---- настройки posting ----
     channel_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
