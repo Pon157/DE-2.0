@@ -17,7 +17,7 @@ from aiogram.types import (Message, PreCheckoutQuery, LabeledPrice,
 from sqlalchemy import select
 from db.base import Session
 from db.models import (ChildBot, BotAdmin, Donation, BotButton, OpenMode, ForwardMode,
-                       BotUser, Ticket, MsgMap, MessageLog)
+                       BotUser, Ticket, MsgMap, MessageLog, BotType)
 from services import moderation as mod
 from services import ads as ads_service
 from services import referrals
@@ -299,6 +299,12 @@ async def build_keyboards(bot_db_id: int, cfg: ChildBot, extra_inline: list | No
                 style=b.style, icon_custom_emoji_id=b.icon_emoji_id)])
         elif b.kind == "keyboard_ticket":
             kb_rows.append([KeyboardButton(text=b.text)])
+        elif b.kind == "inline_survey":
+            inline_rows.append([InlineKeyboardButton(
+                text=b.text, callback_data=f"survey_start:{b.id}",
+                style=b.style, icon_custom_emoji_id=b.icon_emoji_id)])
+        elif b.kind == "keyboard_survey":
+            kb_rows.append([KeyboardButton(text=b.text)])
     if extra_inline:
         inline_rows = extra_inline + inline_rows
     if getattr(cfg, "open_mode", None) == OpenMode.button:
@@ -400,13 +406,21 @@ async def handle_keyboard_button(m: Message, bot_db_id: int) -> bool:
             BotButton.kind.in_(("keyboard", "keyboard_ticket")),
             BotButton.text == m.text))
     if b and b.kind == "keyboard_ticket":
-        # Открывает СВОЁ, отдельное обращение по теме = тексту кнопки (см.
-        # п.3) — работает независимо от того, сколько других обращений (по
-        # другим темам) у пользователя уже открыто.
+        # Открывает обращение по теме = тексту кнопки (см. п.3). Правило
+        # "1 пользователь = 1 открытое обращение" строгое — если у юзера
+        # уже открыто обращение (по любой теме), новое не создаём.
         cfg = await get_cfg(bot_db_id)
         if cfg:
-            await open_ticket(m.bot, cfg, m.from_user.id, subject=b.text)
-            await send_response(m, b.response_text, b.response_photo)
+            ticket, created, conflict = await open_ticket(m.bot, cfg, m.from_user.id, subject=b.text)
+            if conflict:
+                close_hint = cfg.close_ticket_button_text or "❌ Закрыть обращение"
+                await m.answer(
+                    f"{em('warn')} У вас уже есть открытое обращение"
+                    f"{f' («{ticket.subject}»)' if ticket.subject else ''}. "
+                    f"Закройте его командой /close или кнопкой «{close_hint}», "
+                    "чтобы открыть новое.")
+            else:
+                await send_response(m, b.response_text, b.response_photo)
         return True
     if b and (b.response_text is not None or b.response_photo):
         await send_response(m, b.response_text, b.response_photo)
@@ -431,47 +445,45 @@ async def _notify_user(bot: Bot, bot_db_id: int, user_id: int, text: str):
 
 async def open_ticket(bot: Bot, cfg: ChildBot, user_id: int,
                       force_new: bool = False,
-                      subject: str | None = None) -> tuple[Ticket, bool]:
+                      subject: str | None = None) -> tuple[Ticket, bool, bool]:
     """Открывает (или переиспользует) тикет-переписку с пользователем —
-    возвращает (ticket, created). created=True, если тикет только что создан
-    (по этому флагу на первое сообщение вешается кнопка закрытия обращения).
+    возвращает (ticket, created, conflict).
+    created=True, если тикет только что создан (по этому флагу на первое
+    сообщение вешается кнопка закрытия обращения).
+    conflict=True — тикет НЕ создан и НЕ переиспользован для этой темы,
+    потому что у пользователя уже открыто обращение по ДРУГОЙ теме (см.
+    ниже) — вызывающий код должен показать пользователю, что нужно сначала
+    закрыть текущее обращение.
 
     БАГ: если чат админов НЕ форум, а топики включены, create_forum_topic
     падал с исключением и сообщение пользователя терялось ВООБЩЕ (не
     релеилось). Теперь — мягкий фолбэк на режим без топика.
 
-    subject (п.3, "несколько обращений по разным темам"): None — обычное
-    поведение (как раньше, максимум одно открытое обращение "без темы" на
-    пользователя). Если передана конкретная тема (нажатие тематической
-    inline_ticket/keyboard_ticket кнопки) — ищем/создаём отдельное открытое
-    обращение ИМЕННО с этой темой; у пользователя при этом может быть
-    несколько разных открытых обращений одновременно (по разным темам), но
-    правило "1 обращение = 1 тема = максимум 1 открытый тикет" сохраняется
-    — повторное нажатие той же тематической кнопки просто возвращает уже
-    открытое обращение по этой теме, а не плодит дубли.
-
-    Когда subject не передан (обычное сообщение без нажатия кнопки, а также
-    /start-триггер и т.п.) — если у пользователя уже открыто НЕСКОЛЬКО
-    обращений по разным темам, сообщение уходит в то, что использовалось
-    последним (last_active_at) — это самый интуитивный вариант "текущего
-    диалога" для юзера, который просто продолжает переписку."""
+    ВАЖНО (по запросу): правило "1 пользователь = 1 открытое обращение"
+    строгое — даже с несколькими тематическими кнопками
+    (inline_ticket/keyboard_ticket, см. п.3) одновременно у пользователя
+    может быть открыто только ОДНО обращение. subject — это просто метка
+    темы для уже открытого/создаваемого обращения, а не способ завести
+    параллельно несколько штук. Если пользователь нажимает кнопку темы, а
+    у него уже открыто обращение (по любой теме или без темы) — новое НЕ
+    создаётся, возвращается conflict=True, и пользователю нужно сначала
+    закрыть текущее через /close или кнопку «Закрыть обращение»."""
     async with Session() as s:
-        q = select(Ticket).where(
-            Ticket.bot_id == cfg.id, Ticket.user_id == user_id, Ticket.is_open)
-        if subject is not None:
-            q = q.where(Ticket.subject == subject)
-        else:
-            q = q.order_by(Ticket.last_active_at.desc())
-        t = await s.scalar(q)
+        t = await s.scalar(select(Ticket).where(
+            Ticket.bot_id == cfg.id, Ticket.user_id == user_id, Ticket.is_open))
         if t and not force_new:
+            if subject is not None and t.subject != subject:
+                # у юзера уже открыто обращение по ДРУГОЙ теме (или без темы) —
+                # не открываем второе одновременно, сигналим конфликт
+                return t, False, True
             t.last_active_at = datetime.utcnow()
             await s.commit()
-            return t, False
+            return t, False, False
         if t and force_new:
             if not getattr(cfg, "always_new_ticket", False):
                 t.last_active_at = datetime.utcnow()
                 await s.commit()
-                return t, False
+                return t, False, False
             t.is_open = False
             await s.commit()
         topic_id = None
@@ -493,7 +505,7 @@ async def open_ticket(bot: Bot, cfg: ChildBot, user_id: int,
         s.add(t)
         await s.commit()
     await _send_ticket_opened_keyboard(bot, cfg, user_id)
-    return t, True
+    return t, True, False
 
 
 async def _send_ticket_opened_keyboard(bot: Bot, cfg: ChildBot, user_id: int):
@@ -555,7 +567,7 @@ async def relay_to_admin_chat(msgs: list[Message], bot: Bot, cfg: ChildBot,
     "🔒 Закрыть обращение" вешается на первое сообщение нового тикета.
     """
     user = msgs[0].from_user
-    ticket, created = await open_ticket(bot, cfg, user.id)
+    ticket, created, _conflict = await open_ticket(bot, cfg, user.id)
     thread = ticket.topic_id if cfg.use_topics else None
     header = build_header(cfg, user, subject=ticket.subject)
     header_mode = getattr(cfg, "header_mode", "separate") or "separate"
@@ -989,9 +1001,12 @@ def build_common_router() -> Router:
 
     @r.callback_query(F.data.startswith("open_ticket_subj:"))
     async def cb_open_ticket_subject(c: CallbackQuery, bot: Bot, bot_db_id: int):
-        """Открытие ОТДЕЛЬНОГО обращения по конкретной теме (п.3) — кнопка
-        inline_ticket. Текст/фото ответа (b.response_text/response_photo) —
-        то, что владелец настроил присылать при открытии темы."""
+        """Открытие обращения по конкретной теме (п.3) — кнопка inline_ticket.
+        Текст/фото ответа (b.response_text/response_photo) — то, что
+        владелец настроил присылать при открытии темы. Правило "1
+        пользователь = 1 открытое обращение" строгое — если уже что-то
+        открыто, новое НЕ создаётся, юзеру предлагается сперва закрыть
+        текущее (/close или кнопка)."""
         if await mod.is_banned(bot_db_id, c.from_user.id):
             await c.answer("Вы забанены в этом боте.", show_alert=True)
             return
@@ -1002,7 +1017,15 @@ def build_common_router() -> Router:
             await c.answer("Кнопка не найдена", show_alert=True)
             return
         cfg = await get_cfg(bot_db_id)
-        await open_ticket(bot, cfg, c.from_user.id, subject=b.text)
+        ticket, created, conflict = await open_ticket(bot, cfg, c.from_user.id, subject=b.text)
+        if conflict:
+            close_hint = cfg.close_ticket_button_text or "❌ Закрыть обращение"
+            await c.answer(
+                f"У вас уже есть открытое обращение"
+                f"{f' («{ticket.subject}»)' if ticket.subject else ''}. "
+                f"Закройте его командой /close или кнопкой «{close_hint}», "
+                "чтобы открыть новое.", show_alert=True)
+            return
         if b.response_text or b.response_photo:
             await send_response(c.message, b.response_text, b.response_photo)
         await c.answer(f"Обращение «{b.text}» открыто!", show_alert=True)
@@ -1033,12 +1056,16 @@ def build_common_router() -> Router:
         await send_response(m, b.response_text, b.response_photo)
 
     # ---------- закрытие / переоткрытие обращения ----------
-    async def _close_ticket_core(bot: Bot, bot_db_id: int, tid: int) -> str | None:
+    async def _close_ticket_core(bot: Bot, bot_db_id: int, tid: int,
+                                 notify_user: bool = True) -> str | None:
         """Общая логика закрытия тикета — используется и инлайн-кнопкой
         (доступна только в copy-режиме), и командой /close (работает в
         любом режиме — единственный способ закрыть тикет при forward, и
-        альтернативный способ при copy). Возвращает текст ошибки (если
-        что-то пошло не так) или None при успехе."""
+        альтернативный способ при copy), и самим пользователем через /close.
+        Возвращает текст ошибки (если что-то пошло не так) или None при
+        успехе. notify_user=False — не слать юзеру уведомление о закрытии
+        (используется, когда закрывает сам пользователь — ему и так придёт
+        прямой ответ на его /close, дублировать не нужно)."""
         async with Session() as s:
             t = await s.get(Ticket, tid)
             cfg = await s.get(ChildBot, bot_db_id)
@@ -1053,15 +1080,16 @@ def build_common_router() -> Router:
                 await bot.close_forum_topic(cfg.admin_chat_id, t.topic_id)
             except Exception:
                 pass
-        try:
-            await bot.send_message(t.user_id,
-                                   f"{em('lock')} Обращение закрыто администрацией. "
-                                   "Ваше новое сообщение откроет новое обращение.",
-                                   reply_markup=ReplyKeyboardRemove())
-        except TelegramForbiddenError:
-            await mod.mark_blocked_bot(bot_db_id, t.user_id)
-        except Exception:
-            pass
+        if notify_user:
+            try:
+                await bot.send_message(t.user_id,
+                                       f"{em('lock')} Обращение закрыто администрацией. "
+                                       "Ваше новое сообщение откроет новое обращение.",
+                                       reply_markup=ReplyKeyboardRemove())
+            except TelegramForbiddenError:
+                await mod.mark_blocked_bot(bot_db_id, t.user_id)
+            except Exception:
+                pass
         return None
 
     @r.callback_query(F.data.startswith("close_ticket:"))
@@ -1095,6 +1123,29 @@ def build_common_router() -> Router:
     @r.message(Command("close"))
     async def cmd_close(m: Message, bot: Bot, bot_db_id: int):
         if not await is_bot_admin(bot_db_id, m.from_user.id):
+            # Боты-анкеты (п.4) не используют обращения/тикеты — там у
+            # /close другой смысл (отмена текущей незаполненной анкеты),
+            # обрабатывается в child/survey.py::build_survey_router().
+            cfg0 = await get_cfg(bot_db_id)
+            if cfg0 and cfg0.bot_type == BotType.survey:
+                raise SkipHandler
+            # НОВОЕ (по запросу): /close теперь работает и у пользователя —
+            # закрывает ЕГО СОБСТВЕННОЕ открытое обращение (не только у
+            # админа реплаем/в топике). Это тот же способ закрыть
+            # обращение, что и кнопка «Закрыть обращение» на стороне
+            # пользователя, просто командой.
+            async with Session() as s:
+                t = await s.scalar(select(Ticket).where(
+                    Ticket.bot_id == bot_db_id, Ticket.user_id == m.from_user.id,
+                    Ticket.is_open))
+            if not t:
+                await m.answer(f"{em('info')} У вас нет открытых обращений.")
+                return
+            err = await _close_ticket_core(bot, bot_db_id, t.id, notify_user=False)
+            await m.answer(
+                f"{em('cross')} {err}" if err else
+                f"{em('lock')} Обращение закрыто. Напишите сообщение, чтобы открыть новое.",
+                reply_markup=ReplyKeyboardRemove() if not err else None)
             return
         ticket_id = None
         if m.reply_to_message:
