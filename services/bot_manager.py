@@ -165,6 +165,7 @@ class BotManager:
 
         from child.feedback import build_feedback_router
         from child.posting import build_posting_router
+        from child.survey import build_survey_router
         from child.common import build_common_router
 
         bot = Bot(cb.token, default=DefaultBotProperties(parse_mode="HTML"))
@@ -196,6 +197,8 @@ class BotManager:
         dp.include_router(build_common_router())
         if cb.bot_type == BotType.feedback:
             dp.include_router(build_feedback_router())
+        elif cb.bot_type == BotType.survey:
+            dp.include_router(build_survey_router())
         else:
             dp.include_router(build_posting_router())
 
