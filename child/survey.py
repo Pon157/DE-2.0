@@ -24,7 +24,8 @@ from services import moderation as mod
 from services import antispam
 from child.common import (inject_extras, build_keyboards, send_with_keyboards,
                           handle_keyboard_button, get_cfg, is_bot_admin,
-                          should_apply_antispam, safe_call, send_response)
+                          should_apply_antispam, safe_call, send_response,
+                          message_media)
 from utils.emoji import em
 from sqlalchemy import select
 
@@ -72,8 +73,16 @@ async def _finish(bot: Bot, cfg: ChildBot, resp_id: int):
     answers = json.loads(resp.answers_json or "[]")
     lines = [f"📋 <b>Анкета «{html.escape(survey.name)}»</b>",
             f"👤 <code>{resp.user_id}</code>"]
+    # media-ответы (по запросу: фото/аудио/etc. в ответ на вопрос анкеты) —
+    # шлём ОТДЕЛЬНЫМИ сообщениями после текста анкеты, т.к. эти файлы
+    # получены ЭТИМ ЖЕ (дочерним) ботом — в отличие от рассылки, здесь
+    # file_id валиден напрямую, перезаливка не нужна.
+    media_answers = []
     for a in answers:
-        lines.append(f"\n<b>{html.escape(a['q'])}</b>\n{html.escape(a['a'])[:3500]}")
+        a_text = a["a"] if a["a"] else "(без текста)"
+        lines.append(f"\n<b>{html.escape(a['q'])}</b>\n{html.escape(a_text)[:3500]}")
+        if a.get("media_file_id"):
+            media_answers.append(a)
     text = "\n".join(lines)
     if cfg.admin_chat_id:
         # Длинный текст анкеты может легко перевалить за 4096 — режем на
@@ -85,6 +94,33 @@ async def _finish(bot: Bot, cfg: ChildBot, resp_id: int):
             except Exception as e:
                 log.warning("survey._finish: не удалось отправить в admin_chat_id "
                             "бота %s: %s", cfg.id, e)
+        for a in media_answers:
+            try:
+                await _send_answer_media(bot, cfg.admin_chat_id, a["media_type"],
+                                         a["media_file_id"], caption=f"↳ {a['q']}")
+            except Exception as e:
+                log.warning("survey._finish: не удалось переслать медиа-ответ "
+                            "бота %s: %s", cfg.id, e)
+
+
+async def _send_answer_media(bot: Bot, chat_id: int, media_type: str, file_id: str,
+                             caption: str | None = None):
+    if media_type == "photo":
+        await bot.send_photo(chat_id, file_id, caption=caption)
+    elif media_type == "video":
+        await bot.send_video(chat_id, file_id, caption=caption)
+    elif media_type == "document":
+        await bot.send_document(chat_id, file_id, caption=caption)
+    elif media_type == "animation":
+        await bot.send_animation(chat_id, file_id, caption=caption)
+    elif media_type == "audio":
+        await bot.send_audio(chat_id, file_id, caption=caption)
+    elif media_type == "voice":
+        await bot.send_voice(chat_id, file_id, caption=caption)
+    elif media_type == "video_note":
+        await bot.send_video_note(chat_id, file_id)
+    elif media_type == "sticker":
+        await bot.send_sticker(chat_id, file_id)
 
 
 async def _advance_or_finish(bot: Bot, cfg: ChildBot, m: Message, resp_id: int):
@@ -246,11 +282,20 @@ def build_survey_router() -> Router:
                 await m.answer(f"{em('warn')} Пожалуйста, выберите один из вариантов "
                                "кнопкой выше.")
                 return
-            answer_text = m.text or m.caption or "(сообщение без текста)"
+            # По запросу: ответом на свободный текстовый вопрос анкеты
+            # теперь можно прислать и медиа (фото/видео/аудио/голосовое/
+            # документ/гиф/кружок/стикер) — раньше медиа без подписи просто
+            # терялось и сохранялось как "(сообщение без текста)".
+            media_file_id, media_type = message_media(m)
+            answer_text = m.text or m.caption or ("" if media_file_id else "")
+            answer = {"q": q.text, "a": answer_text}
+            if media_file_id:
+                answer["media_file_id"] = media_file_id
+                answer["media_type"] = media_type
             async with Session() as s:
                 r2 = await s.get(SurveyResponse, resp.id)
                 answers = json.loads(r2.answers_json or "[]")
-                answers.append({"q": q.text, "a": answer_text})
+                answers.append(answer)
                 r2.answers_json = json.dumps(answers, ensure_ascii=False)
                 r2.current_index += 1
                 await s.commit()
