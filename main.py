@@ -23,6 +23,7 @@ async def main():
     dp.include_router(master_router)
 
     await manager.start_all()           # поднять все дочерние боты
+    manager.start_conflict_watchdog()   # раз в 30 мин отключать ботов, застрявших в конфликте
     webhook_runner = await run_webhook_server(AD_WEBHOOK_PORT)
     scheduler_task = asyncio.create_task(run_scheduler())
     logging.info("Dialogue Engine started")
