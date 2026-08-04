@@ -24,9 +24,12 @@ from child.common import RESERVED_COMMANDS
 from master import legal
 import config
 import json
+import base64
+import logging
 from config import SUPER_ADMIN_ID, MASTER_BOT_TOKEN, AD_MAX_LEN, AD_BROADCAST_COOLDOWN_DAYS
 
 router = Router()
+log = logging.getLogger("master.router")
 
 
 async def _has_accepted_terms(user_id: int) -> bool:
@@ -98,10 +101,32 @@ async def _master_guard_message(handler, event: Message, data: dict):
             return
         # Капча — ПОКАЗЫВАЕТСЯ ВСЕМ, включая владельца/SUPER_ADMIN_ID, без
         # исключений (раньше в master-роутере капчи не было вообще).
-        notice = await mod.check_platform_captcha(uid, event.text)
-        if notice is not None:
-            await event.answer(notice)
-            return
+        #
+        # БАГ (по репорту: "сделал новый вопрос в анкете — следующий вопрос
+        # нельзя сделать, пока не /start"): счётчик капчи растёт на КАЖДОЕ
+        # текстовое сообщение, включая ввод текста внутри многошаговых FSM-
+        # сценариев (текст вопроса анкеты, текст кнопки и т.п.). Когда
+        # срабатывал показ капчи, ожидаемый ввод сценария молча "съедался"
+        # этим guard'ом (return до вызова handler), FSM-состояние
+        # оставалось прежним, а следующее сообщение пользователя (он не
+        # понимал, что от него ждут решения примера) уходило уже как
+        # "неверный ответ на капчу" — переписка зацикливалась, и реально
+        # помогал только /start (сбрасывающий его в состояние без proверки,
+        # либо совпадающий по времени с истечением капчи через
+        # CAPTCHA_TIMEOUT_MINUTES). Исправление: пока у пользователя активно
+        # состояние FSM (он на middle of a конкретного шага конструктора —
+        # печатает текст вопроса, кнопки и т.п.), капчу не показываем и не
+        # тратим на это тик счётчика — это одно связное действие
+        # администратора, а не свободный флуд.
+        state: FSMContext | None = data.get("state")
+        in_fsm_flow = False
+        if state is not None:
+            in_fsm_flow = (await state.get_state()) is not None
+        if not in_fsm_flow:
+            notice = await mod.check_platform_captcha(uid, event.text)
+            if notice is not None:
+                await event.answer(notice)
+                return
     return await handler(event, data)
 
 
@@ -232,6 +257,29 @@ def capture_media(m: Message):
     if m.sticker:
         return m.sticker.file_id, "sticker"
     return None, None
+
+
+async def _download_media_b64(bot: Bot, file_id: str) -> tuple[str | None, str | None]:
+    """Скачивает файл по file_id (полученному ЭТИМ ботом) и возвращает
+    (base64-байты, имя файла) для последующей ПЕРЕЗАЛИВКИ в другого бота.
+
+    БАГ (критичный, объясняет "0 доставлено"/массу ошибок при рассылке):
+    медиа для рассылки захватывается в чате с МАСТЕР-ботом, а рассылать его
+    нужно ДОЧЕРНИМИ ботами — file_id одного бота недействителен для
+    другого ("wrong file identifier"). Раньше file_id передавался в
+    run_broadcast как есть, и КАЖДАЯ отправка с медиа падала. Теперь байты
+    скачиваются один раз через master-бота и передаются дальше, чтобы
+    дочерний бот мог сам загрузить их и получить СВОЙ валидный file_id."""
+    try:
+        tg_file = await bot.get_file(file_id)
+        buf = await bot.download_file(tg_file.file_path)
+        data = buf.read()
+        filename = (tg_file.file_path.rsplit("/", 1)[-1]
+                   if tg_file.file_path else "file")
+        return base64.b64encode(data).decode(), filename
+    except Exception:
+        log.exception("Не удалось скачать медиа file_id=%s для рассылки", file_id)
+        return None, None
 
 
 async def _access(bot_id: int, user_id: int) -> tuple[ChildBot | None, bool]:
@@ -1611,9 +1659,19 @@ async def bc_content(m: Message, state: FSMContext):
         pass
 
     file_id, media_type = capture_media(m)
+    media_b64 = media_filename = None
+    if file_id:
+        media_b64, media_filename = await _download_media_b64(m.bot, file_id)
+        if media_b64 is None:
+            # Скачать не удалось — отправляем без медиа, чтобы не потерять
+            # рассылку целиком, но предупреждаем администратора.
+            media_type = None
+            await m.answer(f"{em('warn')} Не удалось скачать медиа для рассылки, "
+                           "разошлю только текст (если он есть).")
 
     await state.update_data(html_text=m.html_text if (m.text or m.caption) else None,
-                            file_id=file_id, media_type=media_type)
+                            media_b64=media_b64, media_filename=media_filename,
+                            media_type=media_type)
     await state.set_state(St.bc_target)
 
     text = "Кому разослать?"
@@ -1652,11 +1710,14 @@ async def bc_go(c: CallbackQuery, state: FSMContext):
         except Exception:
             pass
 
-    result = await run_broadcast(cb.token, cb.id, target=target,
-                                 html_text=data["html_text"],
-                                 media_file_id=data["file_id"],
-                                 media_type=data["media_type"],
-                                 progress_cb=progress)
+    media_b64 = data.get("media_b64")
+    result = await run_broadcast(
+        cb.token, cb.id, target=target,
+        html_text=data["html_text"],
+        media_bytes=base64.b64decode(media_b64) if media_b64 else None,
+        media_filename=data.get("media_filename"),
+        media_type=data["media_type"],
+        progress_cb=progress)
     await msg.edit_text(
         f"{em('check')} <b>Рассылка завершена</b>\n\n"
         f"Всего: {result['total']}\n✅ Доставлено: {result['sent']}\n"
@@ -1966,6 +2027,19 @@ async def ap_bc_content(m: Message, state: FSMContext):
     file_id, media_type = capture_media(m)
     await state.clear()
 
+    media_bytes = media_filename = None
+    if file_id:
+        # Скачиваем ОДИН раз через master-бота — раньше сюда передавался
+        # "чужой" file_id мастер-бота напрямую в каждый из дочерних ботов,
+        # из-за чего ЛЮБАЯ отправка с медиа падала (см. _download_media_b64).
+        media_b64, media_filename = await _download_media_b64(m.bot, file_id)
+        if media_b64 is None:
+            media_type = None
+            await m.answer(f"{em('warn')} Не удалось скачать медиа для рассылки, "
+                           "разошлю только текст (если он есть).")
+        else:
+            media_bytes = base64.b64decode(media_b64)
+
     async with Session() as s:
         bots = (await s.scalars(select(ChildBot).where(ChildBot.is_active))).all()
     msg = await m.answer(f"{em('hourglass')} Рассылка запущена по {len(bots)} ботам...")
@@ -1974,11 +2048,14 @@ async def ap_bc_content(m: Message, state: FSMContext):
     for cb in bots:
         try:
             res = await run_broadcast(cb.token, cb.id, target="all",
-                                      html_text=html_text, media_file_id=file_id,
+                                      html_text=html_text, media_bytes=media_bytes,
+                                      media_filename=media_filename,
                                       media_type=media_type)
             total += res["total"]; sent += res["sent"]; failed += res["failed"]
         except Exception:
             failed += 1
+            log.exception("Рассылка по всем ботам: сбой на боте %s (@%s)",
+                          cb.id, cb.username)
     await msg.edit_text(f"{em('check')} <b>Готово</b>\nБотов: {len(bots)}\n"
                         f"Получателей всего: {total}\n✅ Доставлено: {sent}\n❌ Ошибки: {failed}")
 
