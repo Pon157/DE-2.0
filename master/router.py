@@ -4,7 +4,7 @@ from aiogram.filters import CommandStart, Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (Message, CallbackQuery, InlineKeyboardMarkup,
-                           InlineKeyboardButton, BufferedInputFile)
+                           InlineKeyboardButton, BufferedInputFile)g
 from aiogram.utils.token import validate_token
 from sqlalchemy import select, func
 from db.base import Session
@@ -2180,7 +2180,7 @@ async def ap_pro_days_save(m: Message, state: FSMContext):
             try:
                 await notifier.send_message(
                     user_id,
-                    f"{em('sparkles')} Вам продлена Pro-подписка на {days} дн. "
+                    f"Вам продлена Pro-подписка на {days} дн. "
                     f"({status}).")
             finally:
                 await notifier.session.close()
