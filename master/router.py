@@ -4,7 +4,7 @@ from aiogram.filters import CommandStart, Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (Message, CallbackQuery, InlineKeyboardMarkup,
-                           InlineKeyboardButton, BufferedInputFile)g
+                           InlineKeyboardButton, BufferedInputFile)
 from aiogram.utils.token import validate_token
 from sqlalchemy import select, func
 from db.base import Session
@@ -1904,7 +1904,7 @@ async def ap_menu(c: CallbackQuery):
             [("🤖 Все боты", "ap_bots:0")],
             [("📊 Общая статистика", "ap_stats")],
             [("📢 Разослать во все боты", "ap_bc")],
-            [("🌟 Выдать/продлить Pro", "ap_pro")],
+            [("🌟 Активные Pro / выдать", "ap_pro_list:0")],
             [("🚫 Бан в конструкторе", "ap_ban:0")],
             [("⬅️ Назад", "main")],
         ]))
@@ -2178,14 +2178,71 @@ async def ap_pro_days_save(m: Message, state: FSMContext):
         try:
             notifier = Bot(MASTER_BOT_TOKEN)
             try:
+                # БАГ: тут не был указан parse_mode="HTML" — em('sparkles')
+                # отдаёт сырой <tg-emoji ...> тег, и без parse_mode он
+                # уходил пользователю ЛИТЕРАЛЬНО как текст тега, а не как
+                # эмодзи. Остальные HTML-теги (<b>, <code> и т.п.) по той же
+                # причине никогда бы не рендерились.
                 await notifier.send_message(
                     user_id,
-                    f"Вам продлена Pro-подписка на {days} дн. "
-                    f"({status}).")
+                    f"{em('sparkles')} Вам продлена Pro-подписка на {days} дн. "
+                    f"({status}).", parse_mode="HTML")
             finally:
                 await notifier.session.close()
         except Exception:
             pass
+
+
+@router.callback_query(F.data.startswith("ap_pro_list:"))
+async def ap_pro_list(c: CallbackQuery):
+    """По запросу: просмотр всех сейчас активных Pro-подписок в админ-панели."""
+    if not _is_super(c.from_user.id):
+        await c.answer("Нет доступа", show_alert=True); return
+    page = int(c.data.split(":")[1])
+    per_page = 10
+    now = datetime.utcnow()
+    async with Session() as s:
+        users = (await s.scalars(
+            select(PlatformUser)
+            .where(PlatformUser.pro_until.is_not(None), PlatformUser.pro_until > now)
+            .order_by(PlatformUser.pro_until.desc()))).all()
+    chunk = users[page * per_page:(page + 1) * per_page]
+    rows = [[(f"👤 {u.id} — до {u.pro_until.strftime('%d.%m.%Y %H:%M')}",
+             f"ap_pro_edit:{u.id}")] for u in chunk]
+    nav = []
+    if page > 0:
+        nav.append((f"⬅️ Стр. {page}", f"ap_pro_list:{page-1}"))
+    if (page + 1) * per_page < len(users):
+        nav.append((f"Стр. {page+2} ➡️", f"ap_pro_list:{page+1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([("➕ Выдать/продлить Pro", "ap_pro")])
+    rows.append([("⬅️ Назад", "ap")])
+    text = (f"{em('sparkles')} <b>Активные Pro-подписки</b>\n\n"
+           f"Сейчас активна у {len(users)} пользователей."
+           if users else f"{em('sparkles')} Сейчас ни у кого нет активной Pro-подписки.")
+    await c.message.edit_text(text, reply_markup=kb(rows))
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("ap_pro_edit:"))
+async def ap_pro_edit(c: CallbackQuery, state: FSMContext):
+    """Быстрый переход к продлению/сокращению Pro прямо из списка активных —
+    без повторного ввода ID."""
+    if not _is_super(c.from_user.id):
+        await c.answer("Нет доступа", show_alert=True); return
+    user_id = int(c.data.split(":")[1])
+    pu = await referrals.get_or_create(user_id)
+    status = (f"Pro активен до {pu.pro_until.strftime('%d.%m.%Y %H:%M')}"
+             if pu.pro_until and pu.pro_until > datetime.utcnow()
+             else "Pro сейчас не активен")
+    await state.update_data(pro_user_id=user_id, last_msg_id=c.message.message_id)
+    await state.set_state(St.ap_pro_days)
+    await c.message.edit_text(
+        f"Пользователь <code>{user_id}</code>: {status}\n\n"
+        "На сколько дней продлить Pro? Пришлите целое число (отрицательное — "
+        "чтобы сократить/отключить).")
+    await c.answer()
 
 
 # ================== модерация рекламы (/ads в мастер-боте) ==================
