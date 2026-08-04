@@ -996,7 +996,24 @@ def build_common_router() -> Router:
             await c.answer("Вы забанены в этом боте.", show_alert=True)
             return
         cfg = await get_cfg(bot_db_id)
-        await open_ticket(bot, cfg, c.from_user.id, force_new=True)
+        # БАГ (по репорту): раньше здесь всегда стоял force_new=True — эта
+        # кнопка (в отличие от inline_ticket/keyboard_ticket, см.
+        # open_ticket() выше) НЕ проверяла конфликт и, если у владельца бота
+        # включена настройка always_new_ticket, при каждом нажатии молча
+        # ЗАКРЫВАЛА текущее открытое обращение и открывала новый топик —
+        # получалось, что можно было "наплодить" параллельные обращения
+        # нажатиями кнопки, хотя правило "1 пользователь = 1 обращение"
+        # должно быть строгим. Теперь эта кнопка ведёт себя так же, как
+        # остальные кнопки открытия обращения — если что-то уже открыто,
+        # сообщаем об этом вместо тихого создания нового.
+        ticket, created, conflict = await open_ticket(bot, cfg, c.from_user.id)
+        if conflict:
+            close_hint = cfg.close_ticket_button_text or "❌ Закрыть обращение"
+            await c.answer(
+                f"У вас уже есть открытое обращение. Закройте его командой "
+                f"/close или кнопкой «{close_hint}», чтобы открыть новое.",
+                show_alert=True)
+            return
         await c.answer("Обращение открыто! Напишите сообщение.", show_alert=True)
 
     @r.callback_query(F.data.startswith("open_ticket_subj:"))
