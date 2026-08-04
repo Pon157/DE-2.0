@@ -45,7 +45,7 @@ PAYMENT_CALLBACK_DOMAIN = os.environ.get("PAYMENT_CALLBACK_DOMAIN", "https://dia
 AD_WEBHOOK_PORT = int(os.environ.get("AD_WEBHOOK_PORT", 8085))
 
 # ---- реклама ----
-AD_MAX_LEN = 100
+AD_MAX_LEN = 150
 AD_BROADCAST_COOLDOWN_DAYS = 5
 # тарифы за показы: (показов, цена_руб). Дальше цена за 100 показов дешевле
 # при большем объёме (простая линейная скидка, см. services/ads.py).
