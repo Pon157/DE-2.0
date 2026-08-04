@@ -17,6 +17,18 @@ HEARTBEAT_EVERY = 5
 
 TOKEN_WATCHDOG_EVERY = 45  # секунд между проверками валидности токена
 
+# ---- отслеживание "залипших" TelegramConflictError (по запросу) ----
+# Один TelegramConflictError сам по себе — норма (например, короткое
+# перекрытие при рестарте деплоя) и обрабатывается ретраем с backoff внутри
+# _run(). Проблема — когда бот УСТОЙЧИВО не может подняться (например,
+# токен используется где-то ещё — второй инстанс/забытый локальный запуск
+# у владельца бота) и вечно ретраит getUpdates, тратя ресурсы и никогда не
+# доставляя сообщения. Раз в CONFLICT_CHECK_EVERY проверяем все боты,
+# которые непрерывно (без единого успешного старта) находятся в конфликте
+# дольше CONFLICT_DISABLE_AFTER, и отключаем их.
+CONFLICT_CHECK_EVERY = 30 * 60      # 30 минут
+CONFLICT_DISABLE_AFTER = timedelta(minutes=30)
+
 
 class BotManager:
     def __init__(self):
@@ -25,6 +37,10 @@ class BotManager:
         self.dispatchers: dict[int, Dispatcher] = {}  # bot_id -> Dispatcher object
         self._locks: dict[int, asyncio.Lock] = {}
         self._instance_id = str(uuid.uuid4())
+        # bot_id -> момент, с которого бот НЕПРЕРЫВНО в состоянии конфликта
+        # (сбрасывается при любом успешном старте поллинга или остановке).
+        self._conflict_since: dict[int, datetime] = {}
+        self._conflict_watchdog_task: asyncio.Task | None = None
 
     def _lock(self, bot_id: int) -> asyncio.Lock:
         lock = self._locks.get(bot_id)
@@ -228,12 +244,18 @@ class BotManager:
                         await dp.start_polling(
                             bot, handle_signals=False,
                             allowed_updates=dp.resolve_used_update_types())
-                        
+
                         log.info("[DEBUG_BOT] Воркер @%s: Сессия dp.start_polling() завершилась штатно.", cb.username)
+                        self._conflict_since.pop(cb.id, None)
                         return  # штатная остановка (stop_polling / отмена)
                     except TelegramConflictError:
                         log.warning("[DEBUG_BOT] Воркер @%s: Конфликт токенов (TelegramConflictError). Засыпаю на %ss перед ретраем.",
                                     cb.username, backoff)
+                        # Помечаем начало непрерывной серии конфликтов (если
+                        # ещё не помечено) — см. _conflict_watchdog_loop,
+                        # который раз в 30 минут отключит бота, если тот так
+                        # и не поднимется до этого момента.
+                        self._conflict_since.setdefault(cb.id, datetime.utcnow())
                         await asyncio.sleep(backoff)
                         backoff = min(backoff * 2, 60)
                     except TelegramUnauthorizedError:
@@ -267,6 +289,7 @@ class BotManager:
                 except asyncio.CancelledError:
                     pass
                 await self._release_runtime_lock(cb.id)
+                self._conflict_since.pop(cb.id, None)
                 try:
                     await bot.session.close()
                     log.info("[DEBUG_BOT] Воркер @%s: Сессия aiohttp закрыта успешно.", cb.username)
@@ -318,8 +341,80 @@ class BotManager:
                 await self._start_bot_locked(cb)
 
     async def stop_all(self):
+        if self._conflict_watchdog_task:
+            self._conflict_watchdog_task.cancel()
+            try:
+                await self._conflict_watchdog_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._conflict_watchdog_task = None
         ids = list(self.tasks.keys())
         await asyncio.gather(*(self.stop_bot(i) for i in ids), return_exceptions=True)
+
+    def start_conflict_watchdog(self):
+        """Запускает фоновый цикл, который раз в CONFLICT_CHECK_EVERY (30
+        минут по запросу) отключает ботов, непрерывно застрявших в
+        TelegramConflictError (см. _conflict_since)."""
+        if self._conflict_watchdog_task is None or self._conflict_watchdog_task.done():
+            self._conflict_watchdog_task = asyncio.create_task(
+                self._conflict_watchdog_loop(), name="conflict-watchdog")
+
+    async def _conflict_watchdog_loop(self):
+        try:
+            while True:
+                await asyncio.sleep(CONFLICT_CHECK_EVERY)
+                await self._check_stuck_conflicts()
+        except asyncio.CancelledError:
+            pass
+
+    async def _check_stuck_conflicts(self):
+        now = datetime.utcnow()
+        stuck = [bot_id for bot_id, since in list(self._conflict_since.items())
+                if now - since >= CONFLICT_DISABLE_AFTER]
+        for bot_id in stuck:
+            await self._deactivate_conflicting_bot(bot_id)
+
+    async def _deactivate_conflicting_bot(self, bot_id: int):
+        """Отключает бота, который непрерывно (без единого успешного
+        старта) находится в TelegramConflictError дольше
+        CONFLICT_DISABLE_AFTER — обычно значит, что токен уже используется
+        где-то ещё (второй запущенный инстанс/локальный запуск у
+        владельца), и бесконечный ретрай только жжёт ресурсы, ничего не
+        доставляя пользователям."""
+        async with Session() as s:
+            cb = await s.get(ChildBot, bot_id)
+            if not cb:
+                self._conflict_since.pop(bot_id, None)
+                return
+            username = cb.username
+            owner_id = cb.owner_id
+            still_active = cb.is_active
+            if still_active:
+                cb.is_active = False
+                await s.commit()
+        self._conflict_since.pop(bot_id, None)
+        await self.stop_bot(bot_id)
+        if not still_active:
+            return
+        log.error("Bot %s (@%s): непрерывный TelegramConflictError дольше %s — "
+                  "отключаю (is_active=False), скорее всего токен используется "
+                  "где-то ещё.", bot_id, username, CONFLICT_DISABLE_AFTER)
+        if owner_id:
+            try:
+                from config import MASTER_BOT_TOKEN
+                notifier = Bot(MASTER_BOT_TOKEN)
+                try:
+                    await notifier.send_message(
+                        owner_id,
+                        f"⚠️ Бот @{username} остановлен: обнаружен постоянный конфликт "
+                        "получения обновлений (TelegramConflictError) — похоже, этот "
+                        "же токен сейчас используется где-то ещё (другой запущенный "
+                        "экземпляр бота). Остановите второй экземпляр и включите бота "
+                        "заново.")
+                finally:
+                    await notifier.session.close()
+            except Exception:
+                pass
 
 
 manager = BotManager()
