@@ -26,6 +26,8 @@ import config
 import json
 import base64
 import logging
+import re
+from datetime import datetime
 from config import SUPER_ADMIN_ID, MASTER_BOT_TOKEN, AD_MAX_LEN, AD_BROADCAST_COOLDOWN_DAYS
 
 router = Router()
@@ -203,6 +205,8 @@ class St(StatesGroup):
     survey_q_text = State()
     survey_q_options = State()
     btn_pick_survey = State()
+    ap_pro_user = State()
+    ap_pro_days = State()
 
 
 HEADER_MODE_LABELS = {
@@ -280,6 +284,19 @@ async def _download_media_b64(bot: Bot, file_id: str) -> tuple[str | None, str |
     except Exception:
         log.exception("Не удалось скачать медиа file_id=%s для рассылки", file_id)
         return None, None
+
+
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _plain_preview(html_text: str, limit: int) -> str:
+    """Укороченный текст БЕЗ html-тегов — для превью в списках (например,
+    'Мои кампании'). По запросу текст объявлений теперь поддерживает
+    форматирование (жирный/курсив/ссылки), поэтому наивная обрезка по
+    символам могла бы разрезать тег пополам и сломать рендер сообщения —
+    для превью просто убираем разметку целиком."""
+    plain = _HTML_TAG_RE.sub("", html_text or "")
+    return plain[:limit] + ("…" if len(plain) > limit else "")
 
 
 async def _access(bot_id: int, user_id: int) -> tuple[ChildBot | None, bool]:
@@ -1887,6 +1904,7 @@ async def ap_menu(c: CallbackQuery):
             [("🤖 Все боты", "ap_bots:0")],
             [("📊 Общая статистика", "ap_stats")],
             [("📢 Разослать во все боты", "ap_bc")],
+            [("🌟 Выдать/продлить Pro", "ap_pro")],
             [("🚫 Бан в конструкторе", "ap_ban:0")],
             [("⬅️ Назад", "main")],
         ]))
@@ -2011,12 +2029,34 @@ async def ap_stats(c: CallbackQuery):
 async def ap_bc_start(c: CallbackQuery, state: FSMContext):
     if not _is_super(c.from_user.id):
         await c.answer("Нет доступа", show_alert=True); return
-    await state.set_state(St.ap_bc_content)
+    # БАГ (по запросу): рассылка из админ-панели раньше уходила АБСОЛЮТНО во
+    # все активные боты, включая боты владельцев с Pro-подпиской — хотя Pro
+    # как раз и продаётся как "без рекламы/рассылок в моих ботах" (см.
+    # services/ads.py::bot_is_pro_protected — платная реклама это правило
+    # уже соблюдает). Теперь при каждом запуске рассылки явно спрашиваем.
     await state.update_data(last_msg_id=c.message.message_id)
     await c.message.edit_text(
-        f"{em('megaphone')} Пришлите сообщение, которое будет разослано ВСЕМ "
-        "пользователям ВСЕХ активных ботов платформы (текст/медиа/форматирование "
-        "сохранятся):")
+        f"{em('megaphone')} Включать в рассылку боты, чьи владельцы — "
+        "Pro-подписчики? (обычно у Pro реклама/рассылки в ботах отключены)",
+        reply_markup=kb([
+            [("✅ Включая Pro-ботов", "ap_bc_pro:1")],
+            [("🚫 Без Pro-ботов", "ap_bc_pro:0")],
+            [("❌ Отмена", "ap")],
+        ]))
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("ap_bc_pro:"))
+async def ap_bc_pro_choice(c: CallbackQuery, state: FSMContext):
+    if not _is_super(c.from_user.id):
+        await c.answer("Нет доступа", show_alert=True); return
+    include_pro = c.data.split(":")[1] == "1"
+    await state.set_state(St.ap_bc_content)
+    await state.update_data(include_pro=include_pro, last_msg_id=c.message.message_id)
+    await c.message.edit_text(
+        f"{em('megaphone')} Пришлите сообщение, которое будет разослано "
+        f"пользователям {'ВСЕХ' if include_pro else 'ВСЕХ (кроме Pro-ботов)'} "
+        "активных ботов платформы (текст/медиа/форматирование сохранятся):")
     await c.answer()
 
 
@@ -2024,6 +2064,8 @@ async def ap_bc_start(c: CallbackQuery, state: FSMContext):
 async def ap_bc_content(m: Message, state: FSMContext):
     if not _is_super(m.from_user.id):
         return
+    data = await state.get_data()
+    include_pro = data.get("include_pro", False)
     file_id, media_type = capture_media(m)
     await state.clear()
 
@@ -2041,8 +2083,19 @@ async def ap_bc_content(m: Message, state: FSMContext):
             media_bytes = base64.b64decode(media_b64)
 
     async with Session() as s:
-        bots = (await s.scalars(select(ChildBot).where(ChildBot.is_active))).all()
-    msg = await m.answer(f"{em('hourglass')} Рассылка запущена по {len(bots)} ботам...")
+        all_bots = (await s.scalars(select(ChildBot).where(ChildBot.is_active))).all()
+    bots = []
+    skipped_pro = 0
+    if include_pro:
+        bots = all_bots
+    else:
+        for cb in all_bots:
+            if await referrals.is_pro(cb.owner_id):
+                skipped_pro += 1
+            else:
+                bots.append(cb)
+    msg = await m.answer(f"{em('hourglass')} Рассылка запущена по {len(bots)} ботам"
+                         f"{f' (пропущено Pro: {skipped_pro})' if skipped_pro else ''}...")
     html_text = m.html_text if (m.text or m.caption) else None
     total = sent = failed = 0
     for cb in bots:
@@ -2056,8 +2109,83 @@ async def ap_bc_content(m: Message, state: FSMContext):
             failed += 1
             log.exception("Рассылка по всем ботам: сбой на боте %s (@%s)",
                           cb.id, cb.username)
-    await msg.edit_text(f"{em('check')} <b>Готово</b>\nБотов: {len(bots)}\n"
-                        f"Получателей всего: {total}\n✅ Доставлено: {sent}\n❌ Ошибки: {failed}")
+    await msg.edit_text(
+        f"{em('check')} <b>Готово</b>\nБотов: {len(bots)}"
+        f"{f' (пропущено Pro-ботов: {skipped_pro})' if skipped_pro else ''}\n"
+        f"Получателей всего: {total}\n✅ Доставлено: {sent}\n❌ Ошибки: {failed}")
+
+
+@router.callback_query(F.data == "ap_pro")
+async def ap_pro_start(c: CallbackQuery, state: FSMContext):
+    """По запросу: возможность выдать/продлить Pro-подписку пользователю
+    прямо из админ-панели (без покупки/рефералки) — например, в качестве
+    бонуса или компенсации."""
+    if not _is_super(c.from_user.id):
+        await c.answer("Нет доступа", show_alert=True); return
+    await state.set_state(St.ap_pro_user)
+    await state.update_data(last_msg_id=c.message.message_id)
+    await c.message.edit_text(
+        f"{em('sparkles')} Введите Telegram ID пользователя, которому нужно "
+        "выдать/продлить Pro:",
+        reply_markup=kb([[("❌ Отмена", "ap")]]))
+    await c.answer()
+
+
+@router.message(St.ap_pro_user)
+async def ap_pro_user_save(m: Message, state: FSMContext):
+    if not _is_super(m.from_user.id):
+        return
+    if not m.text or not m.text.strip().lstrip("-").isdigit():
+        await m.answer(f"{em('warn')} Нужен числовой Telegram ID. Попробуйте ещё раз:")
+        return
+    user_id = int(m.text.strip())
+    pu = await referrals.get_or_create(user_id)
+    status = (f"Pro активен до {pu.pro_until.strftime('%d.%m.%Y %H:%M')}"
+             if pu.pro_until and pu.pro_until > datetime.utcnow()
+             else "Pro сейчас не активен")
+    await state.update_data(pro_user_id=user_id)
+    await state.set_state(St.ap_pro_days)
+    await m.answer(f"Пользователь <code>{user_id}</code>: {status}\n\n"
+                   "На сколько дней продлить Pro? Пришлите целое число "
+                   "(отрицательное — чтобы, наоборот, сократить/отключить).")
+
+
+@router.message(St.ap_pro_days)
+async def ap_pro_days_save(m: Message, state: FSMContext):
+    if not _is_super(m.from_user.id):
+        return
+    if not m.text or not m.text.strip().lstrip("-").isdigit():
+        await m.answer(f"{em('warn')} Нужно целое число дней. Попробуйте ещё раз:")
+        return
+    days = int(m.text.strip())
+    data = await state.get_data()
+    user_id = data.get("pro_user_id")
+    await state.clear()
+    if not user_id:
+        await m.answer(f"{em('warn')} Сессия истекла, начните заново: /start → "
+                       "Админ-панель → Выдать/продлить Pro.")
+        return
+    await referrals.grant_pro_days(user_id, days)
+    pu = await referrals.get_or_create(user_id)
+    status = (f"Pro активен до {pu.pro_until.strftime('%d.%m.%Y %H:%M')}"
+             if pu.pro_until and pu.pro_until > datetime.utcnow()
+             else "Pro не активен")
+    await m.answer(f"{em('check')} Готово. Пользователь <code>{user_id}</code>: {status}",
+                   reply_markup=kb([[("⬅️ В админ-панель", "ap")]]))
+    # уведомляем самого пользователя, если это возможно (не роняем, если он
+    # заблокировал master-бота или ещё ни разу не запускал его)
+    if days > 0:
+        try:
+            notifier = Bot(MASTER_BOT_TOKEN)
+            try:
+                await notifier.send_message(
+                    user_id,
+                    f"{em('sparkles')} Вам продлена Pro-подписка на {days} дн. "
+                    f"({status}).")
+            finally:
+                await notifier.session.close()
+        except Exception:
+            pass
 
 
 # ================== модерация рекламы (/ads в мастер-боте) ==================
@@ -2192,7 +2320,8 @@ async def ads_kind_allbots(c: CallbackQuery, state: FSMContext):
     await state.set_state(St.ads_text)
     await c.message.edit_text(
         f"{em('pencil')} Пришлите ТЕКСТ объявления (до {AD_MAX_LEN} символов). "
-        "Реклама только текстовая, без фото/видео.")
+        "Реклама только текстовая, без фото/видео — но форматирование "
+        "(жирный, курсив, подчёркнутый, ссылки) поддерживается.")
     await c.answer()
 
 
@@ -2232,7 +2361,8 @@ async def ads_pick_bot(c: CallbackQuery, state: FSMContext):
     await state.set_state(St.ads_text)
     await c.message.edit_text(
         f"{em('pencil')} Пришлите ТЕКСТ объявления (до {AD_MAX_LEN} символов). "
-        "Реклама только текстовая, без фото/видео.")
+        "Реклама только текстовая, без фото/видео — но форматирование "
+        "(жирный, курсив, подчёркнутый, ссылки) поддерживается.")
     await c.answer()
 
 
@@ -2246,7 +2376,8 @@ async def ads_kind_bcast(c: CallbackQuery, state: FSMContext):
     await state.set_state(St.ads_text)
     await c.message.edit_text(
         f"{em('pencil')} Пришлите ТЕКСТ объявления (до {AD_MAX_LEN} символов). "
-        "Реклама только текстовая, без фото/видео.")
+        "Реклама только текстовая, без фото/видео — но форматирование "
+        "(жирный, курсив, подчёркнутый, ссылки) поддерживается.")
     await c.answer()
 
 
@@ -2255,14 +2386,21 @@ async def ads_text(m: Message, state: FSMContext):
     # БАГ (по запросу "убери медиа у рекламных постов"): раньше сюда же
     # принималось фото/видео/гифка — реклама теперь принципиально ТОЛЬКО
     # текстовая, любое вложение просто игнорируется (берём m.text/caption).
-    text = (m.text or m.caption or "").strip()
-    if not text:
+    #
+    # По запросу: теперь сохраняем текст С ФОРМАТИРОВАНИЕМ (m.html_text —
+    # жирный/курсив/подчёркивание/ссылки и т.п., как в самом сообщении),
+    # а не голый m.text/caption как раньше. Лимит символов считаем по
+    # ВИДИМОМУ тексту (без html-тегов) — иначе разметка несправедливо
+    # съедала бы часть лимита.
+    plain = (m.text or m.caption or "").strip()
+    if not plain:
         await m.answer(f"{em('warn')} Нужен текст объявления (только текст, без вложений).")
         return
-    if len(text) > AD_MAX_LEN:
-        await m.answer(f"{em('warn')} Слишком длинно ({len(text)}/{AD_MAX_LEN}). "
+    if len(plain) > AD_MAX_LEN:
+        await m.answer(f"{em('warn')} Слишком длинно ({len(plain)}/{AD_MAX_LEN}). "
                        "Сократите текст и пришлите ещё раз.")
         return
+    text = (m.html_text or plain).strip()
     await state.update_data(text=text)
     data = await state.get_data()
     if data["kind"] == "broadcast":
@@ -2400,7 +2538,7 @@ async def ads_cabinet(c: CallbackQuery):
                 else ("📢 рассылка" if ad.kind == AdKind.broadcast else "🎯 конкретный бот")
             progress = f" ({ad.shown_count}/{ad.target_impressions})" if ad.kind == AdKind.impressions else ""
             lines.append(f"№{ad.id} · {kind}{progress} · {_AD_STATUS_LABEL.get(ad.status.value, ad.status.value)}\n"
-                        f"«{ad.text[:60]}{'…' if len(ad.text) > 60 else ''}» · {ad.price_rub} ₽")
+                        f"«{_plain_preview(ad.text, 60)}» · {ad.price_rub} ₽")
             row = []
             if ad.kind == AdKind.impressions and ad.status == AdStatus.finished:
                 row.append((f"🔁 Продлить №{ad.id}", f"adext:{ad.id}"))
