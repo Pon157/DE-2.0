@@ -1,3 +1,4 @@
+
 import asyncio
 import hashlib
 import logging
@@ -23,7 +24,6 @@ from services import moderation as mod
 from services import ads as ads_service
 from services import referrals
 from utils.emoji import em, styled_button
-import utils.raw_api as raw_api
 from config import PLATFORM_BOT_USERNAME
 
 log = logging.getLogger("child.common")
@@ -232,7 +232,7 @@ def build_header(cfg: ChildBot, user, subject: str | None = None) -> str:
         header = (f"{user.full_name} | @{user.username or '—'} | <code>{user.id}</code> "
                  f"· {anon_id_for(cfg.id, user.id)}")
     if subject:
-        header = f"{em('bookmark')} {subject}\n{header}"
+        header = f"🏷 {subject}\n{header}"
     return header
 
 
@@ -247,13 +247,13 @@ def build_topic_name(cfg: ChildBot, user_id: int,
     Telegram всегда чистый текст. subject (тема обращения, см. п.3) —
     добавляется префиксом к имени топика, чтобы различать несколько
     параллельно открытых топиков одного пользователя по разным темам."""
-    tpl = cfg.topic_name_template or f"{em('envelope')} {name} · {id}"
+    tpl = cfg.topic_name_template or "✉️ {name} · {id}"
     try:
         name = tpl.format(**_tpl_vars(cfg.id, user_id, full_name, username))
     except Exception:
-        name = f"{em('envelope')} {full_name or user_id} · {user_id}"
+        name = f"✉️ {full_name or user_id} · {user_id}"
     name = _TAG_RE.sub("", name).strip()
-    name = name or f"{em('envelope')} {user_id}"
+    name = name or f"✉️ {user_id}"
     if subject:
         name = f"{subject} · {name}"
     return name[:120]
@@ -280,7 +280,7 @@ async def inject_footer(bot_db_id: int, text: str) -> str:
         return text
     if await referrals.is_pro(cfg.owner_id):
         return text
-    return text + f"\n\n<i>{em('gear')} создано на платформе @{PLATFORM_BOT_USERNAME}</i>"
+    return text + f"\n\n<i>🤖 создано на платформе @{PLATFORM_BOT_USERNAME}</i>"
 
 
 async def inject_extras(bot_db_id: int, text: str) -> str:
@@ -301,7 +301,7 @@ async def build_keyboards(bot_db_id: int, cfg: ChildBot, extra_inline: list | No
                           with_close_ticket: bool = False):
     """Возвращает (InlineKeyboardMarkup|None, ReplyKeyboardMarkup|None).
     with_close_ticket=True добавляет в reply-клавиатуру кнопку
-    f"{em('cross')} Закрыть обращение" (см. open_ticket) — вместе с кнопкой доната, если
+    "❌ Закрыть обращение" (см. open_ticket) — вместе с кнопкой доната, если
     она тоже reply-типа, т.к. Telegram позволяет только ОДНУ активную
     reply-клавиатуру в чате: раньше при появлении кнопки закрытия она бы
     молча заменила собой кнопку доната (или наоборот) — здесь строятся
@@ -363,38 +363,14 @@ async def build_keyboards(bot_db_id: int, cfg: ChildBot, extra_inline: list | No
     return ikb, rkb
 
 
-def extract_rich_payload(m: Message) -> tuple[str | None, bool]:
-    """Извлекает текст из сообщения с учётом рич-режима Telegram (Bot API 10.1).
-
-    aiogram 3.28 не типизирует поле rich_message входящего сообщения — оно
-    попадает в model_extra. Достаём его оттуда и возвращаем (текст, is_rich).
-
-    is_rich=True → текст был набран в рич-редакторе Telegram (заголовки,
-    разделители, врезки и т.п.) и должен отправляться через send_rich_message.
-    is_rich=False → обычный текст, m.html_text как всегда.
-
-    Если сообщение пришло с rich_message, но без html-представления (черновик
-    API / неизвестный формат) — падаем на m.html_text, is_rich=False, чтобы
-    не потерять текст совсем.
-    """
-    extra = getattr(m, "model_extra", None) or {}
-    rich_msg = extra.get("rich_message")
-    if rich_msg and isinstance(rich_msg, dict):
-        html = rich_msg.get("html") or rich_msg.get("text")
-        if html:
-            return html, True
-    return (m.html_text or None), False
-
-
 async def welcome_pro_kwargs(cfg: ChildBot) -> dict:
-    """Эффект приветствия и рич-текст — Pro-функции.
-    Если Pro не активен (или уже истёк) — молча отдаём обычное приветствие.
-    rich берётся из welcome_is_rich (флаг ставится автоматически при сохранении,
-    отдельный тумблер убран — Pro-пользователи могут использовать рич-режим
-    просто набрав приветствие в рич-редакторе Telegram)."""
+    """НОВОЕ: эффект приветствия и рич-текст — Pro-функции (гейт по
+    referrals.is_pro(cfg.owner_id), та же логика, что и для иконки топика).
+    Если Pro не активен (или уже истёк) — молча отдаём обычное приветствие,
+    ничего не ломая."""
     if not await referrals.is_pro(cfg.owner_id):
         return {}
-    return {"effect_id": cfg.welcome_effect_id, "rich": cfg.welcome_is_rich}
+    return {"effect_id": cfg.welcome_effect_id, "rich": cfg.rich_welcome}
 
 
 async def send_with_keyboards(m: Message, text: str, ikb, rkb, photo: str | None = None,
@@ -443,14 +419,11 @@ async def send_with_keyboards(m: Message, text: str, ikb, rkb, photo: str | None
     # сообщение — при пустом тексте подставляем нейтральный плейсхолдер.
     safe_text = text if text and text.strip() else f"{em('wave')} Привет!"
     fx = {"message_effect_id": effect_id} if effect_id else {}
-    # Рич-сообщение несовместимо ни с фото, ни с message_effect_id —
-    # если задан эффект, для этого сообщения используем обычную отправку,
-    # чтобы эффект (сердечко/огонь/🎉 и т.п.) реально показался пользователю.
-    if rich and not photo and not effect_id:
+    if rich and not photo:
         try:
             msg = await m.bot.send_rich_message(
                 m.chat.id, InputRichMessage(html=safe_text),
-                reply_markup=ikb or rkb)
+                reply_markup=ikb or rkb, **fx)
             if ikb and rkb:
                 await m.answer(f"{em('gear')} Меню", reply_markup=rkb)
             return msg
@@ -495,16 +468,14 @@ async def send_rich_or_plain(m: Message, text: str, reply_markup=None) -> Messag
 
 
 async def rich_enabled(bot_db_id: int | None, cfg: ChildBot | None = None) -> bool:
-    """Должен ли этот бот отправлять ответы через send_rich_message.
-
-    Условие: текст был реально набран в рич-редакторе Telegram (welcome_is_rich=True)
-    И у владельца активна Pro-подписка. Тумблер убран — флаг ставится
-    автоматически при сохранении текста (см. master/router.py::welcome_save)."""
+    """Включён ли рич-текст для этого бота — Pro-функция (см. cmd_pro /
+    referrals.is_pro), гейтится и в настройках, и здесь в рантайме, на
+    случай если Pro истёк уже после включения тумблера."""
     if cfg is None:
         if bot_db_id is None:
             return False
         cfg = await get_cfg(bot_db_id)
-    if not cfg or not cfg.welcome_is_rich:
+    if not cfg or not cfg.rich_welcome:
         return False
     return await referrals.is_pro(cfg.owner_id)
 
@@ -729,7 +700,7 @@ async def relay_to_admin_chat(msgs: list[Message], bot: Bot, cfg: ChildBot,
     """Пересылает сообщения пользователя в админ-чат.
 
     extra_kb — доп. кнопки (например "Принять/Отклонить" предложки). Кнопка
-    f"{em('lock')} Закрыть обращение" вешается на первое сообщение нового тикета.
+    "🔒 Закрыть обращение" вешается на первое сообщение нового тикета.
     """
     user = msgs[0].from_user
     ticket, created, _conflict = await open_ticket(bot, cfg, user.id)
@@ -762,7 +733,7 @@ async def relay_to_admin_chat(msgs: list[Message], bot: Bot, cfg: ChildBot,
         # невозможно (forwardMessage не поддерживает reply_markup вообще) —
         # там вместо кнопки работает команда /close (реплаем или в топике).
         close_kb = InlineKeyboardMarkup(inline_keyboard=[[
-            styled_button(f"{em('lock')} Закрыть обращение", callback_data=f"close_ticket:{ticket.id}")]])
+            styled_button("🔒 Закрыть обращение", callback_data=f"close_ticket:{ticket.id}")]])
 
     # --- режим "шапка слитно с сообщением" (только copy + одиночное сообщение)
     if header_mode == "merge" and cfg.forward_mode == ForwardMode.copy and not is_album:
@@ -1059,8 +1030,8 @@ def build_common_router() -> Router:
         await m.answer(
             f"{em('star')} Разовый донат или ежемесячная подписка?",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [styled_button(f"{em('star')} Разово", callback_data="donatekind:one")],
-                [styled_button(f"{em('refresh')} Подписка (ежемесячно)", callback_data="donatekind:sub")],
+                [InlineKeyboardButton(text="⭐️ Разово", callback_data="donatekind:one")],
+                [InlineKeyboardButton(text="🔁 Подписка (ежемесячно)", callback_data="donatekind:sub")],
             ]))
 
     @r.callback_query(F.data.startswith("donatekind:"))
@@ -1115,28 +1086,19 @@ def build_common_router() -> Router:
         if not 1 <= stars <= limit:
             await m.answer(f"{em('warn')} Число должно быть от 1 до {limit}.")
             return
+        kwargs = {}
+        if kind == "sub":
+            # subscription_period — фиксированное значение Bot API для Stars-
+            # подписок (30 дней = 2592000 секунд), другого сейчас не задать.
+            kwargs["subscription_period"] = 2592000
         try:
-            if kind == "sub":
-                # subscription_period — фиксированное значение Bot API для Stars-
-                # подписок (30 дней = 2592000 секунд). Параметр появился в Bot API 9.6,
-                # но aiogram 3.28 его ещё не типизирует — шлём через сырой HTTP-метод.
-                await raw_api.send_invoice_raw(
-                    bot,
-                    chat_id=m.chat.id,
-                    title="Подписка",
-                    description=f"Ежемесячная подписка на {stars} {em('star')}",
-                    payload=f"donate:{kind}:{stars}",
-                    currency="XTR",
-                    prices=[LabeledPrice(label=f"{stars} Stars", amount=stars)],
-                    subscription_period=2592000,
-                )
-            else:
-                await bot.send_invoice(
-                    chat_id=m.chat.id,
-                    title="Донат",
-                    description=f"Поддержка на {stars} {em('star')}",
-                    payload=f"donate:{kind}:{stars}", currency="XTR",
-                    prices=[LabeledPrice(label=f"{stars} Stars", amount=stars)])
+            await bot.send_invoice(
+                chat_id=m.chat.id,
+                title="Подписка" if kind == "sub" else "Донат",
+                description=(f"Ежемесячная подписка на {stars} ⭐️" if kind == "sub"
+                             else f"Поддержка на {stars} ⭐️"),
+                payload=f"donate:{kind}:{stars}", currency="XTR",
+                prices=[LabeledPrice(label=f"{stars} Stars", amount=stars)], **kwargs)
         except Exception as e:
             log.warning("donate_amount: не удалось выставить счёт (kind=%s) для бота %s: %s",
                         kind, bot_db_id, e)
@@ -1223,7 +1185,7 @@ def build_common_router() -> Router:
         uname = f"@{sub.user.username}" if sub.user.username else sub.user.full_name
         try:
             await bot.send_message(cfg.admin_chat_id,
-                                   f"{em('refresh')} Подписка на донат — {uname} (id {sub.user.id}): {label}")
+                                   f"🔁 Подписка на донат — {uname} (id {sub.user.id}): {label}")
         except Exception:
             pass
 
@@ -1440,12 +1402,12 @@ def build_common_router() -> Router:
         actor = f"@{uname}" if uname else str(c.from_user.id)
         try:
             await c.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[[styled_button(f"{em('lock')} Открыть снова",
+                inline_keyboard=[[styled_button("🔓 Открыть снова",
                                                 callback_data=f"reopen_ticket:{tid}")]]))
         except Exception:
             pass
         try:
-            await c.message.answer(f"{em('lock')} Закрыл — {actor}")
+            await c.message.answer(f"🔒 Закрыл — {actor}")
         except Exception:
             pass
         await c.answer("Обращение закрыто")
@@ -1567,12 +1529,12 @@ def build_common_router() -> Router:
         actor = f"@{uname}" if uname else str(c.from_user.id)
         try:
             await c.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[[styled_button(f"{em('lock')} Закрыть обращение",
+                inline_keyboard=[[styled_button("🔒 Закрыть обращение",
                                                 callback_data=f"close_ticket:{tid}")]]))
         except Exception:
             pass
         try:
-            await c.message.answer(f"{em('lock')} Переоткрыл — {actor}")
+            await c.message.answer(f"🔓 Переоткрыл — {actor}")
         except Exception:
             pass
         await c.answer("Обращение снова открыто")
