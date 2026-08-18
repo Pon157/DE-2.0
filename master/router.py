@@ -1,4 +1,3 @@
-
 from aiogram import Router, F, Bot
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart, Command, CommandObject
@@ -577,19 +576,21 @@ async def bot_menu(c: CallbackQuery):
 # ================== методичка по типу бота (по запросу) ==================
 # Показывается прямо в меню бота — доступна и владельцу, и админам, чтобы не
 # держать инструкцию где-то отдельно. Текст зависит от cb.bot_type.
-_PRO_GUIDE_BLOCK = (
-    "\n\n✨ <b>Pro-функции этого бота</b> (/pro у владельца):\n"
-    "• 🧵 Иконка форум-топика (premium-эмодзи)\n"
-    "• 🎆 Эффект на приветственном сообщении\n"
-    "• 🎨 Рич-текст приветствия (заголовки/разделители/врезки — новый формат)\n"
-    "• 🔁 Ежемесячная Stars-подписка на донат — не только разово; пользователь "
-    "может отменить сам через /unsubscribe, владелец — через "
-    "«📊 Статистика → 🔁 Активные подписки»."
-)
+def _pro_guide_block() -> str:
+    return (
+        f"\n\n{em('sparkles')} <b>Pro-функции этого бота</b> (/pro у владельца):\n"
+        f"• {em('link')} Иконка форум-топика (premium-эмодзи)\n"
+        f"• {em('star')} Эффект на приветственном сообщении\n"
+        f"• {em('sparkles')} Рич-текст приветствия (заголовки/разделители/врезки — новый формат)\n"
+        f"• {em('refresh')} Ежемесячная Stars-подписка на донат — не только разово; пользователь "
+        "может отменить сам через /unsubscribe, владелец — через "
+        "«📊 Статистика → 🔁 Активные подписки»."
+    )
 
-BOT_GUIDES: dict[str, str] = {
+def _bot_guide(bot_type: str) -> str:
+    guides: dict[str, str] = {
     "feedback": (
-        "📖 <b>Бот-обращения (feedback)</b>\n\n"
+        f"{em('bookmark')} <b>Бот-обращения (feedback)</b>\n\n"
         "Подписчик пишет боту → создаётся обращение и пересылается в чат "
         "админов (⚙️ Настройки → «Чат админов»). Админ отвечает <b>реплаем</b> "
         "на пересланное сообщение — ответ уходит подписчику автоматически.\n\n"
@@ -603,10 +604,10 @@ BOT_GUIDES: dict[str, str] = {
         "в «Пороги».\n"
         "• <b>Донат</b>: кнопка доната через Telegram Stars, включается отдельно.\n"
         "• Кнопки конструктора (🔘) поддерживают HTML-стили и premium-эмодзи."
-        + _PRO_GUIDE_BLOCK
+        + _pro_guide_block()
     ),
     "posting": (
-        "📖 <b>Бот-постинг (предложка + публикация в канал)</b>\n\n"
+        f"{em('bookmark')} <b>Бот-постинг (предложка + публикация в канал)</b>\n\n"
         "Подписчики присылают посты в бота → они попадают в чат админов на "
         "модерацию (или сразу в канал, если предложка выключена). Админ "
         "публикует пост кнопкой под пересланным сообщением.\n\n"
@@ -619,10 +620,10 @@ BOT_GUIDES: dict[str, str] = {
         "уходят в свои топики.\n"
         "• Альбомы (несколько фото/видео одним постом) публикуются одним "
         "постом, а не по одному файлу."
-        + _PRO_GUIDE_BLOCK
+        + _pro_guide_block()
     ),
     "survey": (
-        "📖 <b>Бот-анкета (survey)</b>\n\n"
+        f"{em('bookmark')} <b>Бот-анкета (survey)</b>\n\n"
         "Владелец собирает одну или несколько анкет — наборов вопросов "
         "(свободный текст или варианты-кнопки). Респондент проходит анкету по "
         "кнопке из меню, заполненная анкета уходит в чат админов.\n\n"
@@ -639,9 +640,10 @@ BOT_GUIDES: dict[str, str] = {
         "продолжить переписку.\n"
         "• Респондент может отменить текущее незавершённое прохождение "
         "командой /close и начать заново."
-        + _PRO_GUIDE_BLOCK
+        + _pro_guide_block()
     ),
-}
+    }
+    return guides.get(bot_type, "Методичка для этого типа бота пока не готова.")
 
 
 @router.callback_query(F.data.startswith("guide:"))
@@ -650,7 +652,7 @@ async def bot_guide(c: CallbackQuery):
     cb, is_owner = await _access(bot_id, c.from_user.id)
     if not cb:
         await c.answer("Нет доступа", show_alert=True); return
-    text = BOT_GUIDES.get(cb.bot_type.value, "Методичка для этого типа бота пока не готова.")
+    text = _bot_guide(cb.bot_type.value)
     await c.message.edit_text(text, reply_markup=kb([[("⬅️ Назад", f"bot:{bot_id}")]]))
     await c.answer()
 
@@ -673,8 +675,7 @@ async def cfg_menu(c: CallbackQuery):
               f"cyc_pinfirst:{bot_id}")],
             [("👋 Приветствие", f"welcome:{bot_id}"),
              ("🏷 Шаблон шапки", f"header:{bot_id}")],
-            [("🎆 Эффект приветствия", f"welcomefx:{bot_id}"),
-             ("🎨 Рич-текст (везде)", f"richwelcome:{bot_id}")],
+            [("🎆 Эффект приветствия", f"welcomefx:{bot_id}")],
             [(f"🏷 Шапка: {header_label}", f"cyc_header:{bot_id}")],
             [("🏠 Чат админов", f"admchat:{bot_id}"),
              (f"⚠️ Лимит варнов: {cb.warn_limit}", f"warnlim:{bot_id}")],
@@ -697,7 +698,6 @@ async def cfg_menu(c: CallbackQuery):
         rows = [
             [("👋 Приветствие", f"welcome:{bot_id}"),
              ("🎆 Эффект приветствия", f"welcomefx:{bot_id}")],
-            [("🎨 Рич-текст (везде)", f"richwelcome:{bot_id}")],
             [("📋 Анкеты (вопросы)", f"surveys:{bot_id}")],
             [("✅ Текст после заполнения анкеты", f"surveyfinish:{bot_id}")],
             [("🏠 Чат админов (куда приходят заполненные анкеты)", f"admchat:{bot_id}")],
@@ -722,7 +722,6 @@ async def cfg_menu(c: CallbackQuery):
               f"cyc_sugg:{bot_id}")],
             [("👋 Приветствие", f"welcome:{bot_id}"),
              ("🎆 Эффект приветствия", f"welcomefx:{bot_id}")],
-            [("🎨 Рич-текст (везде)", f"richwelcome:{bot_id}")],
             [("🎨 Шаблон поста", f"template:{bot_id}"), ("🔘 Кнопки шаблона", f"tplbtn:{bot_id}")],
             [("📡 Канал", f"channel:{bot_id}"), ("🏠 Чат админов", f"admchat:{bot_id}")],
             [(f"📨 Пересылка предложки в чат админов: {cb.forward_mode.value}", f"cyc_fwd:{bot_id}")],
