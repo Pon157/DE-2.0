@@ -4,7 +4,8 @@ import uuid
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
-from aiogram.exceptions import TelegramConflictError, TelegramUnauthorizedError
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.exceptions import TelegramConflictError, TelegramUnauthorizedError, TelegramNetworkError
 from sqlalchemy import select
 from db.base import Session
 from db.models import ChildBot, BotType, BotRuntimeLock
@@ -14,18 +15,8 @@ log = logging.getLogger("bot_manager")
 LOCK_STALE_AFTER = timedelta(seconds=15)   # если heartbeat старше — лок считается брошенным
 HEARTBEAT_EVERY = 5
 
-
 TOKEN_WATCHDOG_EVERY = 45  # секунд между проверками валидности токена
 
-# ---- отслеживание "залипших" TelegramConflictError (по запросу) ----
-# Один TelegramConflictError сам по себе — норма (например, короткое
-# перекрытие при рестарте деплоя) и обрабатывается ретраем с backoff внутри
-# _run(). Проблема — когда бот УСТОЙЧИВО не может подняться (например,
-# токен используется где-то ещё — второй инстанс/забытый локальный запуск
-# у владельца бота) и вечно ретраит getUpdates, тратя ресурсы и никогда не
-# доставляя сообщения. Раз в CONFLICT_CHECK_EVERY проверяем все боты,
-# которые непрерывно (без единого успешного старта) находятся в конфликте
-# дольше CONFLICT_DISABLE_AFTER, и отключаем их.
 CONFLICT_CHECK_EVERY = 30 * 60      # 30 минут
 CONFLICT_DISABLE_AFTER = timedelta(minutes=30)
 
@@ -37,8 +28,6 @@ class BotManager:
         self.dispatchers: dict[int, Dispatcher] = {}  # bot_id -> Dispatcher object
         self._locks: dict[int, asyncio.Lock] = {}
         self._instance_id = str(uuid.uuid4())
-        # bot_id -> момент, с которого бот НЕПРЕРЫВНО в состоянии конфликта
-        # (сбрасывается при любом успешном старте поллинга или остановке).
         self._conflict_since: dict[int, datetime] = {}
         self._conflict_watchdog_task: asyncio.Task | None = None
 
@@ -52,16 +41,13 @@ class BotManager:
     async def start_all(self):
         async with Session() as s:
             rows = (await s.scalars(select(ChildBot).where(ChildBot.is_active))).all()
-        # Запускаем ботов пачками по STARTUP_BATCH_SIZE с паузой между пачками.
-        # Без этого при большом числе ботов все разом бьются в Telegram API
-        # с get_me()/delete_webhook() → получаем шквал 502 Bad Gateway,
-        # которые роняют start_polling() ещё до первого getUpdates.
-        STARTUP_BATCH_SIZE = 5
-        STARTUP_BATCH_DELAY = 1.5  # сек между пачками
+
+        # Запускаем ботов небольшими пачками с задержкой, чтобы избежать спама в Telegram API
+        STARTUP_BATCH_SIZE = 3
+        STARTUP_BATCH_DELAY = 2.0  # сек между пачками
         for i in range(0, len(rows), STARTUP_BATCH_SIZE):
             batch = rows[i:i + STARTUP_BATCH_SIZE]
-            await asyncio.gather(*(self.start_bot(cb) for cb in batch),
-                                 return_exceptions=True)
+            await asyncio.gather(*(self.start_bot(cb) for cb in batch), return_exceptions=True)
             if i + STARTUP_BATCH_SIZE < len(rows):
                 await asyncio.sleep(STARTUP_BATCH_DELAY)
 
@@ -102,7 +88,6 @@ class BotManager:
                         await s.commit()
                     cb = await s.get(ChildBot, bot_id)
                 
-                # ДЕБАГ: Логируем реакцию фонового хертбита на изменение записи в БД
                 if cb is None or not cb.is_active:
                     log.info("[DEBUG_BOT] Хертбит: Бот %s деактивирован (is_active=False) или удален. Сигнализирую stop_polling()", bot_id)
                     await dp.stop_polling()
@@ -110,24 +95,7 @@ class BotManager:
             pass
 
     async def _deactivate_invalid_token(self, cb_id: int, username: str):
-        """БАГ/ресурсная проблема (по запросу): если токен дочернего бота
-        отозван/невалиден (TelegramUnauthorizedError), aiogram'овский
-        dp.start_polling() НЕ пробрасывает это исключение наружу — его
-        внутренний бесконечный цикл _listen_updates() ловит ЛЮБОЕ
-        исключение (это его штатное поведение "so you may not worry that
-        the polling will stop working") и просто ретраит get_updates раз в
-        1-5 секунд НАВСЕГДА. Отсюда в логах тысячи строк "Sleep for N
-        seconds and try again... (tryings = 57199...)" и постоянная
-        нагрузка на CPU/сеть от бота, который заведомо не может работать.
-        Наш собственный except TelegramUnauthorizedError вокруг
-        dp.start_polling() в _run() из-за этого никогда не срабатывал.
-        Решение — активно проверять токен (см. _token_watchdog и
-        preflight-проверку в _start_bot_locked) и при невалидности
-        ОСТАНАВЛИВАТЬ поллинг самим, а не полагаться на то, что aiogram
-        когда-нибудь перестанет ретраить (он не перестанет)."""
-        log.error("Bot %s (@%s): токен недействителен (TelegramUnauthorizedError) — "
-                  "останавливаю бота и отключаю (is_active=False), чтобы не "
-                  "жечь ресурсы на бесконечный ретрай.", cb_id, username)
+        log.error("Bot %s (@%s): токен недействителен (TelegramUnauthorizedError) — останавливаю и отключаю.", cb_id, username)
         async with Session() as s:
             cb = await s.get(ChildBot, cb_id)
             if cb and cb.is_active:
@@ -139,25 +107,19 @@ class BotManager:
         if owner_id:
             try:
                 from config import MASTER_BOT_TOKEN
-                notifier = Bot(MASTER_BOT_TOKEN)
+                notifier = Bot(MASTER_BOT_TOKEN, session=AiohttpSession(timeout=10.0))
                 try:
                     await notifier.send_message(
                         owner_id,
                         f"⚠️ Бот @{username} остановлен: его токен недействителен "
-                        "(отозван или отсутствует в Telegram — TelegramUnauthorizedError). "
-                        "Скорее всего, токен был отозван через @BotFather. "
-                        "Создайте нового бота или обновите токен и включите бота заново.")
+                        "(отозван или отсутствует в Telegram — TelegramUnauthorizedError)."
+                    )
                 finally:
                     await notifier.session.close()
             except Exception:
                 pass
 
     async def _token_watchdog(self, cb_id: int, bot: Bot, dp: Dispatcher, username: str):
-        """Периодически (раз в TOKEN_WATCHDOG_EVERY сек) проверяет, что токен
-        всё ещё валиден (bot.get_me()) — см. докстринг
-        _deactivate_invalid_token про то, почему это нельзя переложить на
-        встроенный ретрай aiogram. При TelegramUnauthorizedError сразу же
-        останавливает поллинг этого бота вместо бесконечных ретраев."""
         try:
             while True:
                 await asyncio.sleep(TOKEN_WATCHDOG_EVERY)
@@ -168,8 +130,6 @@ class BotManager:
                     await dp.stop_polling()
                     return
                 except Exception:
-                    # Сетевые/временные ошибки — не повод останавливать бота,
-                    # это дело самого get_updates внутри aiogram.
                     pass
         except asyncio.CancelledError:
             pass
@@ -184,9 +144,7 @@ class BotManager:
             self.dispatchers.pop(cb.id, None)
 
         if not await self._claim_runtime_lock(cb.id):
-            log.warning(
-                "Bot %s (@%s) уже поднят ДРУГИМ процессом (по метке в БД) — "
-                "не запускаю второй поллинг.", cb.id, cb.username)
+            log.warning("Bot %s (@%s) уже поднят ДРУГИМ процессом — не запускаю.", cb.id, cb.username)
             return
 
         from child.feedback import build_feedback_router
@@ -194,12 +152,11 @@ class BotManager:
         from child.survey import build_survey_router
         from child.common import build_common_router
 
-        bot = Bot(cb.token, default=DefaultBotProperties(parse_mode="HTML"))
+        # Явный таймаут для aiohttp сессии (30 сек)
+        session = AiohttpSession(timeout=30.0)
+        bot = Bot(cb.token, session=session, default=DefaultBotProperties(parse_mode="HTML"))
 
-        # Preflight-проверка (по запросу): если токен уже невалиден на
-        # момент запуска — не поднимаем поллинг вообще (см. докстринг
-        # _deactivate_invalid_token — иначе он бы молча ушёл в бесконечный
-        # ретрай внутри aiogram и жёг ресурсы).
+        # Preflight-проверка токена
         try:
             await bot.get_me()
         except TelegramUnauthorizedError:
@@ -211,7 +168,7 @@ class BotManager:
                 pass
             return
         except Exception:
-            pass  # временная сетевая ошибка — не блокируем запуск из-за неё
+            pass  # Сетевую ошибку обработаем внутри воркера
 
         try:
             await bot.delete_webhook(drop_pending_updates=False)
@@ -229,65 +186,69 @@ class BotManager:
             dp.include_router(build_posting_router())
 
         async def _run():
+            nonlocal bot
             heartbeat = asyncio.create_task(self._heartbeat_loop(cb.id, dp))
             watchdog = asyncio.create_task(self._token_watchdog(cb.id, bot, dp, cb.username))
             backoff = 5
             try:
                 while True:
-                    # ДЕБАГ: Логируем факт новой итерации цикла и запрос к БД
-                    log.info("[DEBUG_BOT] Воркер @%s: Проверяю актуальный статус в БД перед стартом сессии...", cb.username)
+                    log.info("[DEBUG_BOT] Воркер @%s: Проверяю статус в БД...", cb.username)
                     async with Session() as s:
                         current_cb = await s.get(ChildBot, cb.id)
                     
                     if current_cb is None:
-                        log.warning("[DEBUG_BOT] Воркер @%s: Бот полностью удален из БД. Завершаю поток воркера.", cb.username)
+                        log.warning("[DEBUG_BOT] Воркер @%s: Бот удален из БД.", cb.username)
                         return
                     
-                    log.info("[DEBUG_BOT] Воркер @%s: Ответ БД получен. Текущий флаг is_active = %s", cb.username, current_cb.is_active)
-                    
+                    log.info("[DEBUG_BOT] Воркер @%s: is_active = %s", cb.username, current_cb.is_active)
                     if not current_cb.is_active:
-                        log.info("[DEBUG_BOT] Воркер @%s: Обнаружен флаг остановки (is_active=False). Мягко выхожу из цикла.", cb.username)
+                        log.info("[DEBUG_BOT] Воркер @%s: Остановка по флагу is_active=False", cb.username)
                         return
 
                     try:
-                        log.info("[DEBUG_BOT] Воркер @%s: Инициализирую вызов dp.start_polling()", cb.username)
+                        log.info("[DEBUG_BOT] Воркер @%s: Инициализирую dp.start_polling()", cb.username)
                         await dp.start_polling(
                             bot, handle_signals=False,
-                            allowed_updates=dp.resolve_used_update_types())
+                            allowed_updates=dp.resolve_used_update_types()
+                        )
 
-                        log.info("[DEBUG_BOT] Воркер @%s: Сессия dp.start_polling() завершилась штатно.", cb.username)
+                        log.info("[DEBUG_BOT] Воркер @%s: Сессия поллинга завершилась штатно.", cb.username)
                         self._conflict_since.pop(cb.id, None)
-                        return  # штатная остановка (stop_polling / отмена)
+                        return
+                    except TelegramNetworkError as e:
+                        log.warning("[DEBUG_BOT] Воркер @%s: Сетевой сбой/таймаут (%s). Сбрасываю сессию и ретраю через %ss...", cb.username, e, backoff)
+                        # Закрываем старую застрявшую сессию
+                        try:
+                            await bot.session.close()
+                        except Exception:
+                            pass
+                        # Пересоздаем свежую сессию
+                        new_session = AiohttpSession(timeout=30.0)
+                        bot = Bot(cb.token, session=new_session, default=DefaultBotProperties(parse_mode="HTML"))
+                        self.bots[cb.id] = bot
+
+                        await asyncio.sleep(backoff)
+                        backoff = min(backoff * 2, 30)
                     except TelegramConflictError:
-                        log.warning("[DEBUG_BOT] Воркер @%s: Конфликт токенов (TelegramConflictError). Засыпаю на %ss перед ретраем.",
-                                    cb.username, backoff)
-                        # Помечаем начало непрерывной серии конфликтов (если
-                        # ещё не помечено) — см. _conflict_watchdog_loop,
-                        # который раз в 30 минут отключит бота, если тот так
-                        # и не поднимется до этого момента.
+                        log.warning("[DEBUG_BOT] Воркер @%s: Конфликт токенов (TelegramConflictError). Пауза %ss.", cb.username, backoff)
                         self._conflict_since.setdefault(cb.id, datetime.utcnow())
                         await asyncio.sleep(backoff)
                         backoff = min(backoff * 2, 60)
                     except TelegramUnauthorizedError:
-                        # На практике сюда aiogram обычно НЕ доходит (см.
-                        # докстринг _deactivate_invalid_token — сам
-                        # start_polling эту ошибку проглатывает и ретраит
-                        # бесконечно) — оставлено как доп. защита на случай
-                        # если исключение всё же прилетит сюда напрямую
-                        # (например, из delete_webhook() чуть выше).
-                        log.error("[DEBUG_BOT] Воркер @%s: Токен заблокирован ТГ (TelegramUnauthorizedError). Выхожу.", cb.username)
+                        log.error("[DEBUG_BOT] Воркер @%s: Токен заблокирован (TelegramUnauthorizedError).", cb.username)
                         await self._deactivate_invalid_token(cb.id, cb.username)
                         return
                     except Exception as e:
-                        log.exception("[DEBUG_BOT] Воркер @%s: Поймано исключение внутри старта поллинга: %s", cb.username, e)
+                        log.exception("[DEBUG_BOT] Воркер @%s: Исключение в поллинге: %s", cb.username, e)
                         await asyncio.sleep(backoff)
+                        backoff = min(backoff * 2, 30)
             except asyncio.CancelledError:
-                log.info("[DEBUG_BOT] Воркер @%s: Получена жесткая отмена задачи (CancelledError).", cb.username)
+                log.info("[DEBUG_BOT] Воркер @%s: Отмена задачи (CancelledError).", cb.username)
                 raise
             except Exception as e:
                 log.exception("Bot %s crashed: %s", cb.username, e)
             finally:
-                log.info("[DEBUG_BOT] Воркер @%s: Вхожу в блок finally очистки ресурсов воркера.", cb.username)
+                log.info("[DEBUG_BOT] Воркер @%s: Очистка ресурсов воркера...", cb.username)
                 heartbeat.cancel()
                 watchdog.cancel()
                 try:
@@ -302,7 +263,7 @@ class BotManager:
                 self._conflict_since.pop(cb.id, None)
                 try:
                     await bot.session.close()
-                    log.info("[DEBUG_BOT] Воркер @%s: Сессия aiohttp закрыта успешно.", cb.username)
+                    log.info("[DEBUG_BOT] Воркер @%s: Сессия aiohttp закрыта.", cb.username)
                 except Exception:
                     pass
 
@@ -321,18 +282,17 @@ class BotManager:
         bot = self.bots.pop(bot_id, None)
 
         if dp:
-            log.info("[DEBUG_BOT] stop_bot: Сигнализирую dp.stop_polling() для корректного завершения сетевого цикла.")
+            log.info("[DEBUG_BOT] stop_bot: Сигнализирую dp.stop_polling() для бота id=%s", bot_id)
             await dp.stop_polling()
-            # Короткая пауза, чтобы aiogram успел обработать изменение флага running
             await asyncio.sleep(0.2)
 
         if task:
-            log.info("[DEBUG_BOT] stop_bot: Вызываю явный cancel() для таски бота id=%s", bot_id)
+            log.info("[DEBUG_BOT] stop_bot: Вызываю task.cancel() для бота id=%s", bot_id)
             task.cancel()
             try:
                 await asyncio.wait_for(asyncio.shield(task), timeout=10)
             except asyncio.TimeoutError:
-                log.warning("Bot %s: остановка зависла дольше 10с, продолжаю без ожидания", bot_id)
+                log.warning("Bot %s: остановка зависла дольше 10с, продолжаю...", bot_id)
             except (asyncio.CancelledError, Exception):
                 pass
         if bot:
@@ -362,9 +322,6 @@ class BotManager:
         await asyncio.gather(*(self.stop_bot(i) for i in ids), return_exceptions=True)
 
     def start_conflict_watchdog(self):
-        """Запускает фоновый цикл, который раз в CONFLICT_CHECK_EVERY (30
-        минут по запросу) отключает ботов, непрерывно застрявших в
-        TelegramConflictError (см. _conflict_since)."""
         if self._conflict_watchdog_task is None or self._conflict_watchdog_task.done():
             self._conflict_watchdog_task = asyncio.create_task(
                 self._conflict_watchdog_loop(), name="conflict-watchdog")
@@ -380,17 +337,11 @@ class BotManager:
     async def _check_stuck_conflicts(self):
         now = datetime.utcnow()
         stuck = [bot_id for bot_id, since in list(self._conflict_since.items())
-                if now - since >= CONFLICT_DISABLE_AFTER]
+                 if now - since >= CONFLICT_DISABLE_AFTER]
         for bot_id in stuck:
             await self._deactivate_conflicting_bot(bot_id)
 
     async def _deactivate_conflicting_bot(self, bot_id: int):
-        """Отключает бота, который непрерывно (без единого успешного
-        старта) находится в TelegramConflictError дольше
-        CONFLICT_DISABLE_AFTER — обычно значит, что токен уже используется
-        где-то ещё (второй запущенный инстанс/локальный запуск у
-        владельца), и бесконечный ретрай только жжёт ресурсы, ничего не
-        доставляя пользователям."""
         async with Session() as s:
             cb = await s.get(ChildBot, bot_id)
             if not cb:
@@ -406,21 +357,17 @@ class BotManager:
         await self.stop_bot(bot_id)
         if not still_active:
             return
-        log.error("Bot %s (@%s): непрерывный TelegramConflictError дольше %s — "
-                  "отключаю (is_active=False), скорее всего токен используется "
-                  "где-то ещё.", bot_id, username, CONFLICT_DISABLE_AFTER)
+        log.error("Bot %s (@%s): постоянный TelegramConflictError — отключаю.", bot_id, username)
         if owner_id:
             try:
                 from config import MASTER_BOT_TOKEN
-                notifier = Bot(MASTER_BOT_TOKEN)
+                notifier = Bot(MASTER_BOT_TOKEN, session=AiohttpSession(timeout=10.0))
                 try:
                     await notifier.send_message(
                         owner_id,
-                        f"⚠️ Бот @{username} остановлен: обнаружен постоянный конфликт "
-                        "получения обновлений (TelegramConflictError) — похоже, этот "
-                        "же токен сейчас используется где-то ещё (другой запущенный "
-                        "экземпляр бота). Остановите второй экземпляр и включите бота "
-                        "заново.")
+                        f"⚠️ Бот @{username} остановлен: постоянный конфликт (TelegramConflictError). "
+                        "Токен используется в другом месте."
+                    )
                 finally:
                     await notifier.session.close()
             except Exception:
@@ -452,12 +399,6 @@ async def reupload_photo_for_bot(source_bot: Bot, bot_id: int, file_id: str,
         return None
 
 
-# Расширяемый вариант reupload_photo_for_bot на все типы медиа — нужен для
-# вопросов анкет и финального сообщения анкеты (см. child/survey.py,
-# master/router.py::survey_q_text_save/surveyfinish_save), т.к. владелец
-# настраивает их через МАСТЕР-бота, а показывает их ДОЧЕРНИЙ — тот же класс
-# бага с "file_id действителен только для бота, которым получен", что и с
-# welcome_photo/response_photo (см. reupload_photo_for_bot выше).
 _REUPLOAD_FILENAMES = {
     "photo": "photo.jpg", "video": "video.mp4", "animation": "animation.gif",
     "document": "file", "audio": "audio.mp3", "voice": "voice.ogg",
@@ -493,6 +434,6 @@ async def reupload_media_for_bot(source_bot: Bot, bot_id: int, file_id: str,
             return obj[-1].file_id
         return obj.file_id if obj else None
     except Exception as e:
-        log.warning("reupload_media_for_bot: не удалось перенести file_id (%s) для "
-                    "бота %s: %s", media_type, bot_id, e)
+        log.warning("reupload_media_for_bot: не удалось перенести file_id (%s) для бота %s: %s",
+                    media_type, bot_id, e)
         return None
