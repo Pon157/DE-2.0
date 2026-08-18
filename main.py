@@ -8,7 +8,6 @@ from aiogram.exceptions import (
     TelegramUnauthorizedError,
     TelegramNetworkError,
 )
-from aiohttp import ClientTimeout
 
 from config import MASTER_BOT_TOKEN, AD_WEBHOOK_PORT
 from db.base import init_db
@@ -28,11 +27,9 @@ async def run_master_polling(dp: Dispatcher):
     """Отдельный устойчивый цикл поллинга для мастер-бота со сбросом сессии"""
     backoff = 5
     while True:
-        # Настраиваем сессию: total=None обязателен для Long Polling (getUpdates),
-        # а connect=30.0 не дает застрять при установке соединения.
-        session = AiohttpSession(
-            timeout=ClientTimeout(total=None, connect=30.0, sock_read=None)
-        )
+        # Передаем обычное число (30.0), чтобы aiogram мог корректно
+        # вычислять request_timeout = bot.session.timeout + polling_timeout
+        session = AiohttpSession(timeout=30.0)
         master = Bot(
             MASTER_BOT_TOKEN,
             session=session,
@@ -46,6 +43,7 @@ async def run_master_polling(dp: Dispatcher):
                 handle_signals=False,
                 allowed_updates=dp.resolve_used_update_types()
             )
+            backoff = 5  # Сбрасываем backoff при успешном завершении
             break  # Штатный останов
         except TelegramNetworkError as e:
             log.warning(
