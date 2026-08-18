@@ -1,4 +1,3 @@
-
 from aiogram import Router, F, Bot
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart, Command, CommandObject
@@ -23,7 +22,7 @@ from services import moderation as mod
 from utils.emoji import em, styled_button
 from utils import crypto
 from utils.raw_api import get_star_balance
-from child.common import RESERVED_COMMANDS, message_media
+from child.common import RESERVED_COMMANDS, message_media, extract_rich_payload
 from master import legal
 import config
 import json
@@ -101,7 +100,7 @@ async def _master_guard_message(handler, event: Message, data: dict):
         # разрешён всегда — это как раз просмотр текстов документов.
         if event.text != "/info" and not await _has_accepted_terms(uid):
             await event.answer(legal.GATE_TEXT, reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="✅ Принимаю",
+                inline_keyboard=[[InlineKeyboardButton(text=f"{em('check')} Принимаю",
                                                        callback_data="accept_terms")]]))
             return
         # Капча — ПОКАЗЫВАЕТСЯ ВСЕМ, включая владельца/SUPER_ADMIN_ID, без
@@ -249,9 +248,9 @@ def nav_kb(bot_id: int, back_data: str | None = None):
     """
     rows = []
     if back_data:
-        rows.append([("⬅️ Назад", back_data)])
-    rows.append([("⚙️ Настройки", f"cfg:{bot_id}")])
-    rows.append([("🤖 Меню бота", f"bot:{bot_id}")])
+        rows.append([(f"{em('arrow_right')} Назад", back_data)])
+    rows.append([(f"{em('gear')} Настройки", f"cfg:{bot_id}")])
+    rows.append([(f"{em('gear')} Меню бота", f"bot:{bot_id}")])
     return kb(rows)
 
 
@@ -403,13 +402,13 @@ async def cmd_pro(m: Message):
         "В ваших ботах не будет рекламы: её нельзя будет купить для показа, и "
         "в них не попадут глобальные рекламные рассылки.\n\n"
         "Плюс Pro-функции для всех ваших ботов:\n"
-        "• 🧵 Иконка форум-топика (premium-эмодзи)\n"
-        "• 🎆 Эффект на приветственном сообщении\n"
-        "• 🔁 Ежемесячная Stars-подписка на донат (не только разово)\n"
-        "• 🎨 Рич-текст приветствия (новый формат Bot API — заголовки, "
+        f"• {em('link')} Иконка форум-топика (premium-эмодзи)\n"
+        f"• {em('sparkles')} Эффект на приветственном сообщении\n"
+        f"• {em('refresh')} Ежемесячная Stars-подписка на донат (не только разово)\n"
+        f"• {em('sparkles')} Рич-текст приветствия (новый формат Bot API — заголовки, "
         "разделители, врезки-цитаты)\n\n"
         "Также Pro можно получить бесплатно за приглашённых — см. /ref",
-        reply_markup=kb([[("💳 Купить Pro", "buy_pro")]]))
+        reply_markup=kb([[(f"{em('money_wings')} Купить Pro", "buy_pro")]]))
 
 
 async def _require_pro(c: CallbackQuery, owner_id: int) -> bool:
@@ -437,7 +436,7 @@ async def buy_pro(c: CallbackQuery):
         await c.message.edit_text(
             f"{em('sparkles')} Оплата Pro-подписки ({config.PRO_PRICE_RUB} ₽/мес). "
             "После оплаты Pro активируется автоматически в течение минуты.",
-            reply_markup=kb([[(f"💳 Оплатить {config.PRO_PRICE_RUB} ₽", None, url)]]))
+            reply_markup=kb([[(f"{em('money_wings')} Оплатить {config.PRO_PRICE_RUB} ₽", None, url)]]))
     except TelegramBadRequest:
         # Двойное нажатие ("кнопка плохо прожимается") — редактирование тем
         # же текстом падает с "message is not modified" и раньше просто
@@ -456,8 +455,8 @@ async def show_main(m: Message, edit: bool = False, user_id: int | None = None):
             BotAdmin.user_id == uid))).all()
         admined = (await s.scalars(select(ChildBot).where(
             ChildBot.id.in_(adm_ids)))).all() if adm_ids else []
-    rows = [[(f"🤖 @{b.username}", f"bot:{b.id}")] for b in {b.id: b for b in own + admined}.values()]
-    rows.append([(f"➕ Создать бота", "newbot")])
+    rows = [[(f"{em('gear')} @{b.username}", f"bot:{b.id}")] for b in {b.id: b for b in own + admined}.values()]
+    rows.append([(f"{em('plus')} Создать бота", "newbot")])
     if uid == SUPER_ADMIN_ID and SUPER_ADMIN_ID:
         rows.append([(f"{em('gear')} Админ-панель", "ap")])
 
@@ -485,8 +484,8 @@ async def cb_main(c: CallbackQuery, state: FSMContext):
 async def newbot(c: CallbackQuery, state: FSMContext):
     await state.set_state(St.add_type)
     await c.message.edit_text("Тип бота?", reply_markup=kb([
-        [("💬 Обратная связь", "type:feedback")],
-        [("📣 Постинг в канал", "type:posting")],
+        [(f"{em('speech')} Обратная связь", "type:feedback")],
+        [(f"{em('megaphone')} Постинг в канал", "type:posting")],
         [("📝 Анкета", "type:survey")],
     ]))
     await c.answer()
@@ -557,19 +556,19 @@ async def bot_menu(c: CallbackQuery):
     if not cb:
         await c.answer("Нет доступа", show_alert=True); return
     rows = [
-        [("📣 Рассылка", f"bc:{bot_id}"), ("📊 Статистика", f"stats:{bot_id}")],
+        [(f"{em('megaphone')} Рассылка", f"bc:{bot_id}"), (f"{em('chart')} Статистика", f"stats:{bot_id}")],
         [("📖 Методичка по этому боту", f"guide:{bot_id}")]]
     if is_owner:
         rows += [
-            [("⚙️ Настройки", f"cfg:{bot_id}")],
-            [("🔘 Кнопки и команды", f"btns:{bot_id}"),
-             ("👥 Админы", f"admins:{bot_id}")],
-            [("⏯ Вкл/выкл", f"toggle:{bot_id}"), ("🔄 Перезапустить", f"restartbot:{bot_id}")],
-            [("🗑 Удалить", f"del:{bot_id}")]]
-    rows.append([("⬅️ Назад", "main")])
-    status = "🟢 работает" if cb.is_active else "🔴 остановлен"
+            [(f"{em('gear')} Настройки", f"cfg:{bot_id}")],
+            [(f"{em('gear')} Кнопки и команды", f"btns:{bot_id}"),
+             (f"{em('loudspeaker')} Админы", f"admins:{bot_id}")],
+            [(f"{em('play')} Вкл/выкл", f"toggle:{bot_id}"), (f"{em('refresh')} Перезапустить", f"restartbot:{bot_id}")],
+            [(f"{em('trash')} Удалить", f"del:{bot_id}")]]
+    rows.append([(f"{em('arrow_right')} Назад", "main")])
+    status = f"{em('green')} работает" if cb.is_active else f"{em('red')} остановлен"
     await c.message.edit_text(
-        f"🤖 <b>@{cb.username}</b> · {cb.bot_type.value} · {status}",
+        f"{em('gear')} <b>@{cb.username}</b> · {cb.bot_type.value} · {status}",
         reply_markup=kb(rows))
     await c.answer()
 
@@ -578,31 +577,31 @@ async def bot_menu(c: CallbackQuery):
 # Показывается прямо в меню бота — доступна и владельцу, и админам, чтобы не
 # держать инструкцию где-то отдельно. Текст зависит от cb.bot_type.
 _PRO_GUIDE_BLOCK = (
-    "\n\n✨ <b>Pro-функции этого бота</b> (/pro у владельца):\n"
-    "• 🧵 Иконка форум-топика (premium-эмодзи)\n"
-    "• 🎆 Эффект на приветственном сообщении\n"
-    "• 🎨 Рич-текст приветствия (заголовки/разделители/врезки — новый формат)\n"
-    "• 🔁 Ежемесячная Stars-подписка на донат — не только разово; пользователь "
+    f"\n\n{em('sparkles')} <b>Pro-функции этого бота</b> (/pro у владельца):\n"
+    f"• {em('link')} Иконка форум-топика (premium-эмодзи)\n"
+    f"• {em('sparkles')} Эффект на приветственном сообщении\n"
+    f"• {em('sparkles')} Рич-текст приветствия (заголовки/разделители/врезки — новый формат)\n"
+    f"• {em('refresh')} Ежемесячная Stars-подписка на донат — не только разово; пользователь "
     "может отменить сам через /unsubscribe, владелец — через "
-    "«📊 Статистика → 🔁 Активные подписки»."
+    f"«{em('chart')} Статистика → {em('refresh')} Активные подписки»."
 )
 
 BOT_GUIDES: dict[str, str] = {
     "feedback": (
         "📖 <b>Бот-обращения (feedback)</b>\n\n"
         "Подписчик пишет боту → создаётся обращение и пересылается в чат "
-        "админов (⚙️ Настройки → «Чат админов»). Админ отвечает <b>реплаем</b> "
+        f"админов ({em('gear')} Настройки → «Чат админов»). Админ отвечает <b>реплаем</b> "
         "на пересланное сообщение — ответ уходит подписчику автоматически.\n\n"
         "• <b>Режим открытия</b>: по первому сообщению / по /start / по кнопке.\n"
         "• <b>Топики</b>: если чат админов — форум, каждому подписчику можно "
-        "выделять свой топик (⚙️ → «Топики»). Имя топика настраивается шаблоном "
+        f"выделять свой топик ({em('gear')} → «Топики»). Имя топика настраивается шаблоном "
         "с {name}/{username}/{id}.\n"
         "• <b>«1 пользователь = 1 обращение»</b> — новое сообщение не открывает "
         "второе обращение, пока не закрыто текущее (/close или кнопка).\n"
         "• <b>Антиспам</b>: капча + лимит сообщений в окно времени, настраивается "
         "в «Пороги».\n"
         "• <b>Донат</b>: кнопка доната через Telegram Stars, включается отдельно.\n"
-        "• Кнопки конструктора (🔘) поддерживают HTML-стили и premium-эмодзи."
+        f"• Кнопки конструктора ({em('gear')}) поддерживают HTML-стили и premium-эмодзи."
         + _PRO_GUIDE_BLOCK
     ),
     "posting": (
@@ -610,7 +609,7 @@ BOT_GUIDES: dict[str, str] = {
         "Подписчики присылают посты в бота → они попадают в чат админов на "
         "модерацию (или сразу в канал, если предложка выключена). Админ "
         "публикует пост кнопкой под пересланным сообщением.\n\n"
-        "• <b>Канал</b> и <b>чат админов</b> настраиваются в ⚙️ Настройки.\n"
+        f"• <b>Канал</b> и <b>чат админов</b> настраиваются в {em('gear')} Настройки.\n"
         "• <b>Шаблон поста</b> — оформление публикации (шапка/подпись), "
         "поддерживает HTML и premium-эмодзи; переменные — в разделе шаблона.\n"
         "• <b>Публикация</b>: пересылкой («Forwarded from») или копией без "
@@ -629,7 +628,7 @@ BOT_GUIDES: dict[str, str] = {
         "• <b>«📋 Анкеты»</b> в настройках — создание анкет и вопросов. Вопрос "
         "может содержать HTML-форматирование, premium-эмодзи и медиа-вложение "
         "(фото/видео/файл/гиф/аудио) — присылайте их прямо при добавлении вопроса.\n"
-        "• <b>«✅ Текст после заполнения»</b> — тоже поддерживает форматирование "
+        f"• <b>«{em('check')} Текст после заполнения»</b> — тоже поддерживает форматирование "
         "и медиа.\n"
         "• <b>Топики</b>: включите в настройках — каждому респонденту будет "
         "выделяться свой топик в чате админов, чтобы не путать анкеты разных "
@@ -651,7 +650,7 @@ async def bot_guide(c: CallbackQuery):
     if not cb:
         await c.answer("Нет доступа", show_alert=True); return
     text = BOT_GUIDES.get(cb.bot_type.value, "Методичка для этого типа бота пока не готова.")
-    await c.message.edit_text(text, reply_markup=kb([[("⬅️ Назад", f"bot:{bot_id}")]]))
+    await c.message.edit_text(text, reply_markup=kb([[(f"{em('arrow_right')} Назад", f"bot:{bot_id}")]]))
     await c.answer()
 
 
@@ -665,83 +664,80 @@ async def cfg_menu(c: CallbackQuery):
     header_label = HEADER_MODE_LABELS.get(cb.header_mode or "separate", "отдельным сообщением")
     if cb.bot_type == BotType.feedback:
         rows = [
-            [("✉️ Открытие обращений: " + cb.open_mode.value, f"cyc_open:{bot_id}")],
-            [(f"📨 Пересылка сообщений в чат админов: {cb.forward_mode.value}", f"cyc_fwd:{bot_id}")],
-            [("🧵 Топики: " + ("вкл" if cb.use_topics else "выкл"), f"cyc_topics:{bot_id}"),
-             ("🧵 Имя топика", f"topicname:{bot_id}"), ("🧵 Иконка топика", f"topicicon:{bot_id}")],
-            [(f"📌 Закреп 1-го сообщения (без топиков): {'вкл' if cb.pin_first_message else 'выкл'}",
+            [(f"{em('envelope')} Открытие обращений: " + cb.open_mode.value, f"cyc_open:{bot_id}")],
+            [(f"{em('megaphone')} Пересылка сообщений в чат админов: {cb.forward_mode.value}", f"cyc_fwd:{bot_id}")],
+            [(f"{em('link')} Топики: " + ("вкл" if cb.use_topics else "выкл"), f"cyc_topics:{bot_id}"),
+             (f"{em('link')} Имя топика", f"topicname:{bot_id}"), (f"{em('link')} Иконка топика", f"topicicon:{bot_id}")],
+            [(f"{em('pin')} Закреп 1-го сообщения (без топиков): {'вкл' if cb.pin_first_message else 'выкл'}",
               f"cyc_pinfirst:{bot_id}")],
-            [("👋 Приветствие", f"welcome:{bot_id}"),
-             ("🏷 Шаблон шапки", f"header:{bot_id}")],
-            [("🎆 Эффект приветствия", f"welcomefx:{bot_id}"),
-             ("🎨 Рич-текст (везде)", f"richwelcome:{bot_id}")],
-            [(f"🏷 Шапка: {header_label}", f"cyc_header:{bot_id}")],
-            [("🏠 Чат админов", f"admchat:{bot_id}"),
-             (f"⚠️ Лимит варнов: {cb.warn_limit}", f"warnlim:{bot_id}")],
-            [("⭐️ Донат: " + ("вкл" if cb.donate_enabled else "выкл"), f"cyc_donate:{bot_id}")],
-            [("⭐️ Тип кнопки доната: " + cb.donate_button_type, f"cyc_donbtn:{bot_id}")],
-            [("✉️ Кнопка обращения", f"ticketbtn:{bot_id}")],
-            [("❌ Кнопка «Закрыть обращение» (текст/цвет/эмодзи/удаление)", f"closebtn:{bot_id}")],
-            [("⭐️ Текст/цвет/эмодзи кнопки доната", f"donatebtn:{bot_id}")],
-            [("🔄 Restart/кнопка: " + ("новый тикет" if cb.always_new_ticket else "тот же тикет"),
+            [(f"{em('wave')} Приветствие", f"welcome:{bot_id}"),
+             (f"{em('bookmark')} Шаблон шапки", f"header:{bot_id}")],
+            [(f"{em('sparkles')} Эффект приветствия", f"welcomefx:{bot_id}")],
+            [(f"{em('bookmark')} Шапка: {header_label}", f"cyc_header:{bot_id}")],
+            [(f"{em('home')} Чат админов", f"admchat:{bot_id}"),
+             (f"{em('warn')} Лимит варнов: {cb.warn_limit}", f"warnlim:{bot_id}")],
+            [(f"{em('star')} Донат: " + ("вкл" if cb.donate_enabled else "выкл"), f"cyc_donate:{bot_id}")],
+            [(f"{em('star')} Тип кнопки доната: " + cb.donate_button_type, f"cyc_donbtn:{bot_id}")],
+            [(f"{em('envelope')} Кнопка обращения", f"ticketbtn:{bot_id}")],
+            [(f"{em('cross')} Кнопка «Закрыть обращение» (текст/цвет/эмодзи/удаление)", f"closebtn:{bot_id}")],
+            [(f"{em('star')} Текст/цвет/эмодзи кнопки доната", f"donatebtn:{bot_id}")],
+            [(f"{em('refresh')} Restart/кнопка: " + ("новый тикет" if cb.always_new_ticket else "тот же тикет"),
               f"cyc_newticket:{bot_id}")],
-            [(f"🛡 Антиспам: {'вкл' if cb.antispam_enabled else 'выкл'}", f"cyc_antispam:{bot_id}"),
-             ("🛡 Пороги", f"antispamcfg:{bot_id}")],
-            [(f"🛡 Антиспам трогает владельца: {'нет' if cb.antispam_ignore_owner else 'да'}",
+            [(f"{em('shield')} Антиспам: {'вкл' if cb.antispam_enabled else 'выкл'}", f"cyc_antispam:{bot_id}"),
+             (f"{em('shield')} Пороги", f"antispamcfg:{bot_id}")],
+            [(f"{em('shield')} Антиспам трогает владельца: {'нет' if cb.antispam_ignore_owner else 'да'}",
               f"cyc_aspown:{bot_id}")],
-            [("🔒 Текст закрытия обращения", f"closenotify:{bot_id}")],
-            [(f"👍 Реакция на ответ админа: {cb.admin_reply_reaction or 'выкл'}",
+            [(f"{em('lock')} Текст закрытия обращения", f"closenotify:{bot_id}")],
+            [(f"{em('thumb_up')} Реакция на ответ админа: {cb.admin_reply_reaction or 'выкл'}",
               f"adminreaction:{bot_id}")],
         ]
     elif cb.bot_type == BotType.survey:
         rows = [
-            [("👋 Приветствие", f"welcome:{bot_id}"),
-             ("🎆 Эффект приветствия", f"welcomefx:{bot_id}")],
-            [("🎨 Рич-текст (везде)", f"richwelcome:{bot_id}")],
+            [(f"{em('wave')} Приветствие", f"welcome:{bot_id}"),
+             (f"{em('sparkles')} Эффект приветствия", f"welcomefx:{bot_id}")],
             [("📋 Анкеты (вопросы)", f"surveys:{bot_id}")],
-            [("✅ Текст после заполнения анкеты", f"surveyfinish:{bot_id}")],
-            [("🏠 Чат админов (куда приходят заполненные анкеты)", f"admchat:{bot_id}")],
+            [(f"{em('check')} Текст после заполнения анкеты", f"surveyfinish:{bot_id}")],
+            [(f"{em('home')} Чат админов (куда приходят заполненные анкеты)", f"admchat:{bot_id}")],
             # НОВОЕ (по запросу): в ботах-анкетницах теперь можно ответить
             # тому, кто прислал анкету — реплаем на его анкету в чате
             # админов, как в фидбек-ботах (см. child/survey.py::admin_reply).
-            [(f"💬 Диалог с респондентами: {'вкл' if cb.survey_dialog_enabled else 'выкл'}",
+            [(f"{em('speech')} Диалог с респондентами: {'вкл' if cb.survey_dialog_enabled else 'выкл'}",
               f"cyc_surveydialog:{bot_id}")],
-            [("🧵 Топики: " + ("вкл" if cb.use_topics else "выкл"), f"cyc_topics:{bot_id}"),
-             ("🧵 Имя топика", f"topicname:{bot_id}"), ("🧵 Иконка топика", f"topicicon:{bot_id}")],
-            [(f"⚠️ Лимит варнов: {cb.warn_limit}", f"warnlim:{bot_id}")],
-            [(f"🛡 Антиспам: {'вкл' if cb.antispam_enabled else 'выкл'}", f"cyc_antispam:{bot_id}"),
-             ("🛡 Пороги", f"antispamcfg:{bot_id}")],
-            [(f"🛡 Антиспам трогает владельца: {'нет' if cb.antispam_ignore_owner else 'да'}",
+            [(f"{em('link')} Топики: " + ("вкл" if cb.use_topics else "выкл"), f"cyc_topics:{bot_id}"),
+             (f"{em('link')} Имя топика", f"topicname:{bot_id}"), (f"{em('link')} Иконка топика", f"topicicon:{bot_id}")],
+            [(f"{em('warn')} Лимит варнов: {cb.warn_limit}", f"warnlim:{bot_id}")],
+            [(f"{em('shield')} Антиспам: {'вкл' if cb.antispam_enabled else 'выкл'}", f"cyc_antispam:{bot_id}"),
+             (f"{em('shield')} Пороги", f"antispamcfg:{bot_id}")],
+            [(f"{em('shield')} Антиспам трогает владельца: {'нет' if cb.antispam_ignore_owner else 'да'}",
               f"cyc_aspown:{bot_id}")],
-            [(f"👍 Реакция на ответ админа: {cb.admin_reply_reaction or 'выкл'}",
+            [(f"{em('thumb_up')} Реакция на ответ админа: {cb.admin_reply_reaction or 'выкл'}",
               f"adminreaction:{bot_id}")],
         ]
     else:
         rows = [
             [("📮 Предложка: " + ("вкл" if cb.accept_suggestions else "выкл"),
               f"cyc_sugg:{bot_id}")],
-            [("👋 Приветствие", f"welcome:{bot_id}"),
-             ("🎆 Эффект приветствия", f"welcomefx:{bot_id}")],
-            [("🎨 Рич-текст (везде)", f"richwelcome:{bot_id}")],
-            [("🎨 Шаблон поста", f"template:{bot_id}"), ("🔘 Кнопки шаблона", f"tplbtn:{bot_id}")],
-            [("📡 Канал", f"channel:{bot_id}"), ("🏠 Чат админов", f"admchat:{bot_id}")],
-            [(f"📨 Пересылка предложки в чат админов: {cb.forward_mode.value}", f"cyc_fwd:{bot_id}")],
-            [(f"🏷 Шапка: {header_label}", f"cyc_header:{bot_id}"),
-             ("🏷 Шаблон шапки", f"header:{bot_id}")],
-            [("🧵 Топики в чате админов: " + ("вкл" if cb.use_topics else "выкл"),
-              f"cyc_topics:{bot_id}"), ("🧵 Имя топика", f"topicname:{bot_id}"), ("🧵 Иконка топика", f"topicicon:{bot_id}")],
+            [(f"{em('wave')} Приветствие", f"welcome:{bot_id}"),
+             (f"{em('sparkles')} Эффект приветствия", f"welcomefx:{bot_id}")],
+            [(f"{em('sparkles')} Шаблон поста", f"template:{bot_id}"), (f"{em('gear')} Кнопки шаблона", f"tplbtn:{bot_id}")],
+            [(f"{em('globe')} Канал", f"channel:{bot_id}"), (f"{em('home')} Чат админов", f"admchat:{bot_id}")],
+            [(f"{em('megaphone')} Пересылка предложки в чат админов: {cb.forward_mode.value}", f"cyc_fwd:{bot_id}")],
+            [(f"{em('bookmark')} Шапка: {header_label}", f"cyc_header:{bot_id}"),
+             (f"{em('bookmark')} Шаблон шапки", f"header:{bot_id}")],
+            [(f"{em('link')} Топики в чате админов: " + ("вкл" if cb.use_topics else "выкл"),
+              f"cyc_topics:{bot_id}"), (f"{em('link')} Имя топика", f"topicname:{bot_id}"), (f"{em('link')} Иконка топика", f"topicicon:{bot_id}")],
             [("📬 Контент поста: " + ("по шаблону" if cb.channel_delivery_mode == "template" else "оригинал"),
               f"cyc_delivery:{bot_id}")],
             [(f"📤 ПУБЛИКАЦИЯ В КАНАЛ: {'пересылка (Forwarded from)' if cb.channel_publish_mode == 'forward' else 'копия (без пометки)'}",
               f"cyc_pubmode:{bot_id}")],
-            [(f"⚠️ Лимит варнов: {cb.warn_limit}", f"warnlim:{bot_id}")],
-            [(f"🛡 Антиспам: {'вкл' if cb.antispam_enabled else 'выкл'}", f"cyc_antispam:{bot_id}"),
-             ("🛡 Пороги", f"antispamcfg:{bot_id}")],
-            [(f"🛡 Антиспам трогает владельца: {'нет' if cb.antispam_ignore_owner else 'да'}",
+            [(f"{em('warn')} Лимит варнов: {cb.warn_limit}", f"warnlim:{bot_id}")],
+            [(f"{em('shield')} Антиспам: {'вкл' if cb.antispam_enabled else 'выкл'}", f"cyc_antispam:{bot_id}"),
+             (f"{em('shield')} Пороги", f"antispamcfg:{bot_id}")],
+            [(f"{em('shield')} Антиспам трогает владельца: {'нет' if cb.antispam_ignore_owner else 'да'}",
               f"cyc_aspown:{bot_id}")],
         ]
-    rows.append([("⬅️ Назад", f"bot:{bot_id}")])
-    await c.message.edit_text(f"⚙️ Настройки @{cb.username}", reply_markup=kb(rows))
+    rows.append([(f"{em('arrow_right')} Назад", f"bot:{bot_id}")])
+    await c.message.edit_text(f"{em('gear')} Настройки @{cb.username}", reply_markup=kb(rows))
     await c.answer()
 
 
@@ -817,6 +813,12 @@ async def welcome_save(m: Message, state: FSMContext):
                            f"дочернему боту @… и попробуйте снова) — приветствие сохранено "
                            "только текстом.")
 
+    # Поддержка рич-режима Telegram (Bot API 10.1): если владелец набрал
+    # приветствие в рич-редакторе, extract_rich_payload вернёт html из
+    # rich_message поля (aiogram 3.28 его не типизирует — берём из model_extra).
+    # welcome_is_rich=True → бот будет слать его через send_rich_message.
+    # При обычном тексте is_rich=False, поведение не меняется.
+    text_payload, is_rich = extract_rich_payload(m)
     async with Session() as s:
         obj = await s.get(ChildBot, bot_id)
         # БАГ: если владелец прислал фото БЕЗ подписи, m.html_text пуст, и
@@ -826,21 +828,25 @@ async def welcome_save(m: Message, state: FSMContext):
         # ЗАКОННЫЙ случай (просто фото без текста), поэтому подставляем
         # дефолтный текст вместо пустой строки, а не полагаемся только на
         # защиту ниже по цепочке.
-        obj.welcome_text = m.html_text or "Привет! Напишите ваше сообщение."
+        obj.welcome_text = text_payload or "Привет! Напишите ваше сообщение."
         obj.welcome_photo = welcome_photo
+        # is_rich ставится только если реально набрано в рич-режиме.
+        # При фото рич всё равно не поддерживается — сбрасываем.
+        obj.welcome_is_rich = is_rich and not welcome_photo
         await s.commit()
     await state.clear()
-    await m.answer(f"{em('check')} Приветствие сохранено!", reply_markup=nav_kb(bot_id))
+    rich_hint = f" {em('sparkles')} (рич-режим)" if (is_rich and not welcome_photo) else ""
+    await m.answer(f"{em('check')} Приветствие сохранено{rich_hint}!", reply_markup=nav_kb(bot_id))
 
 
 # --- НОВОЕ: эффект на приветственном сообщении (message_effect_id, Bot API,
 # доступно только в личных чатах — welcome всегда шлётся в личку) ---
 MESSAGE_EFFECTS = [
-    ("🔥 Огонь", "5104841245755180586"),
-    ("👍 Лайк", "5107584321108051014"),
-    ("👎 Дизлайк", "5104858069142078462"),
+    (f"{em('fire')} Огонь", "5104841245755180586"),
+    (f"{em('thumb_up')} Лайк", "5107584321108051014"),
+    (f"{em('thumb_down')} Дизлайк", "5104858069142078462"),
     ("❤️ Сердце", "5044134455711629726"),
-    ("🎉 Салют", "5046509860389126442"),
+    (f"{em('party')} Салют", "5046509860389126442"),
     ("💩 Куча", "5046589136895476101"),
 ]
 
@@ -854,8 +860,8 @@ async def welcomefx(c: CallbackQuery):
     if not await _require_pro(c, cb.owner_id):
         return
     rows = [[(t, f"setwfx:{bot_id}:{v}")] for t, v in MESSAGE_EFFECTS]
-    rows.append([("🚫 Без эффекта", f"setwfx:{bot_id}:off")])
-    rows.append([("⬅️ Назад", f"cfg:{bot_id}")])
+    rows.append([(f"{em('prohibited')} Без эффекта", f"setwfx:{bot_id}:off")])
+    rows.append([(f"{em('arrow_right')} Назад", f"cfg:{bot_id}")])
     await c.message.edit_text(
         f"{em('sparkles')} Эффект на приветственном сообщении (анимация "
         "при получении в личке). Выберите или выключите:",
@@ -902,7 +908,8 @@ async def surveyfinish_save(m: Message, state: FSMContext):
     # невозможно вообще. m.html_text уже сохранял форматирование текста —
     # не хватало именно медиа-вложения и его перезаливки для дочернего бота
     # (см. reupload_media_for_bot — тот же класс бага, что и с welcome_photo).
-    finish_text = (m.html_text or "").strip()
+    finish_text_raw, _ = extract_rich_payload(m)
+    finish_text = (finish_text_raw or "").strip()
     media_file_id, media_type = message_media(m)
     if not finish_text and not media_file_id:
         msg = await m.answer(f"{em('cross')} Нужен текст или медиа-вложение. Попробуйте снова.")
@@ -942,7 +949,7 @@ async def closenotify(c: CallbackQuery, state: FSMContext):
         "(отправьте текст с premium-эмодзи как обычно — они сохранятся).\n\n"
         f"Сейчас: {cur}\n\n"
         "Пришлите новый текст, или /off чтобы вообще отключить уведомление.",
-        reply_markup=kb([[("⬅️ Отмена", f"cfg:{bot_id}")]]))
+        reply_markup=kb([[(f"{em('arrow_right')} Отмена", f"cfg:{bot_id}")]]))
     await c.answer()
 
 
@@ -980,10 +987,10 @@ async def closebtn_start(c: CallbackQuery, state: FSMContext):
     if not cb or not is_owner:
         await c.answer("Только владелец", show_alert=True); return
     cur = f"«{cb.close_ticket_button_text}»" if cb.close_ticket_button_text else "выключена"
-    rows = [[("✏️ Изменить текст/цвет/эмодзи", f"closebtn_edit:{bot_id}")]]
+    rows = [[(f"{em('pencil')} Изменить текст/цвет/эмодзи", f"closebtn_edit:{bot_id}")]]
     if cb.close_ticket_button_text:
-        rows.append([("🗑 Убрать кнопку (останется только /close)", f"closebtn_del:{bot_id}")])
-    rows.append([("⬅️ Назад", f"cfg:{bot_id}")])
+        rows.append([(f"{em('trash')} Убрать кнопку (останется только /close)", f"closebtn_del:{bot_id}")])
+    rows.append([(f"{em('arrow_right')} Назад", f"cfg:{bot_id}")])
     await c.message.edit_text(f"Кнопка «Закрыть обращение»: {cur}", reply_markup=kb(rows))
     await c.answer()
 
@@ -1013,7 +1020,7 @@ async def closebtn_edit(c: CallbackQuery, state: FSMContext):
         await c.answer("Только владелец", show_alert=True); return
     await state.set_state(St.close_btn_text)
     await state.update_data(bot_id=bot_id, last_msg_id=c.message.message_id)
-    cur = cb.close_ticket_button_text or "❌ Закрыть обращение"
+    cur = cb.close_ticket_button_text or f"{em('cross')} Закрыть обращение"
     await c.message.edit_text(f"Текущий текст кнопки: «{cur}»\n"
                               "Пришлите новый текст кнопки:")
     await c.answer()
@@ -1126,7 +1133,7 @@ async def donatebtn_icon(m: Message, state: FSMContext):
 # --- п.6: реакция на сообщение админа (настраиваемая/отключаемая) ---
 # Список ограничен допустимыми Bot API реакциями (setMessageReaction
 # принимает не любой юникод-эмодзи, а фиксированный список).
-ALLOWED_ADMIN_REACTIONS = ["👍", "❤", "🔥", "🎉", "🙏", "👌", "🤝", "✅", "💯", "🤗"]
+ALLOWED_ADMIN_REACTIONS = [f"{em('thumb_up')}", "❤", f"{em('fire')}", f"{em('party')}", "🙏", "👌", "🤝", f"{em('check')}", f"{em('hundred')}", "🤗"]
 
 
 @router.callback_query(F.data.startswith("adminreaction:"))
@@ -1137,8 +1144,8 @@ async def adminreaction(c: CallbackQuery):
         await c.answer("Только владелец", show_alert=True); return
     rows = [[(f"{e}" + (" ✓" if cb.admin_reply_reaction == e else ""), f"setreaction:{bot_id}:{e}")]
             for e in ALLOWED_ADMIN_REACTIONS]
-    rows.append([("🚫 Выключить реакцию", f"setreaction:{bot_id}:off")])
-    rows.append([("⬅️ Назад", f"cfg:{bot_id}")])
+    rows.append([(f"{em('prohibited')} Выключить реакцию", f"setreaction:{bot_id}:off")])
+    rows.append([(f"{em('arrow_right')} Назад", f"cfg:{bot_id}")])
     await c.message.edit_text(
         f"{em('pencil')} Реакция, которой бот отмечает сообщение админа, когда "
         "оно доставлено пользователю. Выберите новую или выключите совсем:",
@@ -1167,8 +1174,8 @@ async def _show_surveys(target, bot_id: int, edit: bool):
         rows_db = (await s.scalars(select(Survey).where(Survey.bot_id == bot_id)
                                    .order_by(Survey.position, Survey.id))).all()
     rows = [[(f"📋 {sv.name}", f"survey:{sv.id}")] for sv in rows_db]
-    rows.append([("➕ Добавить анкету", f"survey_add:{bot_id}")])
-    rows.append([("⬅️ Назад", f"cfg:{bot_id}")])
+    rows.append([(f"{em('plus')} Добавить анкету", f"survey_add:{bot_id}")])
+    rows.append([(f"{em('arrow_right')} Назад", f"cfg:{bot_id}")])
     text = "Анкеты бота:" if rows_db else "Анкет пока нет — добавьте первую."
     if edit:
         await target.edit_text(text, reply_markup=kb(rows))
@@ -1204,7 +1211,7 @@ async def survey_add_save(m: Message, state: FSMContext):
         await s.commit()
     await state.clear()
     msg = await m.answer(f"{em('check')} Анкета добавлена! Теперь привяжите к ней кнопку "
-                         "(⚙️ Настройки → 🔘 Кнопки → «📋 Инлайн/Кейборд: анкета») и добавьте вопросы.")
+                         f"({em('gear')} Настройки → {em('gear')} Кнопки → «📋 Инлайн/Кейборд: анкета») и добавьте вопросы.")
     await _show_surveys(msg, bot_id, edit=False)
 
 
@@ -1215,12 +1222,12 @@ async def _show_survey(target, survey_id: int, edit: bool):
                               .order_by(SurveyQuestion.position))).all()
     rows = []
     for q in qs:
-        tag = "🔘" if q.qtype == "choice" else "✏️"
+        tag = f"{em('gear')}" if q.qtype == "choice" else f"{em('pencil')}"
         label = q.text if len(q.text) <= 40 else q.text[:37] + "…"
         rows.append([(f"{tag} {label}", f"survey_q_del:{q.id}:{survey_id}")])
-    rows.append([("➕ Добавить вопрос", f"survey_q_add:{survey_id}")])
-    rows.append([("🗑 Удалить анкету", f"survey_del:{survey_id}")])
-    rows.append([("⬅️ Назад", f"surveys:{sv.bot_id}")])
+    rows.append([(f"{em('plus')} Добавить вопрос", f"survey_q_add:{survey_id}")])
+    rows.append([(f"{em('trash')} Удалить анкету", f"survey_del:{survey_id}")])
+    rows.append([(f"{em('arrow_right')} Назад", f"surveys:{sv.bot_id}")])
     text = (f"📋 <b>{sv.name}</b>\n"
            f"Вопросов: {len(qs)}. Нажмите на вопрос, чтобы удалить его.")
     if edit:
@@ -1265,9 +1272,9 @@ async def survey_q_add(c: CallbackQuery, state: FSMContext):
     survey_id = int(c.data.split(":")[1])
     await state.update_data(survey_id=survey_id, last_msg_id=c.message.message_id)
     await c.message.edit_text("Тип вопроса?", reply_markup=kb([
-        [("✏️ Свободный текст", f"survey_qtype:text"),
-         ("🔘 Варианты-кнопки", f"survey_qtype:choice")],
-        [("⬅️ Назад", f"survey:{survey_id}")],
+        [(f"{em('pencil')} Свободный текст", f"survey_qtype:text"),
+         (f"{em('gear')} Варианты-кнопки", f"survey_qtype:choice")],
+        [(f"{em('arrow_right')} Назад", f"survey:{survey_id}")],
     ]))
     await c.answer()
 
@@ -1411,7 +1418,7 @@ async def header(c: CallbackQuery, state: FSMContext):
         "Переменные: <code>{name}</code>, <code>{username}</code>, <code>{id}</code>, "
         "<code>{anon_id}</code> — можно все вместе или по одной.\n\n"
         "КАК шапка попадает в чат (отдельно/слитно/выкл) переключается кнопкой "
-        "«🏷 Шапка» в настройках.")
+        f"«{em('bookmark')} Шапка» в настройках.")
     await c.answer()
 
 
@@ -1451,7 +1458,7 @@ async def topicname(c: CallbackQuery, state: FSMContext):
         f"{em('pencil')} Пришлите шаблон имени топика.\n"
         "Переменные: <code>{name}</code>, <code>{username}</code>, <code>{id}</code>, "
         "<code>{anon_id}</code> — можно все вместе или по одной.\n"
-        "Пример: <code>✉️ {name} · {anon_id}</code>")
+        f"Пример: <code>{em('envelope')} {name} · {anon_id}</code>")
     await c.answer()
 
 
@@ -1495,7 +1502,9 @@ async def topicicon(c: CallbackQuery, state: FSMContext):
     await c.message.edit_text(
         f"{em('sparkles')} Пришлите premium-эмодзи для иконки топика (просто "
         "отправьте его как текст), или «-» чтобы убрать иконку.\n"
-        "<i>Иконка ставится только на НОВЫЕ топики — уже созданные не меняются.</i>")
+        "<i>Иконка ставится только на НОВЫЕ топики — уже созданные не меняются.\n"
+        "Telegram разрешает только определённый набор эмодзи для иконок топиков — "
+        "если ваш эмодзи не подойдёт, бот сообщит об этом.</i>")
     await c.answer()
 
 
@@ -1515,27 +1524,33 @@ async def topicicon_save(m: Message, state: FSMContext):
                 if e.type == "custom_emoji":
                     icon_id = e.custom_emoji_id
                     break
+        # БАГ: Telegram принимает в create_forum_topic только фиксированный
+        # набор эмодзи (getForumTopicIconStickers). Если передать произвольный
+        # custom_emoji_id, create_forum_topic бросает исключение — оно тихо
+        # перехватывается в open_ticket, топик не создаётся, и topic_id=None
+        # навсегда записывается в тикет → все сообщения летят в General.
+        # Теперь валидируем ID здесь, до сохранения.
+        if icon_id:
+            try:
+                allowed_stickers = await m.bot.get_forum_topic_icon_stickers()
+                allowed_ids = {s.custom_emoji_id for s in allowed_stickers
+                               if s.custom_emoji_id}
+                if icon_id not in allowed_ids:
+                    msg = await m.answer(
+                        f"{em('warn')} Этот эмодзи нельзя использовать как иконку топика — "
+                        "Telegram разрешает только специальный набор.\n"
+                        "Попробуйте другой или отправьте «-» чтобы убрать иконку.")
+                    await state.update_data(last_msg_id=msg.message_id)
+                    return
+            except Exception as e:
+                log.warning("topicicon_save: не удалось проверить список иконок (%s), "
+                            "сохраняю без валидации", e)
         obj.topic_icon_emoji_id = icon_id
         await s.commit()
     await state.clear()
-    await m.answer(f"{em('check')} Иконка топика сохранена!", reply_markup=nav_kb(data["bot_id"]))
+    label = f"{em('check')} Иконка топика сохранена!" if icon_id else f"{em('check')} Иконка топика убрана."
+    await m.answer(label, reply_markup=nav_kb(data["bot_id"]))
 
-
-@router.callback_query(F.data.startswith("richwelcome:"))
-async def richwelcome_toggle(c: CallbackQuery):
-    bot_id = int(c.data.split(":")[1])
-    cb, is_owner = await _access(bot_id, c.from_user.id)
-    if not cb or not is_owner:
-        await c.answer("Только владелец", show_alert=True); return
-    if not await _require_pro(c, cb.owner_id):
-        return
-    async with Session() as s:
-        obj = await s.get(ChildBot, bot_id)
-        obj.rich_welcome = not obj.rich_welcome
-        new_val = obj.rich_welcome
-        await s.commit()
-    await c.answer(f"{em('check')} Рич-текст: {'вкл' if new_val else 'выкл'}")
-    await bot_menu(c.model_copy(update={"data": f"bot:{bot_id}"}))
 
 
 @router.callback_query(F.data.startswith("template:"))
@@ -1602,10 +1617,10 @@ async def btns_menu(c: CallbackQuery):
     async with Session() as s:
         btns = (await s.scalars(select(BotButton).where(
             BotButton.bot_id == bot_id).order_by(BotButton.position))).all()
-    rows = [[(f"🗑 [{b.kind}] {b.text}", f"btndel:{bot_id}:{b.id}")] for b in btns]
-    rows.append([("➕ Добавить", f"btnadd:{bot_id}")])
-    rows.append([("⬅️ Назад", f"bot:{bot_id}")])
-    await c.message.edit_text("🔘 Кнопки и триггер-команды\n(нажмите чтобы удалить)",
+    rows = [[(f"{em('trash')} [{b.kind}] {b.text}", f"btndel:{bot_id}:{b.id}")] for b in btns]
+    rows.append([(f"{em('plus')} Добавить", f"btnadd:{bot_id}")])
+    rows.append([(f"{em('arrow_right')} Назад", f"bot:{bot_id}")])
+    await c.message.edit_text(f"{em('gear')} Кнопки и триггер-команды\n(нажмите чтобы удалить)",
                               reply_markup=kb(rows))
     await c.answer()
 
@@ -1635,7 +1650,7 @@ async def btnadd(c: CallbackQuery, state: FSMContext):
     await state.set_state(St.btn_kind)
     await state.update_data(bot_id=bot_id, last_msg_id=c.message.message_id)
     rows = [
-        [("🔗 Инлайн-ссылка", "bk:inline_url"), ("⚡️ Инлайн-триггер", "bk:inline_trigger")],
+        [(f"{em('link')} Инлайн-ссылка", "bk:inline_url"), (f"{em('zap')} Инлайн-триггер", "bk:inline_trigger")],
         [("⌨️ Кейборд-кнопка", "bk:keyboard"), ("/ Триггер-команда", "bk:command")],
     ]
     # НОВОЕ (по запросу): кнопки "открыть тему" и "запустить анкету" работают
@@ -1648,8 +1663,8 @@ async def btnadd(c: CallbackQuery, state: FSMContext):
         # быть несколько, каждая открывает СВОЁ, независимое обращение
         # (текст кнопки = название темы). Текст/фото, введённые на шаге
         # ответа, отправляются пользователю сразу при открытии.
-        rows.append([("✉️➕ Инлайн: открыть тему", "bk:inline_ticket"),
-                     ("✉️➕ Кейборд: открыть тему", "bk:keyboard_ticket")])
+        rows.append([(f"{em('envelope')}{em('plus')} Инлайн: открыть тему", "bk:inline_ticket"),
+                     (f"{em('envelope')}{em('plus')} Кейборд: открыть тему", "bk:keyboard_ticket")])
         # НОВОЕ (по запросу, п.5): кнопка-эффект "отказаться от админа" — по
         # нажатию просто присылает пользователю уведомление, что от него
         # отказались. Никаких других действий не совершает (не закрывает
@@ -1677,8 +1692,8 @@ async def btn_kind(c: CallbackQuery, state: FSMContext):
         if not surveys:
             await c.message.edit_text(
                 f"{em('warn')} У бота пока нет ни одной анкеты. Сначала создайте её: "
-                "⚙️ Настройки → «📋 Анкеты (вопросы)» → «➕ Добавить анкету».",
-                reply_markup=kb([[("⬅️ Назад", f"btnadd:{data['bot_id']}")]]))
+                f"{em('gear')} Настройки → «📋 Анкеты (вопросы)» → «{em('plus')} Добавить анкету».",
+                reply_markup=kb([[(f"{em('arrow_right')} Назад", f"btnadd:{data['bot_id']}")]]))
             await c.answer()
             return
         await state.set_state(St.btn_pick_survey)
@@ -1929,9 +1944,9 @@ async def tplbtn_menu(c: CallbackQuery):
         await c.answer("Только владелец", show_alert=True); return
     rows_data = json.loads(cb.template_buttons_json) if cb.template_buttons_json else []
     flat = [b for row in rows_data for b in row]
-    rows = [[(f"🗑 {b['text']}", f"tpldel:{bot_id}:{i}")] for i, b in enumerate(flat)]
-    rows.append([("➕ Добавить кнопку", f"tpladd:{bot_id}")])
-    rows.append([("⬅️ Назад", f"cfg:{bot_id}")])
+    rows = [[(f"{em('trash')} {b['text']}", f"tpldel:{bot_id}:{i}")] for i, b in enumerate(flat)]
+    rows.append([(f"{em('plus')} Добавить кнопку", f"tpladd:{bot_id}")])
+    rows.append([(f"{em('arrow_right')} Назад", f"cfg:{bot_id}")])
     await c.message.edit_text(
         f"{em('link')} Кнопки шаблона — добавляются к КАЖДОМУ посту "
         "автоматически (для конкретного поста источник кнопок можно "
@@ -2032,11 +2047,11 @@ async def admins_menu(c: CallbackQuery):
     async with Session() as s:
         admins = (await s.scalars(select(BotAdmin).where(
             BotAdmin.bot_id == bot_id))).all()
-    rows = [[(f"🗑 {a.user_id}", f"admdel:{bot_id}:{a.user_id}")] for a in admins]
-    rows.append([("➕ Добавить админа", f"admadd:{bot_id}")])
-    rows.append([("🚫 Забанить по ID", f"banid:{bot_id}")])
-    rows.append([("⬅️ Назад", f"bot:{bot_id}")])
-    await c.message.edit_text("👥 Доверенные администраторы\n"
+    rows = [[(f"{em('trash')} {a.user_id}", f"admdel:{bot_id}:{a.user_id}")] for a in admins]
+    rows.append([(f"{em('plus')} Добавить админа", f"admadd:{bot_id}")])
+    rows.append([(f"{em('prohibited')} Забанить по ID", f"banid:{bot_id}")])
+    rows.append([(f"{em('arrow_right')} Назад", f"bot:{bot_id}")])
+    await c.message.edit_text(f"{em('loudspeaker')} Доверенные администраторы\n"
                               "(доступ к рассылке, статистике и модерации)",
                               reply_markup=kb(rows))
     await c.answer()
@@ -2235,9 +2250,9 @@ async def bc_content(m: Message, state: FSMContext):
 
     text = "Кому разослать?"
     markup = kb([
-        [("👥 Всем пользователям", "bct:all")],
-        [("🔥 Активным (7 дней)", "bct:active")],
-        [("❌ Отмена", "main")]
+        [(f"{em('loudspeaker')} Всем пользователям", "bct:all")],
+        [(f"{em('fire')} Активным (7 дней)", "bct:active")],
+        [(f"{em('cross')} Отмена", "main")]
     ])
 
     try:
@@ -2276,12 +2291,12 @@ async def bc_go(c: CallbackQuery, state: FSMContext):
         media_bytes=base64.b64decode(media_b64) if media_b64 else None,
         media_filename=data.get("media_filename"),
         media_type=data["media_type"],
-        rich=(cb.rich_welcome and await referrals.is_pro(cb.owner_id)),
+        rich=(cb.welcome_is_rich and await referrals.is_pro(cb.owner_id)),
         progress_cb=progress)
     await msg.edit_text(
         f"{em('check')} <b>Рассылка завершена</b>\n\n"
-        f"Всего: {result['total']}\n✅ Доставлено: {result['sent']}\n"
-        f"🚫 Заблокировали бота: {result['blocked']}\n❌ Ошибки: {result['failed']}",
+        f"Всего: {result['total']}\n{em('check')} Доставлено: {result['sent']}\n"
+        f"{em('prohibited')} Заблокировали бота: {result['blocked']}\n{em('cross')} Ошибки: {result['failed']}",
         reply_markup=nav_kb(bot_id))
     await c.answer()
 
@@ -2313,11 +2328,11 @@ async def stats(c: CallbackQuery):
         if child_bot:
             balance = await get_star_balance(child_bot)
             if balance is not None:
-                star_line = f"\n\n⭐️ Баланс Stars: <b>{balance}</b>"
+                star_line = f"\n\n{em('star')} Баланс Stars: <b>{balance}</b>"
     await c.message.answer(f"{em('crown')} <b>Статистика по админам</b>\n\n{admin_stats}{star_line}",
-                           reply_markup=kb([[("🚫 Кто заблокировал бота", f"blockedlist:{bot_id}:0")],
-                                            [("🔁 Активные подписки", f"sublist:{bot_id}:0")],
-                                            [("⬅️ Назад", f"bot:{bot_id}")]]))
+                           reply_markup=kb([[(f"{em('prohibited')} Кто заблокировал бота", f"blockedlist:{bot_id}:0")],
+                                            [(f"{em('refresh')} Активные подписки", f"sublist:{bot_id}:0")],
+                                            [(f"{em('arrow_right')} Назад", f"bot:{bot_id}")]]))
 
 
 @router.callback_query(F.data.startswith("sublist:"))
@@ -2340,19 +2355,19 @@ async def sub_list(c: CallbackQuery):
     chunk = rows[page * per_page:(page + 1) * per_page]
     if not rows:
         text = f"{em('info')} Активных подписок нет."
-        rows_kb = [[("⬅️ Назад", f"stats:{bot_id}")]]
+        rows_kb = [[(f"{em('arrow_right')} Назад", f"stats:{bot_id}")]]
     else:
         text = f"{em('star')} <b>Активные подписки: {len(rows)}</b>"
-        rows_kb = [[(f"❌ Отменить {d.user_id} ({d.stars}⭐️/мес)", f"subcancel:{bot_id}:{d.id}")]
+        rows_kb = [[(f"{em('cross')} Отменить {d.user_id} ({d.stars}{em('star')}/мес)", f"subcancel:{bot_id}:{d.id}")]
                   for d in chunk]
         nav = []
         if page > 0:
-            nav.append((f"⬅️ Стр. {page}", f"sublist:{bot_id}:{page-1}"))
+            nav.append((f"{em('arrow_right')} Стр. {page}", f"sublist:{bot_id}:{page-1}"))
         if (page + 1) * per_page < len(rows):
-            nav.append((f"Стр. {page+2} ➡️", f"sublist:{bot_id}:{page+1}"))
+            nav.append((f"Стр. {page+2} {em('arrow_right')}", f"sublist:{bot_id}:{page+1}"))
         if nav:
             rows_kb.append(nav)
-        rows_kb.append([("⬅️ Назад", f"stats:{bot_id}")])
+        rows_kb.append([(f"{em('arrow_right')} Назад", f"stats:{bot_id}")])
     await c.message.edit_text(text, reply_markup=kb(rows_kb))
     await c.answer()
 
@@ -2410,10 +2425,10 @@ async def blocked_list(c: CallbackQuery):
                + "\n".join(lines))
     nav = []
     if page > 0:
-        nav.append((f"⬅️ Стр. {page}", f"blockedlist:{bot_id}:{page-1}"))
+        nav.append((f"{em('arrow_right')} Стр. {page}", f"blockedlist:{bot_id}:{page-1}"))
     if (page + 1) * per_page < len(rows):
-        nav.append((f"Стр. {page+2} ➡️", f"blockedlist:{bot_id}:{page+1}"))
-    rows_kb = ([nav] if nav else []) + [[("⬅️ Назад", f"stats:{bot_id}")]]
+        nav.append((f"Стр. {page+2} {em('arrow_right')}", f"blockedlist:{bot_id}:{page+1}"))
+    rows_kb = ([nav] if nav else []) + [[(f"{em('arrow_right')} Назад", f"stats:{bot_id}")]]
     await c.message.edit_text(text, reply_markup=kb(rows_kb))
     await c.answer()
 
@@ -2524,12 +2539,12 @@ async def ap_menu(c: CallbackQuery):
     await c.message.edit_text(
         f"{em('gear')} <b>Админ-панель платформы</b>",
         reply_markup=kb([
-            [("🤖 Все боты", "ap_bots:0")],
-            [("📊 Общая статистика", "ap_stats")],
+            [(f"{em('gear')} Все боты", "ap_bots:0")],
+            [(f"{em('chart')} Общая статистика", "ap_stats")],
             [("📢 Разослать во все боты", "ap_bc")],
             [("🌟 Активные Pro / выдать", "ap_pro_list:0")],
-            [("🚫 Бан в конструкторе", "ap_ban:0")],
-            [("⬅️ Назад", "main")],
+            [(f"{em('prohibited')} Бан в конструкторе", "ap_ban:0")],
+            [(f"{em('arrow_right')} Назад", "main")],
         ]))
     await c.answer()
 
@@ -2548,17 +2563,17 @@ async def ap_ban_menu(c: CallbackQuery):
         banned = (await s.scalars(select(PlatformUser).where(
             PlatformUser.is_banned == True).order_by(PlatformUser.banned_at.desc()))).all()
     chunk = banned[page * per_page:(page + 1) * per_page]
-    rows = [[(f"🚫 {u.id} — {(u.ban_reason or 'без причины')[:20]}", f"ap_unban:{u.id}")]
+    rows = [[(f"{em('prohibited')} {u.id} — {(u.ban_reason or 'без причины')[:20]}", f"ap_unban:{u.id}")]
             for u in chunk]
     nav = []
     if page > 0:
-        nav.append((f"⬅️ Стр. {page}", f"ap_ban:{page-1}"))
+        nav.append((f"{em('arrow_right')} Стр. {page}", f"ap_ban:{page-1}"))
     if (page + 1) * per_page < len(banned):
-        nav.append((f"Стр. {page+2} ➡️", f"ap_ban:{page+1}"))
+        nav.append((f"Стр. {page+2} {em('arrow_right')}", f"ap_ban:{page+1}"))
     if nav:
         rows.append(nav)
-    rows.append([("➕ Забанить по ID", "ap_ban_add")])
-    rows.append([("⬅️ Назад", "ap")])
+    rows.append([(f"{em('plus')} Забанить по ID", "ap_ban_add")])
+    rows.append([(f"{em('arrow_right')} Назад", "ap")])
     text = (f"{em('no_entry')} <b>Бан в конструкторе</b>\n"
            f"Забанено: {len(banned)}. Нажмите на запись, чтобы разбанить.")
     await c.message.edit_text(text, reply_markup=kb(rows))
@@ -2572,7 +2587,7 @@ async def ap_ban_add_start(c: CallbackQuery, state: FSMContext):
     await state.set_state(St.ap_ban_add)
     msg = await c.message.edit_text(
         f"{em('info')} Пришлите: <code>ID Причина</code> (причина необязательна)",
-        reply_markup=kb([[("⬅️ Назад", "ap_ban:0")]]))
+        reply_markup=kb([[(f"{em('arrow_right')} Назад", "ap_ban:0")]]))
     await state.update_data(last_msg_id=msg.message_id)
     await c.answer()
 
@@ -2593,7 +2608,7 @@ async def ap_ban_add_save(m: Message, state: FSMContext):
     await state.clear()
     c_fake_data = "ap_ban:0"
     msg = await m.answer(f"{em('check')} Пользователь {user_id} забанен в конструкторе.",
-                         reply_markup=kb([[("⬅️ К списку", c_fake_data)]]))
+                         reply_markup=kb([[(f"{em('arrow_right')} К списку", c_fake_data)]]))
 
 
 @router.callback_query(F.data.startswith("ap_unban:"))
@@ -2616,17 +2631,17 @@ async def ap_bots(c: CallbackQuery):
     async with Session() as s:
         all_bots = (await s.scalars(select(ChildBot).order_by(ChildBot.id))).all()
     chunk = all_bots[page * per_page:(page + 1) * per_page]
-    rows = [[(f"{'🟢' if b.is_active else '🔴'} @{b.username} ({b.bot_type.value})",
+    rows = [[(f"{'{em('green')}' if b.is_active else '{em('red')}'} @{b.username} ({b.bot_type.value})",
              f"bot:{b.id}")] for b in chunk]
     nav = []
     if page > 0:
-        nav.append((f"⬅️ Стр. {page}", f"ap_bots:{page-1}"))
+        nav.append((f"{em('arrow_right')} Стр. {page}", f"ap_bots:{page-1}"))
     if (page + 1) * per_page < len(all_bots):
-        nav.append((f"Стр. {page+2} ➡️", f"ap_bots:{page+1}"))
+        nav.append((f"Стр. {page+2} {em('arrow_right')}", f"ap_bots:{page+1}"))
     if nav:
         rows.append(nav)
-    rows.append([("⬅️ Назад", "ap")])
-    await c.message.edit_text(f"🤖 Все боты платформы ({len(all_bots)}):",
+    rows.append([(f"{em('arrow_right')} Назад", "ap")])
+    await c.message.edit_text(f"{em('gear')} Все боты платформы ({len(all_bots)}):",
                               reply_markup=kb(rows))
     await c.answer()
 
@@ -2642,9 +2657,9 @@ async def ap_stats(c: CallbackQuery):
     posting_n = sum(1 for b in bots if b.bot_type == BotType.posting)
     await c.message.edit_text(
         f"{em('chart')} <b>Статистика платформы</b>\n\n"
-        f"Всего ботов: {len(bots)}\n🟢 Активны: {active}\n🔴 Остановлены: {len(bots) - active}\n\n"
-        f"💬 Фидбек-ботов: {feedback_n}\n📣 Постинг-ботов: {posting_n}",
-        reply_markup=kb([[("⬅️ Назад", "ap")]]))
+        f"Всего ботов: {len(bots)}\n{em('green')} Активны: {active}\n{em('red')} Остановлены: {len(bots) - active}\n\n"
+        f"{em('speech')} Фидбек-ботов: {feedback_n}\n{em('megaphone')} Постинг-ботов: {posting_n}",
+        reply_markup=kb([[(f"{em('arrow_right')} Назад", "ap")]]))
     await c.answer()
 
 
@@ -2662,9 +2677,9 @@ async def ap_bc_start(c: CallbackQuery, state: FSMContext):
         f"{em('megaphone')} Включать в рассылку боты, чьи владельцы — "
         "Pro-подписчики? (обычно у Pro реклама/рассылки в ботах отключены)",
         reply_markup=kb([
-            [("✅ Включая Pro-ботов", "ap_bc_pro:1")],
-            [("🚫 Без Pro-ботов", "ap_bc_pro:0")],
-            [("❌ Отмена", "ap")],
+            [(f"{em('check')} Включая Pro-ботов", "ap_bc_pro:1")],
+            [(f"{em('prohibited')} Без Pro-ботов", "ap_bc_pro:0")],
+            [(f"{em('cross')} Отмена", "ap")],
         ]))
     await c.answer()
 
@@ -2735,7 +2750,7 @@ async def ap_bc_content(m: Message, state: FSMContext):
     await msg.edit_text(
         f"{em('check')} <b>Готово</b>\nБотов: {len(bots)}"
         f"{f' (пропущено Pro-ботов: {skipped_pro})' if skipped_pro else ''}\n"
-        f"Получателей всего: {total}\n✅ Доставлено: {sent}\n❌ Ошибки: {failed}")
+        f"Получателей всего: {total}\n{em('check')} Доставлено: {sent}\n{em('cross')} Ошибки: {failed}")
 
 
 @router.callback_query(F.data == "ap_pro")
@@ -2750,7 +2765,7 @@ async def ap_pro_start(c: CallbackQuery, state: FSMContext):
     await c.message.edit_text(
         f"{em('sparkles')} Введите Telegram ID пользователя, которому нужно "
         "выдать/продлить Pro:",
-        reply_markup=kb([[("❌ Отмена", "ap")]]))
+        reply_markup=kb([[(f"{em('cross')} Отмена", "ap")]]))
     await c.answer()
 
 
@@ -2794,7 +2809,7 @@ async def ap_pro_days_save(m: Message, state: FSMContext):
              if pu.pro_until and pu.pro_until > datetime.utcnow()
              else "Pro не активен")
     await m.answer(f"{em('check')} Готово. Пользователь <code>{user_id}</code>: {status}",
-                   reply_markup=kb([[("⬅️ В админ-панель", "ap")]]))
+                   reply_markup=kb([[(f"{em('arrow_right')} В админ-панель", "ap")]]))
     # уведомляем самого пользователя, если это возможно (не роняем, если он
     # заблокировал master-бота или ещё ни разу не запускал его)
     if days > 0:
@@ -2834,13 +2849,13 @@ async def ap_pro_list(c: CallbackQuery):
              f"ap_pro_edit:{u.id}")] for u in chunk]
     nav = []
     if page > 0:
-        nav.append((f"⬅️ Стр. {page}", f"ap_pro_list:{page-1}"))
+        nav.append((f"{em('arrow_right')} Стр. {page}", f"ap_pro_list:{page-1}"))
     if (page + 1) * per_page < len(users):
-        nav.append((f"Стр. {page+2} ➡️", f"ap_pro_list:{page+1}"))
+        nav.append((f"Стр. {page+2} {em('arrow_right')}", f"ap_pro_list:{page+1}"))
     if nav:
         rows.append(nav)
-    rows.append([("➕ Выдать/продлить Pro", "ap_pro")])
-    rows.append([("⬅️ Назад", "ap")])
+    rows.append([(f"{em('plus')} Выдать/продлить Pro", "ap_pro")])
+    rows.append([(f"{em('arrow_right')} Назад", "ap")])
     text = (f"{em('sparkles')} <b>Активные Pro-подписки</b>\n\n"
            f"Сейчас активна у {len(users)} пользователей."
            if users else f"{em('sparkles')} Сейчас ни у кого нет активной Pro-подписки.")
@@ -2914,15 +2929,15 @@ async def ad_approve(c: CallbackQuery):
             obj.payment_id = payment_id
             await s.commit()
         pay_kb = InlineKeyboardMarkup(inline_keyboard=[[
-            styled_button(f"💳 Оплатить {ad.price_rub} ₽", url=url)]])
+            styled_button(f"{em('money_wings')} Оплатить {ad.price_rub} ₽", url=url)]])
         await _notify_ad_buyer(
             ad, f"{em('check')} Ваша заявка №{ad.id} одобрена!\n"
                f"Формат: {kind_label}\nК оплате: {ad.price_rub} ₽\n\n"
                "После оплаты реклама автоматически запустится.", pay_kb)
-        await _append_to_message(c, "\n\n✅ Одобрено, ссылка на оплату отправлена.")
+        await _append_to_message(c, f"\n\n{em('check')} Одобрено, ссылка на оплату отправлена.")
     except RuntimeError as e:
         # ЮKassa не настроена (нет ключей) — сообщаем админу прямо в чате
-        await _append_to_message(c, f"\n\n⚠️ {e}")
+        await _append_to_message(c, f"\n\n{em('warn')} {e}")
     await c.answer()
 
 
@@ -2933,7 +2948,7 @@ async def ad_reject(c: CallbackQuery, state: FSMContext):
     ad_id = int(c.data.split(":")[1])
     await state.set_state(St.ad_reject_reason)
     await state.update_data(ad_id=ad_id, last_msg_id=c.message.message_id)
-    await _append_to_message(c, "\n\n✏️ Укажите причину отклонения (или отправьте «-»):")
+    await _append_to_message(c, f"\n\n{em('pencil')} Укажите причину отклонения (или отправьте «-»):")
     await c.answer()
 
 
@@ -2962,15 +2977,15 @@ async def ad_reject_reason(m: Message, state: FSMContext):
 async def ads_start(m: Message, state: FSMContext):
     await state.clear()
     await state.set_state(St.ads_pick_kind)
-    rows = [[("🎯 Показы в конкретном боте", "adk:impr")],
-           [("🌐 Показы ВО ВСЕХ ботах платформы", "adk:allbots")]]
+    rows = [[(f"{em('flag')} Показы в конкретном боте", "adk:impr")],
+           [(f"{em('globe')} Показы ВО ВСЕХ ботах платформы", "adk:allbots")]]
     cd = await ads_service.cooldown_remaining(m.from_user.id)
     if cd:
         days = cd.days + (1 if cd.seconds else 0)
         rows.append([(f"📢 Рассылка (доступна через {days} дн.)", "adk:cd")])
     else:
         rows.append([(f"📢 Рассылка во все боты ({ads_service.BROADCAST_PRICE_RUB} ₽)", "adk:bcast")])
-    rows.append([("🎯 Мои кампании", "adcab:0")])
+    rows.append([(f"{em('flag')} Мои кампании", "adcab:0")])
     await m.answer(
         f"{em('megaphone')} <b>Покупка рекламы</b>\n\nВыберите формат:",
         reply_markup=kb(rows))
@@ -3013,12 +3028,12 @@ async def _show_bot_picker(c: CallbackQuery, page: int):
         await c.message.edit_text(f"{em('warn')} Пока нет ни одного активного бота "
                                   "на платформе для размещения рекламы.")
         return
-    rows = [[(f"🤖 @{b.username}", f"adbot:{b.id}")] for b in chunk]
+    rows = [[(f"{em('gear')} @{b.username}", f"adbot:{b.id}")] for b in chunk]
     nav = []
     if page > 0:
-        nav.append(("⬅️", f"adbotpage:{page-1}"))
+        nav.append((f"{em('arrow_right')}", f"adbotpage:{page-1}"))
     if (page + 1) * per_page < len(bots):
-        nav.append(("➡️", f"adbotpage:{page+1}"))
+        nav.append((f"{em('arrow_right')}", f"adbotpage:{page+1}"))
     if nav:
         rows.append(nav)
     await c.message.edit_text(
@@ -3090,12 +3105,12 @@ async def ads_text(m: Message, state: FSMContext):
                     f"Повторная покупка — не раньше чем через "
                     f"{AD_BROADCAST_COOLDOWN_DAYS} дней.\n\nОтправить на модерацию?")
         await m.answer(text_conf, reply_markup=kb([[
-            ("✅ Отправить", "adc:send"), ("❌ Отмена", "adc:cancel")]]))
+            (f"{em('check')} Отправить", "adc:send"), (f"{em('cross')} Отмена", "adc:cancel")]]))
         return
     await state.set_state(St.ads_confirm)
     rows = [[(f"{n} показов — {ads_service.price_for_impressions(n)} ₽", f"adi:{n}")]
            for n in ads_service.TARIFF_PRESETS]
-    rows.append([("✏️ Своё число показов", "adi:custom")])
+    rows.append([(f"{em('pencil')} Своё число показов", "adi:custom")])
     await m.answer("Выберите тариф (чем больше показов — тем дешевле цена за сотню):",
                    reply_markup=kb(rows))
 
@@ -3147,7 +3162,7 @@ async def _ads_confirm_impressions(m: Message, state: FSMContext, n: int, edit=F
     scope = "ВО ВСЕХ ботах платформы" if data.get("target_bot_id") is None else "выбранного бота"
     text = (f"{em('info')} Объявление: {n} показов в стартовых сообщениях "
            f"{scope}.\nЦена: <b>{price} ₽</b>\n\nОтправить на модерацию?")
-    markup = kb([[("✅ Отправить", "adc:send"), ("❌ Отмена", "adc:cancel")]])
+    markup = kb([[(f"{em('check')} Отправить", "adc:send"), (f"{em('cross')} Отмена", "adc:cancel")]])
     if edit:
         await m.edit_text(text, reply_markup=markup)
     else:
@@ -3189,8 +3204,8 @@ async def ads_send(c: CallbackQuery, state: FSMContext):
 # ======================   Рекламный кабинет   ===========================
 # =========================================================================
 _AD_STATUS_LABEL = {
-    "pending": "⏳ на модерации", "rejected": "❌ отклонено",
-    "awaiting_payment": "💳 ждёт оплаты", "active": "🟢 активна",
+    "pending": "⏳ на модерации", "rejected": f"{em('cross')} отклонено",
+    "awaiting_payment": f"{em('money_wings')} ждёт оплаты", "active": f"{em('green')} активна",
     "finished": "🏁 показы закончились",
 }
 
@@ -3209,30 +3224,30 @@ async def ads_cabinet(c: CallbackQuery):
     chunk = ads[page * per_page:(page + 1) * per_page]
     if not ads:
         text = f"{em('info')} У вас пока нет рекламных кампаний. Создать — /ads."
-        rows = [[("⬅️ Назад", "adcab_back")]]
+        rows = [[(f"{em('arrow_right')} Назад", "adcab_back")]]
     else:
         lines = [f"{em('coin')} Всего потрачено: <b>{spent} ₽</b>\n"]
         rows = []
         for ad in chunk:
-            kind = "🌐 все боты" if (ad.kind == AdKind.impressions and ad.source_bot_id is None) \
-                else ("📢 рассылка" if ad.kind == AdKind.broadcast else "🎯 конкретный бот")
+            kind = f"{em('globe')} все боты" if (ad.kind == AdKind.impressions and ad.source_bot_id is None) \
+                else ("📢 рассылка" if ad.kind == AdKind.broadcast else f"{em('flag')} конкретный бот")
             progress = f" ({ad.shown_count}/{ad.target_impressions})" if ad.kind == AdKind.impressions else ""
             lines.append(f"№{ad.id} · {kind}{progress} · {_AD_STATUS_LABEL.get(ad.status.value, ad.status.value)}\n"
                         f"«{_plain_preview(ad.text, 60)}» · {ad.price_rub} ₽")
             row = []
             if ad.kind == AdKind.impressions and ad.status == AdStatus.finished:
-                row.append((f"🔁 Продлить №{ad.id}", f"adext:{ad.id}"))
+                row.append((f"{em('refresh')} Продлить №{ad.id}", f"adext:{ad.id}"))
             if row:
                 rows.append(row)
         text = "\n\n".join(lines)
         nav = []
         if page > 0:
-            nav.append((f"⬅️ Стр. {page}", f"adcab:{page-1}"))
+            nav.append((f"{em('arrow_right')} Стр. {page}", f"adcab:{page-1}"))
         if (page + 1) * per_page < len(ads):
-            nav.append((f"Стр. {page+2} ➡️", f"adcab:{page+1}"))
+            nav.append((f"Стр. {page+2} {em('arrow_right')}", f"adcab:{page+1}"))
         if nav:
             rows.append(nav)
-        rows.append([("⬅️ Назад", "adcab_back")])
+        rows.append([(f"{em('arrow_right')} Назад", "adcab_back")])
     await c.message.edit_text(text, reply_markup=kb(rows))
     await c.answer()
 
@@ -3270,7 +3285,7 @@ async def _notify_super_admin(ad: Advertisement):
     text = (f"{em('megaphone')} <b>Новая заявка на рекламу №{ad.id}</b>\n\n"
            f"От: <code>{ad.buyer_id}</code>\nФормат: {kind_label}\n"
            f"Цена: {ad.price_rub} ₽\n\n<b>Текст:</b>\n{ad.text}")
-    markup = kb([[("✅ Принять", f"ad_ok:{ad.id}"), ("❌ Отклонить", f"ad_no:{ad.id}")]])
+    markup = kb([[(f"{em('check')} Принять", f"ad_ok:{ad.id}"), (f"{em('cross')} Отклонить", f"ad_no:{ad.id}")]])
     master = Bot(MASTER_BOT_TOKEN)
     try:
         # БАГ: медиа заявки с видео/гифкой терялись — суперадмин видел только
@@ -3291,4 +3306,3 @@ async def _notify_super_admin(ad: Advertisement):
         pass
     finally:
         await master.session.close()
-
