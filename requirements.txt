@@ -1,0 +1,12 @@
+
+# НОВОЕ: подписки на донат (subscription-события), рич-сообщения
+# (send_rich_message) и getMyStarBalance — совсем свежие методы Bot API,
+# нужна свежая aiogram с их типизацией.
+aiogram>=3.28
+SQLAlchemy[asyncio]>=2.0
+asyncpg>=0.29
+Pillow>=10.0
+python-dotenv>=1.0
+yookassa>=3.5
+cryptography>=42.0
+
