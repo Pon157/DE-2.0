@@ -1,3 +1,4 @@
+
 # db/base.py
 import logging
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
@@ -167,7 +168,7 @@ async def init_db():
     for stmt in (
         "ALTER TABLE bot_buttons ADD COLUMN IF NOT EXISTS style VARCHAR(16)",
         "ALTER TABLE posts ADD COLUMN IF NOT EXISTS buttons_json TEXT",
-        f"ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS ticket_button_text VARCHAR(64) DEFAULT '{em('envelope')} Открыть обращение'",
+        "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS ticket_button_text VARCHAR(64) DEFAULT '✉️ Открыть обращение'",
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS ticket_button_style VARCHAR(16)",
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS ticket_button_icon VARCHAR(32)",
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS always_new_ticket BOOLEAN DEFAULT false",
@@ -184,7 +185,7 @@ async def init_db():
         "ALTER TABLE suggestions ADD COLUMN IF NOT EXISTS origin_message_ids TEXT",
         # Режим шапки (отдельно/слитно/выкл) и настраиваемое имя топика
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS header_mode VARCHAR(16) DEFAULT 'separate'",
-        f"ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS topic_name_template TEXT DEFAULT '{em('envelope')} {name} · {id}'",
+        "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS topic_name_template TEXT DEFAULT '✉️ {name} · {id}'",
         # id исходного сообщения юзера — reply-контекст и зеркалирование реакций
         "ALTER TABLE msg_map ADD COLUMN IF NOT EXISTS user_chat_msg_id BIGINT",
         # Источник кнопок поста (шаблон/свои/оба/без)
@@ -233,7 +234,7 @@ async def init_db():
         "ALTER TABLE child_bots ALTER COLUMN token TYPE VARCHAR(512)",
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS token_fingerprint VARCHAR(64)",
         # кнопка самостоятельного закрытия обращения пользователем (reply-клавиатура)
-        f"ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS close_ticket_button_text VARCHAR(64) DEFAULT '{em('cross')} Закрыть обращение'",
+        "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS close_ticket_button_text VARCHAR(64) DEFAULT '❌ Закрыть обращение'",
         "ALTER TABLE advertisements ADD COLUMN IF NOT EXISTS extends_ad_id INTEGER",
         # закреплять ли первое сообщение обращения в админ-чате (только вне топиков)
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS pin_first_message BOOLEAN DEFAULT false",
@@ -251,11 +252,11 @@ async def init_db():
         "ALTER TYPE bottype ADD VALUE IF NOT EXISTS 'survey'",
         # ---- п.3: настраиваемый/удаляемый текст закрытия обращения ----
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS close_notify_text TEXT "
-        f"DEFAULT '{em('lock')} Обращение закрыто администрацией. Ваше новое сообщение откроет новое обращение.'",
+        "DEFAULT '🔒 Обращение закрыто администрацией. Ваше новое сообщение откроет новое обращение.'",
         # ---- п.5: кнопка "отказаться от админа" (текст сообщения-эффекта) ----
         "ALTER TABLE bot_buttons ADD COLUMN IF NOT EXISTS disown_text TEXT",
         # ---- п.6: настраиваемая/отключаемая реакция на сообщение админа ----
-        f"ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS admin_reply_reaction VARCHAR(16) DEFAULT '{em('thumb_up')}'",
+        "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS admin_reply_reaction VARCHAR(16) DEFAULT '👍'",
         # ---- стили/premium-эмодзи (Bot API 9.4) на кнопке "Закрыть обращение" и кнопке доната ----
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS close_ticket_button_style VARCHAR(16)",
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS close_ticket_button_icon VARCHAR(32)",
@@ -284,10 +285,6 @@ async def init_db():
         "ALTER TABLE donations ADD COLUMN IF NOT EXISTS telegram_payment_charge_id VARCHAR(128)",
         "ALTER TABLE donations ADD COLUMN IF NOT EXISTS subscription_expiration TIMESTAMP",
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS rich_welcome BOOLEAN DEFAULT FALSE",
-        # welcome_is_rich — автоматический флаг: True если текст приветствия
-        # был реально набран в рич-режиме Telegram (тумблер убран, ставится
-        # сам при сохранении приветствия через master/router.py::welcome_save).
-        "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS welcome_is_rich BOOLEAN DEFAULT FALSE",
     ):
         await _exec(stmt)
 
