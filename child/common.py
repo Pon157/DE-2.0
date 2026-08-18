@@ -1,4 +1,3 @@
-
 import asyncio
 import hashlib
 import logging
@@ -364,13 +363,13 @@ async def build_keyboards(bot_db_id: int, cfg: ChildBot, extra_inline: list | No
 
 
 async def welcome_pro_kwargs(cfg: ChildBot) -> dict:
-    """НОВОЕ: эффект приветствия и рич-текст — Pro-функции (гейт по
-    referrals.is_pro(cfg.owner_id), та же логика, что и для иконки топика).
-    Если Pro не активен (или уже истёк) — молча отдаём обычное приветствие,
-    ничего не ломая."""
+    """Эффект приветствия — Pro-функция. Рич-текст теперь НЕ управляется
+    тумблером: если владелец ставит приветствие через send_rich_message —
+    оно уходит рич-форматом автоматически (гейт по is_pro на уровне
+    send_with_keyboards). Тут возвращаем только effect_id."""
     if not await referrals.is_pro(cfg.owner_id):
         return {}
-    return {"effect_id": cfg.welcome_effect_id, "rich": cfg.rich_welcome}
+    return {"effect_id": cfg.welcome_effect_id}
 
 
 async def send_with_keyboards(m: Message, text: str, ikb, rkb, photo: str | None = None,
@@ -389,16 +388,11 @@ async def send_with_keyboards(m: Message, text: str, ikb, rkb, photo: str | None
     поддерживается не для всех типов вложений) — тихо шлём без эффекта, не
     роняя приветствие целиком.
 
-    rich — НОВОЕ: send_rich_message (Bot API 10.1, июнь 2026, Pro-функция —
-    гейт по referrals.is_pro уже сделан на уровне вызывающего кода, здесь
-    просто исполняем). Рич-сообщения — отдельный метод API с собственным
-    (более широким, чем обычная HTML-разметка сообщений) диалектом: помимо
-    обычных <b>/<i>/<blockquote> и т.п. поддерживает заголовки, разделители,
-    врезки-цитаты и т.д. — их можно просто дописать в текст приветствия
-    вручную (см. https://core.telegram.org/bots/api#rich-message-formatting-options),
-    ничего парсить самим не нужно, Telegram сам разберёт HTML. Комбинация
-    рич-сообщения с фото/эффектом Bot API не поддерживает — в этом случае
-    рич-режим тихо игнорируется и используется обычная отправка.
+    rich — УДАЛЕНО как явный параметр: рич-текст теперь включается
+    автоматически если владелец — Pro и нет фото (Bot API не поддерживает
+    рич+фото). Передаётся как True только при явном вызове из кода, где
+    уже проверен Pro. Комбинация рич-сообщения с фото/эффектом Bot API
+    не поддерживает — рич-режим тихо игнорируется в этом случае.
 
     БАГ из прод-логов ("wrong file identifier/HTTP URL specified"):
     file_id в Telegram привязан к конкретному боту, которым он был получен.
@@ -468,14 +462,14 @@ async def send_rich_or_plain(m: Message, text: str, reply_markup=None) -> Messag
 
 
 async def rich_enabled(bot_db_id: int | None, cfg: ChildBot | None = None) -> bool:
-    """Включён ли рич-текст для этого бота — Pro-функция (см. cmd_pro /
-    referrals.is_pro), гейтится и в настройках, и здесь в рантайме, на
-    случай если Pro истёк уже после включения тумблера."""
+    """Доступен ли рич-текст для этого бота — только Pro-функция.
+    Тумблер rich_welcome убран: рич включается автоматически для Pro-ботов,
+    не требует ручного переключения. Здесь только проверяем is_pro."""
     if cfg is None:
         if bot_db_id is None:
             return False
         cfg = await get_cfg(bot_db_id)
-    if not cfg or not cfg.rich_welcome:
+    if not cfg:
         return False
     return await referrals.is_pro(cfg.owner_id)
 
@@ -628,12 +622,26 @@ async def open_ticket(bot: Bot, cfg: ChildBot, user_id: int,
                 username=(u.username if u else None),
                 subject=subject)
             try:
-                icon = (cfg.topic_icon_emoji_id if await referrals.is_pro(cfg.owner_id)
-                       else None)
-                topic = await bot.create_forum_topic(
-                    cfg.admin_chat_id, topic_name,
-                    icon_custom_emoji_id=icon or None)
+                # БАГ: передача icon_custom_emoji_id в create_forum_topic
+                # вызывала ошибку "TOPIC_ICON_INVALID" для некоторых эмодзи —
+                # при этом исключение ловилось и topic_id оставался None,
+                # из-за чего message_thread_id не передавался и сообщения
+                # уходили в General вместо топика (без ошибок в логах).
+                # Исправление: сначала создаём топик БЕЗ иконки, потом
+                # пробуем задать иконку отдельно (edit_forum_topic) — если
+                # иконка не поддерживается, топик всё равно создан и будет
+                # работать корректно.
+                topic = await bot.create_forum_topic(cfg.admin_chat_id, topic_name)
                 topic_id = topic.message_thread_id
+                # Иконку ставим отдельно — ошибка тут не ломает топик
+                if await referrals.is_pro(cfg.owner_id) and cfg.topic_icon_emoji_id:
+                    try:
+                        await bot.edit_forum_topic(
+                            cfg.admin_chat_id, topic_id,
+                            icon_custom_emoji_id=cfg.topic_icon_emoji_id)
+                    except Exception as icon_err:
+                        log.warning("Bot %s: не удалось задать иконку топика (%s) — "
+                                    "топик создан без иконки", cfg.id, icon_err)
             except Exception as e:
                 log.warning("Bot %s: create_forum_topic failed (%s) — "
                             "продолжаю без топика", cfg.id, e)
@@ -1086,19 +1094,33 @@ def build_common_router() -> Router:
         if not 1 <= stars <= limit:
             await m.answer(f"{em('warn')} Число должно быть от 1 до {limit}.")
             return
-        kwargs = {}
-        if kind == "sub":
-            # subscription_period — фиксированное значение Bot API для Stars-
-            # подписок (30 дней = 2592000 секунд), другого сейчас не задать.
-            kwargs["subscription_period"] = 2592000
         try:
-            await bot.send_invoice(
-                chat_id=m.chat.id,
-                title="Подписка" if kind == "sub" else "Донат",
-                description=(f"Ежемесячная подписка на {stars} ⭐️" if kind == "sub"
-                             else f"Поддержка на {stars} ⭐️"),
-                payload=f"donate:{kind}:{stars}", currency="XTR",
-                prices=[LabeledPrice(label=f"{stars} Stars", amount=stars)], **kwargs)
+            if kind == "sub":
+                # subscription_period не поддерживается в aiogram напрямую —
+                # отправляем через сырой HTTP-запрос к Bot API.
+                import aiohttp, json as _json
+                payload_raw = {
+                    "chat_id": m.chat.id,
+                    "title": "Подписка",
+                    "description": f"Ежемесячная подписка на {stars} ⭐️",
+                    "payload": f"donate:sub:{stars}",
+                    "currency": "XTR",
+                    "prices": _json.dumps([{"label": f"{stars} Stars", "amount": stars}]),
+                    "subscription_period": 2592000,  # 30 дней
+                }
+                url = f"https://api.telegram.org/bot{bot.token}/sendInvoice"
+                async with aiohttp.ClientSession() as sess:
+                    async with sess.post(url, data=payload_raw) as resp:
+                        result = await resp.json()
+                if not result.get("ok"):
+                    raise RuntimeError(result.get("description", "unknown error"))
+            else:
+                await bot.send_invoice(
+                    chat_id=m.chat.id,
+                    title="Донат",
+                    description=f"Поддержка на {stars} ⭐️",
+                    payload=f"donate:one:{stars}", currency="XTR",
+                    prices=[LabeledPrice(label=f"{stars} Stars", amount=stars)])
         except Exception as e:
             log.warning("donate_amount: не удалось выставить счёт (kind=%s) для бота %s: %s",
                         kind, bot_db_id, e)
