@@ -1,4 +1,3 @@
-
 import asyncio
 import logging
 import uuid
@@ -53,8 +52,18 @@ class BotManager:
     async def start_all(self):
         async with Session() as s:
             rows = (await s.scalars(select(ChildBot).where(ChildBot.is_active))).all()
-        for cb in rows:
-            await self.start_bot(cb)
+        # Запускаем ботов пачками по STARTUP_BATCH_SIZE с паузой между пачками.
+        # Без этого при большом числе ботов все разом бьются в Telegram API
+        # с get_me()/delete_webhook() → получаем шквал 502 Bad Gateway,
+        # которые роняют start_polling() ещё до первого getUpdates.
+        STARTUP_BATCH_SIZE = 5
+        STARTUP_BATCH_DELAY = 1.5  # сек между пачками
+        for i in range(0, len(rows), STARTUP_BATCH_SIZE):
+            batch = rows[i:i + STARTUP_BATCH_SIZE]
+            await asyncio.gather(*(self.start_bot(cb) for cb in batch),
+                                 return_exceptions=True)
+            if i + STARTUP_BATCH_SIZE < len(rows):
+                await asyncio.sleep(STARTUP_BATCH_DELAY)
 
     async def start_bot(self, cb: ChildBot):
         async with self._lock(cb.id):
@@ -487,4 +496,3 @@ async def reupload_media_for_bot(source_bot: Bot, bot_id: int, file_id: str,
         log.warning("reupload_media_for_bot: не удалось перенести file_id (%s) для "
                     "бота %s: %s", media_type, bot_id, e)
         return None
-
