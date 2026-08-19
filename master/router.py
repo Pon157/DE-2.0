@@ -177,7 +177,6 @@ class St(StatesGroup):
     set_header = State()
     set_template = State()
     set_topic_name = State()
-    set_topic_icon = State()
     set_welcome_effect = State()
     add_admin = State()
     btn_kind = State()
@@ -579,9 +578,9 @@ async def bot_menu(c: CallbackQuery):
 def _pro_guide_block() -> str:
     return (
         f"\n\n{em('sparkles')} <b>Pro-функции этого бота</b> (/pro у владельца):\n"
-        f"• {em('link')} Иконка форум-топика (premium-эмодзи)\n"
         f"• {em('star')} Эффект на приветственном сообщении\n"
-        f"• {em('sparkles')} Рич-текст приветствия (заголовки/разделители/врезки — новый формат)\n"
+        f"• {em('sparkles')} Рич-текст приветствия (заголовки/разделители/врезки — новый формат, "
+        "тумблер «Рич-текст» в настройках)\n"
         f"• {em('refresh')} Ежемесячная Stars-подписка на донат — не только разово; пользователь "
         "может отменить сам через /unsubscribe, владелец — через "
         "«📊 Статистика → 🔁 Активные подписки»."
@@ -670,7 +669,7 @@ async def cfg_menu(c: CallbackQuery):
             [("✉️ Открытие обращений: " + cb.open_mode.value, f"cyc_open:{bot_id}")],
             [(f"📨 Пересылка сообщений в чат админов: {cb.forward_mode.value}", f"cyc_fwd:{bot_id}")],
             [("🧵 Топики: " + ("вкл" if cb.use_topics else "выкл"), f"cyc_topics:{bot_id}"),
-             ("🧵 Имя топика", f"topicname:{bot_id}"), ("🧵 Иконка топика", f"topicicon:{bot_id}")],
+             ("🧵 Имя топика", f"topicname:{bot_id}"), ("Цвет топика", f"topicicon:{bot_id}")],
             [(f"📌 Закреп 1-го сообщения (без топиков): {'вкл' if cb.pin_first_message else 'выкл'}",
               f"cyc_pinfirst:{bot_id}")],
             [("👋 Приветствие", f"welcome:{bot_id}"),
@@ -838,9 +837,17 @@ MESSAGE_EFFECTS = [
     ("🔥 Огонь", "5104841245755180586"),
     ("👍 Лайк", "5107584321108051014"),
     ("👎 Дизлайк", "5104858069142078462"),
-    ("❤️ Сердце", "5044134455711629726"),
     ("🎉 Салют", "5046509860389126442"),
     ("💩 Куча", "5046589136895476101"),
+]
+TOPIC_COLORS = [
+    ("🔵 Синий",    0x6FB9F0),
+    ("🟡 Жёлтый",  0xFFD67E),
+    ("🟣 Фиолетовый", 0xCB86DB),
+    ("🟢 Зелёный",  0x8EEE98),
+    ("🩷 Розовый",  0xFF93B2),
+    ("🔴 Красный",  0xFB6F5F),
+    ("🟠 Оранжевый", 0xFFB347),
 ]
 
 
@@ -1482,42 +1489,37 @@ async def topicname_save(m: Message, state: FSMContext):
 # --- НОВОЕ: иконка форум-топика (premium-эмодзи, create_forum_topic +
 # icon_custom_emoji_id, Bot API 9.4+) — Pro-функция ---
 @router.callback_query(F.data.startswith("topicicon:"))
-async def topicicon(c: CallbackQuery, state: FSMContext):
+async def topicicon(c: CallbackQuery):
     bot_id = int(c.data.split(":")[1])
     cb, is_owner = await _access(bot_id, c.from_user.id)
     if not cb or not is_owner:
         await c.answer("Только владелец", show_alert=True); return
-    if not await _require_pro(c, cb.owner_id):
-        return
-    await state.set_state(St.set_topic_icon)
-    await state.update_data(bot_id=bot_id, last_msg_id=c.message.message_id)
+    rows = [[(label, f"settopiccolor:{bot_id}:{color}")] for label, color in TOPIC_COLORS]
+    rows.append([("Без цвета (авто)", f"settopiccolor:{bot_id}:off")])
+    rows.append([("Назад", f"cfg:{bot_id}")])
+    cur_color = getattr(cb, "topic_color", None)
+    cur_label = next((lbl for lbl, val in TOPIC_COLORS if val == cur_color), "авто")
     await c.message.edit_text(
-        f"{em('sparkles')} Пришлите premium-эмодзи для иконки топика (просто "
-        "отправьте его как текст), или «-» чтобы убрать иконку.\n"
-        "<i>Иконка ставится только на НОВЫЕ топики — уже созданные не меняются.</i>")
+        f"Цвет форум-топика (сейчас: {cur_label}).\n"
+        "<i>Цвет применяется только к НОВЫМ топикам — уже созданные не меняются.</i>",
+        reply_markup=kb(rows))
     await c.answer()
 
 
-@router.message(St.set_topic_icon)
-async def topicicon_save(m: Message, state: FSMContext):
-    data = await state.get_data()
-    await delete_previous(m, state)
+@router.callback_query(F.data.startswith("settopiccolor:"))
+async def settopiccolor(c: CallbackQuery):
+    parts = c.data.split(":")
+    bot_id = int(parts[1])
+    val = parts[2]
+    cb, is_owner = await _access(bot_id, c.from_user.id)
+    if not cb or not is_owner:
+        await c.answer("Только владелец", show_alert=True); return
     async with Session() as s:
-        obj = await s.get(ChildBot, data["bot_id"])
-        if not await referrals.is_pro(obj.owner_id):
-            await state.clear()
-            await m.answer(f"{em('sparkles')} Pro истёк — иконка топика недоступна.")
-            return
-        icon_id = None
-        if m.text and m.text.strip() != "-" and m.entities:
-            for e in m.entities:
-                if e.type == "custom_emoji":
-                    icon_id = e.custom_emoji_id
-                    break
-        obj.topic_icon_emoji_id = icon_id
+        obj = await s.get(ChildBot, bot_id)
+        obj.topic_color = None if val == "off" else int(val)
         await s.commit()
-    await state.clear()
-    await m.answer(f"{em('check')} Иконка топика сохранена!", reply_markup=nav_kb(data["bot_id"]))
+    await c.answer(f"{em('check')} Цвет топика сохранён!")
+    await cfg_menu(c.model_copy(update={"data": f"cfg:{bot_id}"}))
 
 
 @router.callback_query(F.data.startswith("richwelcome:"))
