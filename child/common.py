@@ -14,7 +14,7 @@ from aiogram.types import (Message, PreCheckoutQuery, LabeledPrice,
                            CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
                            ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton,
                            MessageReactionUpdated, ReactionTypeEmoji, ReplyParameters,
-                           InputRichMessage, BotSubscriptionUpdated)
+                           InputRichMessage)
 from sqlalchemy import select
 from db.base import Session
 from db.models import (ChildBot, BotAdmin, Donation, BotButton, OpenMode, ForwardMode,
@@ -426,9 +426,14 @@ async def send_with_keyboards(m: Message, text: str, ikb, rkb, photo: str | None
             if ikb and rkb:
                 await m.answer(f"{em('gear')} Меню", reply_markup=rkb)
             return msg
+        except AttributeError:
+            log.error(
+                "send_with_keyboards: send_rich_message недоступен — "
+                "нужна aiogram>=3.28 (Bot API 10.1). Рич-текст не будет "
+                "работать до обновления зависимостей. Отправляю обычным текстом.")
         except Exception as e:
             log.warning("send_with_keyboards: рич-сообщение не отправилось (%s), "
-                        "шлю обычным текстом", e)
+                        "отправляю обычным текстом", e)
     if photo:
         try:
             if len(safe_text) <= PHOTO_CAPTION_LIMIT:
@@ -1032,48 +1037,11 @@ def build_common_router() -> Router:
         await _ask_donate_kind(m, cfg, state)
 
     async def _ask_donate_kind(m: Message, cfg: ChildBot, state: FSMContext):
-        # НОВОЕ: разовый донат или ежемесячная Stars-подписка
-        # (subscription_period в send_invoice) — раньше был только разовый.
-        # Подписки — Pro-функция владельца бота: если Pro не активен, сразу
-        # уходим в старый флоу (только разовый донат), не показывая выбор.
-        if not await referrals.is_pro(cfg.owner_id):
-            await state.set_state(DonateSt.amount)
-            await state.update_data(kind="one")
-            await m.answer(f"{em('star')} Введите количество звёзд для доната (1–10000):")
-            return
-        await m.answer(
-            f"{em('star')} Разовый донат или ежемесячная подписка?",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="⭐️ Разово", callback_data="donatekind:one")],
-                [InlineKeyboardButton(text="🔁 Подписка (ежемесячно)", callback_data="donatekind:sub")],
-            ]))
-
-    @r.callback_query(F.data.startswith("donatekind:"))
-    async def cb_donate_kind(c: CallbackQuery, bot_db_id: int, state: FSMContext):
-        if await mod.is_banned(bot_db_id, c.from_user.id):
-            await c.answer("Вы забанены в этом боте.", show_alert=True)
-            return
-        cfg = await get_cfg(bot_db_id)
-        if not cfg or not cfg.donate_enabled:
-            await c.answer()
-            return
-        kind = c.data.split(":")[1]
-        if kind == "sub" and not await referrals.is_pro(cfg.owner_id):
-            # Владелец мог выключить Pro уже после того, как кнопка была
-            # показана — перепроверяем перед тем, как выставлять счёт.
-            await c.answer("Подписки временно недоступны.", show_alert=True)
-            return
         await state.set_state(DonateSt.amount)
-        await state.update_data(kind=kind)
-        if kind == "sub":
-            # Подписки Telegram Stars ограничены ценой 1–2500 ⭐️ (в отличие
-            # от разового доната, где потолок 10000).
-            await c.message.answer(f"{em('star')} Введите цену подписки в звёздах "
-                                   "за месяц (1–2500):")
-        else:
-            await c.message.answer(f"{em('star')} Введите количество звёзд для доната (1–10000):")
-        await c.answer()
+        await state.update_data(kind="one")
+        await m.answer(f"{em('star')} Введите количество звёзд для доната (1–10000):")
 
+    
     @r.message(DonateSt.amount, F.chat.type == "private")
     async def donate_amount(m: Message, bot: Bot, bot_db_id: int, state: FSMContext):
         if await mod.is_banned(bot_db_id, m.from_user.id):
@@ -1092,44 +1060,21 @@ def build_common_router() -> Router:
         cfg = await get_cfg(bot_db_id)
         if not cfg or not cfg.donate_enabled:
             return
-        if kind == "sub" and not await referrals.is_pro(cfg.owner_id):
-            await m.answer(f"{em('warn')} Подписки временно недоступны, попробуйте разовый донат.")
-            return
         stars = int(m.text.strip())
-        limit = 2500 if kind == "sub" else 10000
+        limit = 10000
         if not 1 <= stars <= limit:
             await m.answer(f"{em('warn')} Число должно быть от 1 до {limit}.")
             return
         try:
-            if kind == "sub":
-                # subscription_period не поддерживается в aiogram напрямую —
-                # отправляем через сырой HTTP-запрос к Bot API.
-                import aiohttp, json as _json
-                payload_raw = {
-                    "chat_id": m.chat.id,
-                    "title": "Подписка",
-                    "description": f"Ежемесячная подписка на {stars} ⭐️",
-                    "payload": f"donate:sub:{stars}",
-                    "currency": "XTR",
-                    "prices": _json.dumps([{"label": f"{stars} Stars", "amount": stars}]),
-                    "subscription_period": 2592000,  # 30 дней
-                }
-                url = f"https://api.telegram.org/bot{bot.token}/sendInvoice"
-                async with aiohttp.ClientSession() as sess:
-                    async with sess.post(url, data=payload_raw) as resp:
-                        result = await resp.json()
-                if not result.get("ok"):
-                    raise RuntimeError(result.get("description", "unknown error"))
-            else:
-                await bot.send_invoice(
-                    chat_id=m.chat.id,
-                    title="Донат",
-                    description=f"Поддержка на {stars} ⭐️",
-                    payload=f"donate:one:{stars}", currency="XTR",
-                    prices=[LabeledPrice(label=f"{stars} Stars", amount=stars)])
+            await bot.send_invoice(
+                chat_id=m.chat.id,
+                title="Донат",
+                description=f"Поддержка на {stars} ⭐️",
+                payload=f"donate:one:{stars}", currency="XTR",
+                prices=[LabeledPrice(label=f"{stars} Stars", amount=stars)])
         except Exception as e:
-            log.warning("donate_amount: не удалось выставить счёт (kind=%s) для бота %s: %s",
-                        kind, bot_db_id, e)
+            log.warning("donate_amount: не удалось выставить счёт для бота %s: %s",
+                        bot_db_id, e)
             await m.answer(f"{em('warn')} Не удалось выставить счёт. Попробуйте ещё раз позже.")
 
     @r.pre_checkout_query()
@@ -1140,82 +1085,12 @@ def build_common_router() -> Router:
     async def paid(m: Message, bot_db_id: int):
         sp = m.successful_payment
         stars = sp.total_amount
-        payload = sp.invoice_payload or ""
-        is_sub = payload.startswith("donate:sub:")
         async with Session() as s:
-            s.add(Donation(bot_id=bot_db_id, user_id=m.from_user.id, stars=stars,
-                           is_subscription=is_sub,
-                           subscription_state="active" if is_sub else None,
-                           telegram_payment_charge_id=sp.telegram_payment_charge_id,
-                           subscription_expiration=sp.subscription_expiration_date))
+            s.add(Donation(bot_id=bot_db_id, user_id=m.from_user.id, stars=stars))
             await s.commit()
-        if is_sub:
-            await m.answer(f"{em('party')} Спасибо за подписку на {stars} {em('star')}/мес! "
-                           "Отменить можно в настройках Telegram (Звёзды и Premium → Подписки) "
-                           "или командой /unsubscribe в этом боте.")
-        else:
-            await m.answer(f"{em('party')} Спасибо за донат {stars} {em('star')}!")
+        await m.answer(f"{em('party')} Спасибо за донат {stars} {em('star')}!")
 
-    @r.message(Command("unsubscribe"), F.chat.type == "private")
-    async def unsubscribe(m: Message, bot: Bot, bot_db_id: int):
-        # НОВОЕ: докрутка отмены подписки — пользователь может отменить сам,
-        # не отправляя его в системные настройки Telegram (editUserStarSubscription,
-        # доступен и получателю платежей, и плательщику).
-        async with Session() as s:
-            don = await s.scalar(select(Donation).where(
-                Donation.bot_id == bot_db_id, Donation.user_id == m.from_user.id,
-                Donation.is_subscription == True,  # noqa: E712
-                Donation.subscription_state == "active",
-                Donation.telegram_payment_charge_id.is_not(None),
-            ).order_by(Donation.id.desc()))
-        if not don:
-            await m.answer(f"{em('info')} У вас нет активной подписки в этом боте.")
-            return
-        try:
-            await bot.edit_user_star_subscription(
-                m.from_user.id, don.telegram_payment_charge_id, is_canceled=True)
-        except Exception as e:
-            log.warning("unsubscribe: edit_user_star_subscription failed для бота %s: %s",
-                        bot_db_id, e)
-            await m.answer(f"{em('warn')} Не удалось отменить подписку, попробуйте позже "
-                           "или через настройки Telegram (Звёзды и Premium → Подписки).")
-            return
-        async with Session() as s:
-            obj = await s.get(Donation, don.id)
-            obj.subscription_state = "canceled"
-            await s.commit()
-        await m.answer(f"{em('check')} Подписка отменена — она останется активной до конца "
-                       "уже оплаченного периода и не продлится дальше.")
 
-    @r.subscription()
-    async def on_subscription_updated(sub: BotSubscriptionUpdated, bot: Bot, bot_db_id: int):
-        """НОВОЕ: докрутка продления/отмены подписки. Update.subscription
-        (Bot API) приходит боту при изменении статуса Stars-подписки:
-        state == "canceled" — пользователь отменил (сам или через /unsubscribe),
-        state == "active" — включил отменённую подписку обратно,
-        state == "failed" — не удалось списать за очередной период.
-        Ищем последнюю подписку этого пользователя в этом боте по
-        invoice_payload и обновляем статус + уведомляем владельца в чат
-        админов, чтобы не приходилось мониторить это вручную."""
-        async with Session() as s:
-            don = await s.scalar(select(Donation).where(
-                Donation.bot_id == bot_db_id, Donation.user_id == sub.user.id,
-                Donation.is_subscription == True,  # noqa: E712
-            ).order_by(Donation.id.desc()))
-            if don:
-                don.subscription_state = sub.state
-                await s.commit()
-            cfg = await get_cfg(bot_db_id)
-        if not cfg or not cfg.admin_chat_id:
-            return
-        label = {"canceled": f"{em('cross')} отменена", "active": f"{em('check')} возобновлена",
-                 "failed": f"{em('warn')} не удалось списать оплату"}.get(sub.state, sub.state)
-        uname = f"@{sub.user.username}" if sub.user.username else sub.user.full_name
-        try:
-            await bot.send_message(cfg.admin_chat_id,
-                                   f"🔁 Подписка на донат — {uname} (id {sub.user.id}): {label}")
-        except Exception:
-            pass
 
     @r.callback_query(F.data == "donate_btn")
     async def cb_donate(c: CallbackQuery, bot_db_id: int, state: FSMContext):
