@@ -158,11 +158,13 @@ async def _get_or_create_topic(bot: Bot, cfg: ChildBot, user_id: int) -> int | N
                                   username=(u.username if u else None))
     # Иконка топика — Pro-функция; если Pro у владельца истёк, топик всё
     # равно создаём (топики — это фикс бага, не Pro-фича), просто без иконки.
-    icon = cfg.topic_icon_emoji_id if await referrals.is_pro(cfg.owner_id) else None
+    create_kwargs: dict = {}
+    topic_color = getattr(cfg, "topic_color", None)
+    if topic_color is not None:
+        create_kwargs["icon_color"] = topic_color
     try:
         topic = await bot.create_forum_topic(
-            cfg.admin_chat_id, topic_name,
-            icon_custom_emoji_id=icon or None)
+            cfg.admin_chat_id, topic_name, **create_kwargs)
         return topic.message_thread_id
     except Exception as e:
         log.warning("survey._get_or_create_topic: create_forum_topic failed "
