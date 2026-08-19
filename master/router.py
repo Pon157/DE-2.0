@@ -581,9 +581,6 @@ def _pro_guide_block() -> str:
         f"• {em('star')} Эффект на приветственном сообщении\n"
         f"• {em('sparkles')} Рич-текст приветствия (заголовки/разделители/врезки — новый формат, "
         "тумблер «Рич-текст» в настройках)\n"
-        f"• {em('refresh')} Ежемесячная Stars-подписка на донат — не только разово; пользователь "
-        "может отменить сам через /unsubscribe, владелец — через "
-        "«📊 Статистика → 🔁 Активные подписки»."
     )
 
 def _bot_guide(bot_type: str) -> str:
@@ -2317,7 +2314,6 @@ async def stats(c: CallbackQuery):
                 star_line = f"\n\n⭐️ Баланс Stars: <b>{balance}</b>"
     await c.message.answer(f"{em('crown')} <b>Статистика по админам</b>\n\n{admin_stats}{star_line}",
                            reply_markup=kb([[("🚫 Кто заблокировал бота", f"blockedlist:{bot_id}:0")],
-                                            [("🔁 Активные подписки", f"sublist:{bot_id}:0")],
                                             [("⬅️ Назад", f"bot:{bot_id}")]]))
 
 
