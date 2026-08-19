@@ -285,6 +285,7 @@ async def init_db():
         "ALTER TABLE donations ADD COLUMN IF NOT EXISTS telegram_payment_charge_id VARCHAR(128)",
         "ALTER TABLE donations ADD COLUMN IF NOT EXISTS subscription_expiration TIMESTAMP",
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS rich_welcome BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS topic_color INTEGER",
     ):
         await _exec(stmt)
 
