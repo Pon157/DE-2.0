@@ -363,13 +363,18 @@ async def build_keyboards(bot_db_id: int, cfg: ChildBot, extra_inline: list | No
 
 
 async def welcome_pro_kwargs(cfg: ChildBot) -> dict:
-    """Эффект приветствия — Pro-функция. Рич-текст теперь НЕ управляется
-    тумблером: если владелец ставит приветствие через send_rich_message —
-    оно уходит рич-форматом автоматически (гейт по is_pro на уровне
-    send_with_keyboards). Тут возвращаем только effect_id."""
+    """Pro-kwargs для send_with_keyboards: effect_id + rich.
+    rich=True включает рич-текст приветствия только если у владельца Pro
+    И тумблер rich_welcome=True (настраивается в конструкторе).
+    effect_id — анимация при получении в личке (None = без эффекта)."""
     if not await referrals.is_pro(cfg.owner_id):
         return {}
-    return {"effect_id": cfg.welcome_effect_id}
+    result: dict = {}
+    if cfg.welcome_effect_id:
+        result["effect_id"] = cfg.welcome_effect_id
+    if getattr(cfg, "rich_welcome", False):
+        result["rich"] = True
+    return result
 
 
 async def send_with_keyboards(m: Message, text: str, ikb, rkb, photo: str | None = None,
@@ -448,13 +453,18 @@ async def send_with_keyboards(m: Message, text: str, ikb, rkb, photo: str | None
 
 
 async def send_rich_or_plain(m: Message, text: str, reply_markup=None) -> Message | None:
-    """Общий помощник: пробует send_rich_message, при любой ошибке (или если
-    просто недоступно) — тихий откат на обычный m.answer с тем же текстом.
-    Вынесено отдельно, чтобы рич-режим одинаково подключался на всех
-    экранах бота, а не только в приветствии."""
+    """Общий помощник: пробует send_rich_message, при любой ошибке — тихий
+    откат (возвращает None, вызывающий код шлёт обычный текст).
+    AttributeError = метод отсутствует в этой версии aiogram (нужна >=3.28
+    с поддержкой Bot API 10.1) — логируем как ERROR, чтобы было сразу видно."""
     try:
         return await m.bot.send_rich_message(
             m.chat.id, InputRichMessage(html=text), reply_markup=reply_markup)
+    except AttributeError:
+        log.error(
+            "send_rich_message недоступен — нужна aiogram>=3.28 (Bot API 10.1). "
+            "Рич-текст не будет работать до обновления зависимостей.")
+        return None
     except Exception as e:
         log.warning("send_rich_or_plain: рич-сообщение не отправилось (%s), "
                     "шлю обычным текстом", e)
@@ -631,17 +641,13 @@ async def open_ticket(bot: Bot, cfg: ChildBot, user_id: int,
                 # пробуем задать иконку отдельно (edit_forum_topic) — если
                 # иконка не поддерживается, топик всё равно создан и будет
                 # работать корректно.
-                topic = await bot.create_forum_topic(cfg.admin_chat_id, topic_name)
+                create_kwargs: dict = {}
+                topic_color = getattr(cfg, "topic_color", None)
+                if topic_color is not None:
+                    create_kwargs["icon_color"] = topic_color
+                topic = await bot.create_forum_topic(
+                    cfg.admin_chat_id, topic_name, **create_kwargs)
                 topic_id = topic.message_thread_id
-                # Иконку ставим отдельно — ошибка тут не ломает топик
-                if await referrals.is_pro(cfg.owner_id) and cfg.topic_icon_emoji_id:
-                    try:
-                        await bot.edit_forum_topic(
-                            cfg.admin_chat_id, topic_id,
-                            icon_custom_emoji_id=cfg.topic_icon_emoji_id)
-                    except Exception as icon_err:
-                        log.warning("Bot %s: не удалось задать иконку топика (%s) — "
-                                    "топик создан без иконки", cfg.id, icon_err)
             except Exception as e:
                 log.warning("Bot %s: create_forum_topic failed (%s) — "
                             "продолжаю без топика", cfg.id, e)
