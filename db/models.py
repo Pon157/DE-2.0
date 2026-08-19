@@ -71,7 +71,7 @@ class ChildBot(Base):
     # НОВОЕ: иконка топика — premium-эмодзи (create_forum_topic поддерживает
     # icon_custom_emoji_id, Bot API 9.4+) — раньше топики создавались вообще
     # без иконки, хотя выбор цвета/иконки у обычных кнопок уже был.
-    topic_icon_emoji_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    topic_color: Mapped[int | None] = mapped_column(Integer, nullable=True)
     welcome_text: Mapped[str] = mapped_column(Text, default="Привет! Напишите ваше сообщение.")
     welcome_photo: Mapped[str | None] = mapped_column(String(256), nullable=True)  # file_id
     # НОВОЕ: эффект на приветственном сообщении (message_effect_id, Bot API,
