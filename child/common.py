@@ -364,14 +364,16 @@ async def build_keyboards(bot_db_id: int, cfg: ChildBot, extra_inline: list | No
 
 async def welcome_pro_kwargs(cfg: ChildBot) -> dict:
     """Pro-kwargs для send_with_keyboards: effect_id + rich.
-    rich=True включается автоматически для Pro-ботов (тумблер rich_welcome
-    больше не требуется — рич активен для всех Pro, как в rich_enabled).
+    rich=True включает рич-текст приветствия только если у владельца Pro
+    И тумблер rich_welcome=True (настраивается в конструкторе).
     effect_id — анимация при получении в личке (None = без эффекта)."""
     if not await referrals.is_pro(cfg.owner_id):
         return {}
-    result: dict = {"rich": True}
+    result: dict = {}
     if cfg.welcome_effect_id:
         result["effect_id"] = cfg.welcome_effect_id
+    if getattr(cfg, "rich_welcome", False):
+        result["rich"] = True
     return result
 
 
