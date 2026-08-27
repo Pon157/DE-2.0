@@ -1445,6 +1445,25 @@ def build_common_router() -> Router:
     # ---------- админ-чат: ответы пользователям (ОБЩИЕ для обоих типов) ----------
     @r.message(F.chat.type.in_({"group", "supergroup"}))
     async def admin_reply(m: Message, bot: Bot, bot_db_id: int):
+        # Системные сообщения Telegram (переименование топика, добавление
+        # участника, закреп сообщения, изменение аватара чата и т.п.) не имеют
+        # from_user или несут служебный контент без текста/медиа — copy_message
+        # падает на них с TelegramBadRequest, что раньше ловилось общим
+        # except Exception и показывало ложное "заблокировал бота".
+        # Признаки системного сообщения: нет from_user, ИЛИ есть любое из
+        # специальных полей (forum_topic_created/edited/closed/reopened,
+        # new_chat_members, left_chat_member, pinned_message и т.д.).
+        if not m.from_user:
+            return
+        if (m.forum_topic_created or m.forum_topic_edited or
+                m.forum_topic_closed or m.forum_topic_reopened or
+                m.general_forum_topic_hidden or m.general_forum_topic_unhidden or
+                m.new_chat_members or m.left_chat_member or
+                m.new_chat_title or m.new_chat_photo or m.delete_chat_photo or
+                m.group_chat_created or m.supergroup_chat_created or
+                m.channel_chat_created or m.migrate_to_chat_id or
+                m.pinned_message or m.message_auto_delete_timer_changed):
+            return  # системное событие — не пытаемся relay/copy
         cfg = await get_cfg(bot_db_id)
         if not cfg or m.chat.id != cfg.admin_chat_id or m.from_user.is_bot:
             return
