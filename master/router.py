@@ -10,7 +10,7 @@ from sqlalchemy import select, func
 from db.base import Session
 from db.models import (ChildBot, BotAdmin, BotButton, BotType, OpenMode, ForwardMode,
                        Advertisement, AdKind, AdStatus, PlatformUser, BotUser,
-                       Survey, SurveyQuestion, Donation)
+                       Survey, SurveyQuestion, Donation, AutoReply, AutoReplyKind)
 from services.bot_manager import (manager, reupload_photo_for_bot as manager_reupload,
                                   reupload_media_for_bot as manager_reupload_media)
 from services.broadcast import run_broadcast
@@ -219,6 +219,10 @@ class St(StatesGroup):
     donate_btn_text = State()
     donate_btn_style = State()
     donate_btn_icon = State()
+    # автоответы
+    ar_text = State()
+    ar_param = State()
+    ar_photo = State()
 
 
 HEADER_MODE_LABELS = {
@@ -689,6 +693,7 @@ async def cfg_menu(c: CallbackQuery):
             [("🔒 Текст закрытия обращения", f"closenotify:{bot_id}")],
             [(f"👍 Реакция на ответ админа: {cb.admin_reply_reaction or 'выкл'}",
               f"adminreaction:{bot_id}")],
+            [("💬 Автоответы", f"ar_list:{bot_id}")],
         ]
     elif cb.bot_type == BotType.survey:
         rows = [
@@ -3254,6 +3259,187 @@ async def ads_extend_start(c: CallbackQuery, state: FSMContext):
         "Введите целое число (минимум 1):")
     await c.answer()
 
+
+
+
+# ================== автоответы ==================
+
+async def _show_ar_list(target, bot_id: int, edit: bool):
+    async with Session() as s:
+        rules = (await s.scalars(
+            select(AutoReply)
+            .where(AutoReply.bot_id == bot_id)
+            .order_by(AutoReply.position, AutoReply.id)
+        )).all()
+    lines = []
+    for r in rules:
+        status = "✅" if r.is_active else "⏸"
+        if r.kind == AutoReplyKind.first_message:
+            label = "На первое сообщение"
+        elif r.kind == AutoReplyKind.every_n:
+            label = f"Каждые {r.param} сообщ."
+        else:
+            label = f"Слово «{r.param}»"
+        preview = (r.text or "")[:40].replace("\n", " ")
+        lines.append(f"{status} <b>{label}</b>: {preview}")
+    rows = []
+    for r in rules:
+        rows.append([
+            (f"✏️ {r.id} вкл/выкл", f"ar_toggle:{r.id}:{bot_id}"),
+            (f"🗑 Удалить", f"ar_del:{r.id}:{bot_id}"),
+        ])
+    rows.append([("➕ Добавить автоответ", f"ar_add:{bot_id}")])
+    rows.append([("⬅️ Назад", f"cfg:{bot_id}")])
+    text = ("💬 <b>Автоответы</b>\n\n" + "\n".join(lines)) if lines else            "💬 <b>Автоответы</b>\n\nПравил пока нет — добавьте первое."
+    if edit:
+        await target.edit_text(text, reply_markup=kb(rows))
+    else:
+        await target.answer(text, reply_markup=kb(rows))
+
+
+@router.callback_query(F.data.startswith("ar_list:"))
+async def ar_list(c: CallbackQuery):
+    bot_id = int(c.data.split(":")[1])
+    cb, is_owner = await _access(bot_id, c.from_user.id)
+    if not cb or not is_owner:
+        await c.answer("Только владелец", show_alert=True); return
+    await _show_ar_list(c.message, bot_id, edit=True)
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("ar_add:"))
+async def ar_add(c: CallbackQuery, state: FSMContext):
+    bot_id = int(c.data.split(":")[1])
+    cb, is_owner = await _access(bot_id, c.from_user.id)
+    if not cb or not is_owner:
+        await c.answer("Только владелец", show_alert=True); return
+    await state.update_data(ar_bot_id=bot_id, last_msg_id=c.message.message_id)
+    await c.message.edit_text(
+        "💬 <b>Тип автоответа:</b>",
+        reply_markup=kb([
+            [("📨 На первое сообщение", "ar_kind:first_message")],
+            [("🔢 Каждые N сообщений",  "ar_kind:every_n")],
+            [("🔍 По ключевому слову",  "ar_kind:keyword")],
+            [("⬅️ Отмена", f"ar_list:{bot_id}")],
+        ]))
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("ar_kind:"))
+async def ar_kind(c: CallbackQuery, state: FSMContext):
+    kind = c.data.split(":")[1]
+    await state.update_data(ar_kind=kind)
+    if kind == "first_message":
+        await state.update_data(ar_param=None)
+        await state.set_state(St.ar_text)
+        await c.message.edit_text(
+            f"{em('pencil')} Введите текст автоответа (HTML-форматирование поддерживается):\n"
+            "<i>Или пришлите сообщение с фото — текст станет подписью.</i>")
+    elif kind == "every_n":
+        await state.set_state(St.ar_param)
+        await c.message.edit_text(f"{em('pencil')} Введите <b>число N</b> — автоответ сработает "
+                                  "каждые N входящих сообщений от пользователя (целое ≥ 1):")
+    else:
+        await state.set_state(St.ar_param)
+        await c.message.edit_text(f"{em('pencil')} Введите <b>ключевое слово или фразу</b> "
+                                  "(регистр не важен — срабатывает при вхождении в текст):")
+    await c.answer()
+
+
+@router.message(St.ar_param)
+async def ar_param_save(m: Message, state: FSMContext):
+    await delete_previous(m, state)
+    data = await state.get_data()
+    kind = data.get("ar_kind")
+    text = m.text.strip() if m.text else ""
+    if kind == "every_n":
+        if not text.isdigit() or int(text) < 1:
+            msg = await m.answer(f"{em('cross')} Нужно целое число ≥ 1. Попробуйте снова:")
+            await state.update_data(last_msg_id=msg.message_id)
+            return
+    elif not text:
+        msg = await m.answer(f"{em('cross')} Нужно ввести слово или фразу. Попробуйте снова:")
+        await state.update_data(last_msg_id=msg.message_id)
+        return
+    await state.update_data(ar_param=text)
+    await state.set_state(St.ar_text)
+    msg = await m.answer(
+        f"{em('pencil')} Введите текст автоответа (HTML поддерживается):\n"
+        "<i>Или пришлите сообщение с фото — текст станет подписью.</i>")
+    await state.update_data(last_msg_id=msg.message_id)
+
+
+@router.message(St.ar_text)
+async def ar_text_save(m: Message, state: FSMContext):
+    await delete_previous(m, state)
+    # принимаем текст или фото с подписью
+    text = m.html_text or m.html_caption or ""
+    photo = m.photo[-1].file_id if m.photo else None
+    if not text and not photo:
+        msg = await m.answer(f"{em('cross')} Нужен текст или фото с подписью. Попробуйте снова:")
+        await state.update_data(last_msg_id=msg.message_id)
+        return
+    # Перезалить фото через дочернего бота (file_id мастер-бота невалиден для дочернего)
+    reuploaded_photo = None
+    if photo:
+        data_now = await state.get_data()
+        reuploaded_photo = await manager_reupload(m.bot, data_now["ar_bot_id"], photo, m.from_user.id)
+        if reuploaded_photo is None:
+            await m.answer(f"{em('warn')} Не удалось прикрепить фото (напишите что-нибудь "
+                           "дочернему боту и попробуйте снова) — сохраняю только текст.")
+    await state.update_data(ar_text=text, ar_photo=reuploaded_photo)
+    # Сохраняем правило
+    data = await state.get_data()
+    async with Session() as s:
+        rule = AutoReply(
+            bot_id=data["ar_bot_id"],
+            kind=AutoReplyKind(data["ar_kind"]),
+            param=data.get("ar_param"),
+            text=data.get("ar_text", ""),
+            photo=data.get("ar_photo"),
+            is_active=True,
+        )
+        s.add(rule)
+        await s.commit()
+    await state.clear()
+    bot_id = data["ar_bot_id"]
+    await m.answer(f"{em('check')} Автоответ добавлен!",
+                   reply_markup=kb([[("💬 К списку автоответов", f"ar_list:{bot_id}"),
+                                     ("⚙️ Настройки", f"cfg:{bot_id}")]]))
+
+
+@router.callback_query(F.data.startswith("ar_toggle:"))
+async def ar_toggle(c: CallbackQuery):
+    _, rule_id_s, bot_id_s = c.data.split(":")
+    rule_id, bot_id = int(rule_id_s), int(bot_id_s)
+    cb, is_owner = await _access(bot_id, c.from_user.id)
+    if not cb or not is_owner:
+        await c.answer("Только владелец", show_alert=True); return
+    async with Session() as s:
+        rule = await s.get(AutoReply, rule_id)
+        if not rule or rule.bot_id != bot_id:
+            await c.answer("Не найдено", show_alert=True); return
+        rule.is_active = not rule.is_active
+        await s.commit()
+    await c.answer("✅ Включено" if rule.is_active else "⏸ Выключено")
+    await _show_ar_list(c.message, bot_id, edit=True)
+
+
+@router.callback_query(F.data.startswith("ar_del:"))
+async def ar_del(c: CallbackQuery):
+    _, rule_id_s, bot_id_s = c.data.split(":")
+    rule_id, bot_id = int(rule_id_s), int(bot_id_s)
+    cb, is_owner = await _access(bot_id, c.from_user.id)
+    if not cb or not is_owner:
+        await c.answer("Только владелец", show_alert=True); return
+    async with Session() as s:
+        rule = await s.get(AutoReply, rule_id)
+        if not rule or rule.bot_id != bot_id:
+            await c.answer("Не найдено", show_alert=True); return
+        await s.delete(rule)
+        await s.commit()
+    await c.answer(f"{em('trash')} Удалено")
+    await _show_ar_list(c.message, bot_id, edit=True)
 
 async def _notify_super_admin(ad: Advertisement):
     if not SUPER_ADMIN_ID:
