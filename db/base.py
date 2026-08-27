@@ -1,4 +1,3 @@
-
 # db/base.py
 import logging
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
@@ -286,6 +285,8 @@ async def init_db():
         "ALTER TABLE donations ADD COLUMN IF NOT EXISTS subscription_expiration TIMESTAMP",
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS rich_welcome BOOLEAN DEFAULT FALSE",
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS topic_color INTEGER",
+        # ---- автоответы ----
+        "ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS incoming_msg_count INTEGER DEFAULT 0",
     ):
         await _exec(stmt)
 
