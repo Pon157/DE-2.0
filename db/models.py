@@ -1,4 +1,3 @@
-
 # db/models.py
 import enum
 from datetime import datetime
@@ -190,6 +189,10 @@ class BotUser(Base):
     captcha_asked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     spam_strikes: Mapped[int] = mapped_column(Integer, default=0)
     throttled_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Счётчик входящих сообщений — для автоответов (every_n / first_message).
+    # Не путать с total_requests: тот включает /start и системные события;
+    # этот считает только реальные сообщения пользователя из user_message.
+    incoming_msg_count: Mapped[int] = mapped_column(Integer, default=0)
 
     __table_args__ = (UniqueConstraint("bot_id", "user_id"),)
 
@@ -432,3 +435,24 @@ class SurveyResponse(Base):
     # child/common.py::open_ticket).
     topic_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
+
+class AutoReplyKind(str, enum.Enum):
+    first_message = "first_message"   # один раз при первом сообщении пользователя
+    every_n       = "every_n"         # каждые N входящих сообщений
+    keyword       = "keyword"         # при вхождении фразы/слова в текст
+
+
+class AutoReply(Base):
+    """Правило автоответа — настраивается владельцем бота в конструкторе."""
+    __tablename__ = "auto_replies"
+    id:        Mapped[int] = mapped_column(Integer, primary_key=True)
+    bot_id:    Mapped[int] = mapped_column(
+        ForeignKey("child_bots.id", ondelete="CASCADE"), index=True)
+    kind:      Mapped[AutoReplyKind] = mapped_column(Enum(AutoReplyKind))
+    # keyword → ключевая фраза; every_n → строка с числом N; first_message → None
+    param:     Mapped[str | None] = mapped_column(String(256), nullable=True)
+    text:      Mapped[str] = mapped_column(Text, default="")
+    photo:     Mapped[str | None] = mapped_column(String(256), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    position:  Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
