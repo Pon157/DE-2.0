@@ -1,10 +1,11 @@
-
 from aiogram import Router, F, Bot
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 from db.base import Session
-from db.models import ChildBot, MessageLog, OpenMode
+from db.models import ChildBot, MessageLog, OpenMode, BotUser
+from sqlalchemy import select
+from services.autoreply import check_and_fire
 from services import moderation as mod
 from services import antispam
 from child.common import (inject_extras, build_keyboards, send_with_keyboards,
@@ -59,8 +60,10 @@ def build_feedback_router() -> Router:
         if await mod.is_banned(bot_db_id, m.from_user.id):
             return
         async with Session() as s:
-            await mod.get_or_create_user(s, bot_db_id, m.from_user)
+            u = await mod.get_or_create_user(s, bot_db_id, m.from_user)
             s.add(MessageLog(bot_id=bot_db_id, user_id=m.from_user.id, direction="in"))
+            # Инкремент для автоответов every_n / first_message
+            u.incoming_msg_count = (u.incoming_msg_count or 0) + 1
             await s.commit()
         # Антиспам (rate-limit/капча/прогрессирующий тайм-аут) — обычных
         # админов не трогает, владельца — в зависимости от тоггла
@@ -88,6 +91,8 @@ def build_feedback_router() -> Router:
 
         async def _process(msgs: list[Message]):
             await relay_to_admin_chat(msgs, bot, cfg)
+            # Автоответы — срабатывают после релея (счётчик уже обновлён)
+            await check_and_fire(msgs[0], bot, bot_db_id)
 
         # БАГ "с фотками сложно": альбомы релеились по одному фото, каждое с
         # ОТДЕЛЬНОЙ шапкой (в copy-режиме) — админ-чат превращался в спам.
@@ -96,5 +101,3 @@ def build_feedback_router() -> Router:
         await buffer_or_process(m, _process)
 
     return r
-
-
