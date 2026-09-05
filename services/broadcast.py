@@ -1,4 +1,3 @@
-
 import asyncio
 import logging
 from aiogram import Bot
@@ -118,36 +117,63 @@ async def _send(bot: Bot, chat_id: int, text, media_bytes: bytes | None,
     молча терялся. Теперь для них текст (если есть) шлём отдельным
     сообщением следом.
     """
+    CAPTION_LIMIT = 1024
+    MSG_LIMIT = 4096
+
+    async def _send_text_chunks(t: str):
+        """Отправляет длинный текст чанками по 4096 (Bot API лимит)."""
+        for i in range(0, len(t), MSG_LIMIT):
+            await bot.send_message(chat_id, t[i:i + MSG_LIMIT], parse_mode="HTML")
+
     if media_bytes and media_type:
         media = reusable_file_id or BufferedInputFile(
             media_bytes, filename=media_filename or "file")
+        # БАГ (по запросу): caption в Telegram ограничен 1024 символами.
+        # Если текст длиннее — раньше sendPhoto/sendVideo/... падали с
+        # TelegramBadRequest и сообщение вообще не доставлялось. Теперь
+        # при превышении лимита шлём медиа без подписи, а текст — отдельно
+        # (разбитый на чанки при необходимости).
+        cap = text if text and len(text) <= CAPTION_LIMIT else None
+        long_text = text if text and len(text) > CAPTION_LIMIT else None
         if media_type == "photo":
-            msg = await bot.send_photo(chat_id, media, caption=text, parse_mode="HTML")
+            msg = await bot.send_photo(chat_id, media, caption=cap, parse_mode="HTML" if cap else None)
+            if long_text:
+                await _send_text_chunks(long_text)
             return reusable_file_id or msg.photo[-1].file_id
         elif media_type == "video":
-            msg = await bot.send_video(chat_id, media, caption=text, parse_mode="HTML")
+            msg = await bot.send_video(chat_id, media, caption=cap, parse_mode="HTML" if cap else None)
+            if long_text:
+                await _send_text_chunks(long_text)
             return reusable_file_id or msg.video.file_id
         elif media_type == "document":
-            msg = await bot.send_document(chat_id, media, caption=text, parse_mode="HTML")
+            msg = await bot.send_document(chat_id, media, caption=cap, parse_mode="HTML" if cap else None)
+            if long_text:
+                await _send_text_chunks(long_text)
             return reusable_file_id or msg.document.file_id
         elif media_type == "animation":
-            msg = await bot.send_animation(chat_id, media, caption=text, parse_mode="HTML")
+            msg = await bot.send_animation(chat_id, media, caption=cap, parse_mode="HTML" if cap else None)
+            if long_text:
+                await _send_text_chunks(long_text)
             return reusable_file_id or msg.animation.file_id
         elif media_type == "audio":
-            msg = await bot.send_audio(chat_id, media, caption=text, parse_mode="HTML")
+            msg = await bot.send_audio(chat_id, media, caption=cap, parse_mode="HTML" if cap else None)
+            if long_text:
+                await _send_text_chunks(long_text)
             return reusable_file_id or msg.audio.file_id
         elif media_type == "voice":
-            msg = await bot.send_voice(chat_id, media, caption=text, parse_mode="HTML")
+            msg = await bot.send_voice(chat_id, media, caption=cap, parse_mode="HTML" if cap else None)
+            if long_text:
+                await _send_text_chunks(long_text)
             return reusable_file_id or msg.voice.file_id
         elif media_type == "video_note":
             msg = await bot.send_video_note(chat_id, media)
             if text:
-                await bot.send_message(chat_id, text, parse_mode="HTML")
+                await _send_text_chunks(text)
             return reusable_file_id or msg.video_note.file_id
         elif media_type == "sticker":
             msg = await bot.send_sticker(chat_id, media)
             if text:
-                await bot.send_message(chat_id, text, parse_mode="HTML")
+                await _send_text_chunks(text)
             return reusable_file_id or msg.sticker.file_id
     if rich and text:
         try:
@@ -155,6 +181,6 @@ async def _send(bot: Bot, chat_id: int, text, media_bytes: bytes | None,
             return reusable_file_id
         except Exception as e:
             log.warning("_send: рич-сообщение не отправилось (%s), шлю обычным текстом", e)
-    await bot.send_message(chat_id, text, parse_mode="HTML")
+    if text:
+        await _send_text_chunks(text)
     return reusable_file_id
-
