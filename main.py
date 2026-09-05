@@ -23,6 +23,39 @@ logging.basicConfig(
 log = logging.getLogger("main")
 
 
+async def setup_master_bot(bot: Bot) -> None:
+    """Вызывается один раз при старте — настраивает мастер-бота:
+    регистрирует команды и разрешает домен Mini App через setMyCommands.
+
+    Домен для web_app InlineKeyboardButton регистрировать НЕ нужно —
+    Telegram принимает любой HTTPS-домен напрямую. initData подписывается
+    токеном бота который выдаёт кнопку, поэтому валидация на бэкенде
+    будет работать корректно без дополнительных шагов.
+    """
+    from aiogram.types import BotCommand, BotCommandScopeDefault
+    from config import FLOW_MINIAPP_URL
+    try:
+        await bot.set_my_commands([
+            BotCommand(command="start",     description="Главное меню"),
+            BotCommand(command="my_bots",   description="Мои боты"),
+            BotCommand(command="pro",       description="Pro-подписка"),
+            BotCommand(command="help",      description="Помощь"),
+        ], scope=BotCommandScopeDefault())
+        log.info("Команды мастер-бота установлены")
+    except Exception as e:
+        log.warning("Не удалось установить команды мастер-бота: %s", e)
+
+    # Проверяем доступность Mini App домена (не блокируем запуск если недоступен)
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as s:
+            async with s.head(FLOW_MINIAPP_URL, timeout=aiohttp.ClientTimeout(total=5)) as r:
+                log.info("Mini App домен %s доступен (HTTP %s)", FLOW_MINIAPP_URL, r.status)
+    except Exception as e:
+        log.warning("Mini App домен недоступен при старте (%s) — "
+                    "убедитесь что flow-api и фронтенд запущены", e)
+
+
 async def run_master_polling(dp: Dispatcher):
     """Отдельный устойчивый цикл поллинга для мастер-бота со сбросом сессии"""
     backoff = 5
@@ -38,6 +71,8 @@ async def run_master_polling(dp: Dispatcher):
 
         try:
             log.info("Запуск polling для Master Bot...")
+            # Настраиваем бота один раз перед стартом поллинга
+            await setup_master_bot(master)
             await dp.start_polling(
                 master,
                 handle_signals=False,
