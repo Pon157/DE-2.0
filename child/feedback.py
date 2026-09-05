@@ -8,6 +8,7 @@ from sqlalchemy import select
 from services.autoreply import check_and_fire
 from services import moderation as mod
 from services import antispam
+from services.scenario_runner import run_step, find_matching_scenario, trigger_scenario
 from child.common import (inject_extras, build_keyboards, send_with_keyboards,
                           handle_keyboard_button, open_ticket, get_cfg,
                           buffer_or_process, relay_to_admin_chat, is_bot_admin,
@@ -81,9 +82,25 @@ def build_feedback_router() -> Router:
             return
         if await handle_keyboard_button(m, bot_db_id):
             return
-        # БАГ: неизвестные команды (/что-угодно) раньше релеились в админ-чат
-        # как обращение. Триггер-команды из конструктора уже обработаны в
-        # common-роутере — сюда доходят только чужие/неизвестные.
+
+        # ── Сценарии (Pro) ───────────────────────────────────────────────
+        # Порядок важен:
+        # 1. Антиспам УЖЕ отработал выше — капча не обходится сценарием.
+        # 2. FSM-состояние (донат, техн. диалог) УЖЕ проверено выше.
+        # 3. run_step: если юзер внутри сценария и waiting_input=True —
+        #    поглощаем сообщение, дальше не идём.
+        if await run_step(m, bot, bot_db_id):
+            return
+        # 4. find_matching_scenario: проверяем, запускает ли это сообщение
+        #    новый сценарий (команда / ключевое слово / текст кнопки).
+        #    handle_keyboard_button уже отработал выше — здесь только сценарии.
+        scenario = await find_matching_scenario(bot_db_id, m.text)
+        if scenario:
+            await trigger_scenario(bot_db_id, m.from_user.id, scenario.id, bot)
+            return
+        # ────────────────────────────────────────────────────────────────
+
+        # Неизвестные команды не идут в relay
         if m.text and m.text.startswith("/"):
             return
         if not cfg.admin_chat_id:
