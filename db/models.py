@@ -103,6 +103,16 @@ class ChildBot(Base):
     close_notify_text: Mapped[str | None] = mapped_column(
         Text, nullable=True,
         default="🔒 Обращение закрыто администрацией. Ваше новое сообщение откроет новое обращение.")
+    # Кнопка «Закрыть / Открыть снова» в ADMIN-ЧАТЕ под каждым сообщением.
+    # Отдельные поля от close_ticket_button_* (которые про reply-кнопку у
+    # пользователя). NULL = показываем дефолт «🔒 Закрыть обращение».
+    # Пустая строка («») = кнопка не показывается вообще.
+    admin_close_button_text: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, default=None)   # None → дефолтный текст
+    admin_close_button_style: Mapped[str | None] = mapped_column(
+        String(16), nullable=True)
+    admin_close_button_icon: Mapped[str | None] = mapped_column(
+        String(32), nullable=True)
     always_new_ticket: Mapped[bool] = mapped_column(Boolean, default=False)
     pin_first_message: Mapped[bool] = mapped_column(Boolean, default=False)
     survey_start_text: Mapped[str | None] = mapped_column(Text, nullable=True)
