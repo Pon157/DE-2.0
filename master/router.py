@@ -687,7 +687,7 @@ async def cfg_menu(c: CallbackQuery):
             [("⭐️ Тип кнопки доната: " + cb.donate_button_type, f"cyc_donbtn:{bot_id}")],
             [("✉️ Кнопка обращения", f"ticketbtn:{bot_id}")],
             [("❌ Кнопка «Закрыть обращение» (текст/цвет/эмодзи/удаление)", f"closebtn:{bot_id}")],
-            [("🔒 Кнопка закрытия в admin-чате (inline)", f"admin_closebtn:{bot_id}")],
+            # [("🔒 Кнопка закрытия в admin-чате (inline)", f"admin_closebtn:{bot_id}")],
             [("⭐️ Текст/цвет/эмодзи кнопки доната", f"donatebtn:{bot_id}")],
             [("🔄 Restart/кнопка: " + ("новый тикет" if cb.always_new_ticket else "тот же тикет"),
               f"cyc_newticket:{bot_id}")],
@@ -745,24 +745,23 @@ async def cfg_menu(c: CallbackQuery):
             [(f"🛡 Антиспам трогает владельца: {'нет' if cb.antispam_ignore_owner else 'да'}",
               f"cyc_aspown:{bot_id}")],
         ]
-    if owner_is_pro:
-        flow_url = f"{FLOW_MINIAPP_URL}?bot_id={bot_id}"
-        rows.append([("⚡ Сценарии (Pro)", "web_app", flow_url)])
-    else:
-        rows.append([("⚡ Сценарии (только Pro)", f"scenarios_nopro:{bot_id}")])
+    # if owner_is_pro:
+    #     flow_url = f"{FLOW_MINIAPP_URL}?bot_id={bot_id}"
+    #     rows.append([("⚡ Сценарии (Pro)", "web_app", flow_url)])
+    # else:
+    #     rows.append([("⚡ Сценарии (только Pro)", f"scenarios_nopro:{bot_id}")])
     rows.append([("⬅️ Назад", f"bot:{bot_id}")])
     await c.message.edit_text(f"⚙️ Настройки @{cb.username}", reply_markup=kb(rows))
     await c.answer()
 
 
-@router.callback_query(F.data.startswith("scenarios_nopro:"))
-async def scenarios_nopro(c: CallbackQuery):
-    await c.answer(
-        "⚡ Сценарии — функция Pro-подписки.\n"
-        "Оформите Pro в главном меню чтобы получить доступ к визуальному редактору флоу.",
-        show_alert=True,
-    )
-
+# @router.callback_query(F.data.startswith("scenarios_nopro:"))
+# async def scenarios_nopro(c: CallbackQuery):
+#     await c.answer(
+#         "⚡ Сценарии — функция Pro-подписки.\n"
+#         "Оформите Pro в главном меню чтобы получить доступ к визуальному редактору флоу.",
+#         show_alert=True,
+#     )
 
 # --- циклические переключатели ---
 CYCLES = {
