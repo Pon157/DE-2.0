@@ -1,4 +1,3 @@
-
 """Боты-анкеты (п.4, по запросу) — новый тип дочернего бота (BotType.survey).
 
 Владелец настраивает одну или несколько анкет (Survey) в конструкторе,
@@ -29,7 +28,8 @@ from child.common import (inject_extras, build_keyboards, send_with_keyboards,
                           handle_keyboard_button, get_cfg, is_bot_admin,
                           should_apply_antispam, safe_call, send_response,
                           message_media, build_topic_name, welcome_pro_kwargs,
-                          rich_enabled, send_rich_or_plain)
+                          rich_enabled, send_rich_or_plain,
+                          buffer_or_process, relay_to_admin_chat)
 from utils.emoji import em
 from sqlalchemy import select
 
@@ -476,32 +476,41 @@ def build_survey_router() -> Router:
         # текстовый вопрос.
         resp = await _in_progress(bot_db_id, m.from_user.id)
         if resp:
-            questions = await _questions(resp.survey_id)
-            if resp.current_index >= len(questions):
-                return
-            q = questions[resp.current_index]
-            if q.qtype == "choice":
-                await m.answer(f"{em('warn')} Пожалуйста, выберите один из вариантов "
-                               "кнопкой выше.")
-                return
-            # По запросу: ответом на свободный текстовый вопрос анкеты
-            # теперь можно прислать и медиа (фото/видео/аудио/голосовое/
-            # документ/гиф/кружок/стикер) — раньше медиа без подписи просто
-            # терялось и сохранялось как "(сообщение без текста)".
-            media_file_id, media_type = message_media(m)
-            answer_text = m.text or m.caption or ("" if media_file_id else "")
-            answer = {"q": q.text, "a": answer_text}
-            if media_file_id:
-                answer["media_file_id"] = media_file_id
-                answer["media_type"] = media_type
-            async with Session() as s:
-                r2 = await s.get(SurveyResponse, resp.id)
-                answers = json.loads(r2.answers_json or "[]")
-                answers.append(answer)
-                r2.answers_json = json.dumps(answers, ensure_ascii=False)
-                r2.current_index += 1
-                await s.commit()
-            await _advance_or_finish(bot, cfg, m, resp.id)
+            # БАГ (по запросу): при отправке альбома (несколько фото одной
+            # группой) user_message вызывался для КАЖДОГО фото — каждое
+            # двигало current_index, и пользователь «проскакивал» несколько
+            # вопросов разом вместо одного. Теперь альбом буферизируется:
+            # берём первый файл из группы как ответ, остальные игнорируем.
+            async def _process_answer(msgs: list[Message]):
+                first = msgs[0]
+                r2_check = await _in_progress(bot_db_id, first.from_user.id)
+                if not r2_check:
+                    return
+                qs = await _questions(r2_check.survey_id)
+                if r2_check.current_index >= len(qs):
+                    return
+                q2 = qs[r2_check.current_index]
+                if q2.qtype == "choice":
+                    await first.answer(f"{em('warn')} Пожалуйста, выберите один из вариантов "
+                                       "кнопкой выше.")
+                    return
+                # Для альбома берём первый медиа-файл + подпись (если есть)
+                media_file_id, media_type = message_media(first)
+                answer_text = first.text or first.caption or ("" if media_file_id else "")
+                answer = {"q": q2.text, "a": answer_text}
+                if media_file_id:
+                    answer["media_file_id"] = media_file_id
+                    answer["media_type"] = media_type
+                async with Session() as s:
+                    r3 = await s.get(SurveyResponse, r2_check.id)
+                    answers = json.loads(r3.answers_json or "[]")
+                    answers.append(answer)
+                    r3.answers_json = json.dumps(answers, ensure_ascii=False)
+                    r3.current_index += 1
+                    await s.commit()
+                await _advance_or_finish(bot, cfg, first, r2_check.id)
+
+            await buffer_or_process(m, _process_answer)
             return
 
         # Ни одна анкета не начата и это не ответ — если включён "режим
@@ -511,8 +520,15 @@ def build_survey_router() -> Router:
         # child/common.py это подхватит). Реплай на сообщение админа
         # цепляется к той же ветке через reply_parameters, если получится
         # найти исходную копию.
+        # БАГ (по запросу): альбомы в "режиме диалога" тоже буферизируем —
+        # раньше каждое фото из группы релеилось отдельным сообщением.
         if cfg.survey_dialog_enabled and cfg.admin_chat_id:
-            await _relay_dialog_message(m, bot, cfg)
+            async def _relay_album(msgs: list[Message]):
+                if len(msgs) == 1:
+                    await _relay_dialog_message(msgs[0], bot, cfg)
+                else:
+                    await relay_to_admin_chat(msgs, bot, cfg)
+            await buffer_or_process(m, _relay_album)
             return
 
         # Ни одна анкета не начата и диалог выключен — подсказываем меню.
@@ -522,4 +538,3 @@ def build_survey_router() -> Router:
                            reply_markup=ikb or rkb)
 
     return r
-
