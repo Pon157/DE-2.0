@@ -57,5 +57,4 @@ PLATFORM_BOT_USERNAME = "Dialogue_Enginebot"
 
 # URL Mini App редактора сценариев (Pro-функция).
 # Переопределяется через .env: FLOW_MINIAPP_URL=https://...
-# Для локальной разработки можно использовать ngrok-туннель.
 FLOW_MINIAPP_URL = os.environ.get("FLOW_MINIAPP_URL", "https://flow.dialogengine.ru")
