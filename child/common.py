@@ -744,22 +744,22 @@ async def relay_to_admin_chat(msgs: list[Message], bot: Bot, cfg: ChildBot,
 
     close_kb = None
     if cfg.forward_mode == ForwardMode.copy:
-        # Кнопка «Закрыть обращение» в admin-чате настраивается через
-        # admin_close_button_* (текст, цвет Bot API 9.4, premium-эмодзи).
-        # Это отдельные поля от close_ticket_button_* (reply-кнопка у юзера).
-        #   admin_close_button_text is None → показываем дефолт
-        #   admin_close_button_text == ""   → кнопка отключена полностью
-        #   иначе                           → кастомный текст/стиль/эмодзи
-        _acbt = cfg.admin_close_button_text
+        # БАГ (по запросу): раньше кнопка "Закрыть обращение" вешалась
+        # ТОЛЬКО на первое сообщение нового тикета — на всех последующих
+        # сообщениях пользователя её не было вообще, приходилось скроллить
+        # вверх. В режиме copy у каждой копии есть свой reply_markup —
+        # вешаем кнопку на КАЖДОЕ сообщение. В режиме forward это
+        # невозможно (forwardMessage не поддерживает reply_markup вообще) —
+        # там вместо кнопки работает команда /close (реплаем или в топике).
+        _acbt = getattr(cfg, "admin_close_button_text", None)
         if _acbt is None:
             _acbt = "🔒 Закрыть обращение"
-        if _acbt:  # пустая строка = кнопка убрана
+        if _acbt:
             close_kb = InlineKeyboardMarkup(inline_keyboard=[[
                 styled_button(
                     _acbt,
                     callback_data=f"close_ticket:{ticket.id}",
                     style=getattr(cfg, "admin_close_button_style", None) or None,
-                    icon_custom_emoji_id=getattr(cfg, "admin_close_button_icon", None) or None,
                 )
             ]])
 
@@ -1312,35 +1312,14 @@ def build_common_router() -> Router:
             return
         uname = c.from_user.username
         actor = f"@{uname}" if uname else str(c.from_user.id)
-        cfg2 = await get_cfg(bot_db_id)
-        # Кнопка «Открыть снова» — симметрична кнопке закрытия.
-        # Если кнопка закрытия отключена (пустая строка) — и «Открыть снова»
-        # тоже не показываем (убрать нельзя, т.к. кнопка уже отрисована —
-        # заменяем на заглушку через edit_reply_markup(None)).
-        _reopen_text = None
-        if cfg2:
-            _acbt = cfg2.admin_close_button_text
-            if _acbt is None:
-                _reopen_text = "🔓 Открыть снова"   # дефолт
-            elif _acbt == "":
-                _reopen_text = None   # кнопка убрана — убираем и «Открыть снова»
-            else:
-                _reopen_text = "🔓 Открыть снова"
-        else:
-            _reopen_text = "🔓 Открыть снова"
         try:
-            new_markup = (
+            _acbt2 = getattr(await get_cfg(bot_db_id), "admin_close_button_text", None)
+            _reopen_text = "🔓 Открыть снова" if _acbt2 != "" else None
+            await c.message.edit_reply_markup(reply_markup=(
                 InlineKeyboardMarkup(inline_keyboard=[[
-                    styled_button(
-                        _reopen_text,
-                        callback_data=f"reopen_ticket:{tid}",
-                        style=getattr(cfg2, "admin_close_button_style", None) or None,
-                        icon_custom_emoji_id=getattr(cfg2, "admin_close_button_icon", None) or None,
-                    )
-                ]])
-                if _reopen_text else None
-            )
-            await c.message.edit_reply_markup(reply_markup=new_markup)
+                    styled_button(_reopen_text, callback_data=f"reopen_ticket:{tid}")
+                ]]) if _reopen_text else None
+            ))
         except Exception:
             pass
         try:
