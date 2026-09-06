@@ -217,6 +217,9 @@ class St(StatesGroup):
     close_btn_text = State()
     close_btn_style = State()
     close_btn_icon = State()
+    admin_close_btn_text = State()
+    admin_close_btn_style = State()
+    admin_close_btn_icon = State()
     donate_btn_text = State()
     donate_btn_style = State()
     donate_btn_icon = State()
@@ -687,7 +690,7 @@ async def cfg_menu(c: CallbackQuery):
             [("⭐️ Тип кнопки доната: " + cb.donate_button_type, f"cyc_donbtn:{bot_id}")],
             [("✉️ Кнопка обращения", f"ticketbtn:{bot_id}")],
             [("❌ Кнопка «Закрыть обращение» (текст/цвет/эмодзи/удаление)", f"closebtn:{bot_id}")],
-            # [("🔒 Кнопка закрытия в admin-чате (inline)", f"admin_closebtn:{bot_id}")],
+            [("🔒 Кнопка закрытия в admin-чате (inline)", f"admin_closebtn:{bot_id}")],
             [("⭐️ Текст/цвет/эмодзи кнопки доната", f"donatebtn:{bot_id}")],
             [("🔄 Restart/кнопка: " + ("новый тикет" if cb.always_new_ticket else "тот же тикет"),
               f"cyc_newticket:{bot_id}")],
@@ -745,23 +748,24 @@ async def cfg_menu(c: CallbackQuery):
             [(f"🛡 Антиспам трогает владельца: {'нет' if cb.antispam_ignore_owner else 'да'}",
               f"cyc_aspown:{bot_id}")],
         ]
-    # if owner_is_pro:
-    #     flow_url = f"{FLOW_MINIAPP_URL}?bot_id={bot_id}"
-    #     rows.append([("⚡ Сценарии (Pro)", "web_app", flow_url)])
-    # else:
-    #     rows.append([("⚡ Сценарии (только Pro)", f"scenarios_nopro:{bot_id}")])
+    if owner_is_pro:
+        flow_url = f"{FLOW_MINIAPP_URL}?bot_id={bot_id}"
+        rows.append([("⚡ Сценарии (Pro)", "web_app", flow_url)])
+    else:
+        rows.append([("⚡ Сценарии (только Pro)", f"scenarios_nopro:{bot_id}")])
     rows.append([("⬅️ Назад", f"bot:{bot_id}")])
     await c.message.edit_text(f"⚙️ Настройки @{cb.username}", reply_markup=kb(rows))
     await c.answer()
 
 
-# @router.callback_query(F.data.startswith("scenarios_nopro:"))
-# async def scenarios_nopro(c: CallbackQuery):
-#     await c.answer(
-#         "⚡ Сценарии — функция Pro-подписки.\n"
-#         "Оформите Pro в главном меню чтобы получить доступ к визуальному редактору флоу.",
-#         show_alert=True,
-#     )
+@router.callback_query(F.data.startswith("scenarios_nopro:"))
+async def scenarios_nopro(c: CallbackQuery):
+    await c.answer(
+        "⚡ Сценарии — функция Pro-подписки.\n"
+        "Оформите Pro в главном меню чтобы получить доступ к визуальному редактору флоу.",
+        show_alert=True,
+    )
+
 
 # --- циклические переключатели ---
 CYCLES = {
@@ -1088,6 +1092,133 @@ async def closebtn_icon(m: Message, state: FSMContext):
         await s.commit()
     await state.clear()
     await m.answer(f"{em('check')} Кнопка «Закрыть обращение» обновлена!", reply_markup=nav_kb(bot_id))
+
+
+# --- кнопка «Закрыть обращение» в ADMIN-ЧАТЕ (inline под каждым сообщением) ---
+
+@router.callback_query(F.data.startswith("admin_closebtn:"))
+async def admin_closebtn_start(c: CallbackQuery, state: FSMContext):
+    bot_id = int(c.data.split(":")[1])
+    cb, is_owner = await _access(bot_id, c.from_user.id)
+    if not cb or not is_owner:
+        await c.answer("Только владелец", show_alert=True); return
+    acbt = cb.admin_close_button_text
+    if acbt is None:
+        cur = "«🔒 Закрыть обращение» (дефолт)"
+    elif acbt == "":
+        cur = "отключена"
+    else:
+        cur = f"«{acbt}»"
+    rows = [
+        [("✏️ Изменить текст/цвет/эмодзи", f"admin_closebtn_edit:{bot_id}")],
+    ]
+    if acbt != "":
+        rows.append([("🚫 Убрать кнопку из admin-чата", f"admin_closebtn_del:{bot_id}")])
+    if acbt is not None:
+        rows.append([("↩️ Вернуть дефолт", f"admin_closebtn_reset:{bot_id}")])
+    rows.append([("⬅️ Назад", f"cfg:{bot_id}")])
+    await c.message.edit_text(
+        f"Кнопка закрытия в <b>admin-чате</b>: {cur}\n\n"
+        "Это inline-кнопка под каждым сообщением пользователя в чате с операторами.\n"
+        "Поддерживает текст, цвет (Bot API 9.4) и premium-эмодзи.",
+        reply_markup=kb(rows)
+    )
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("admin_closebtn_del:"))
+async def admin_closebtn_del(c: CallbackQuery):
+    bot_id = int(c.data.split(":")[1])
+    cb, is_owner = await _access(bot_id, c.from_user.id)
+    if not cb or not is_owner:
+        await c.answer("Только владелец", show_alert=True); return
+    async with Session() as s:
+        obj = await s.get(ChildBot, bot_id)
+        obj.admin_close_button_text = ""
+        obj.admin_close_button_style = None
+        obj.admin_close_button_icon = None
+        await s.commit()
+    await c.answer(f"{em('check')} Кнопка убрана из admin-чата", show_alert=True)
+    c2 = c.model_copy(update={"data": f"admin_closebtn:{bot_id}"})
+    await admin_closebtn_start(c2, state=None)
+
+
+@router.callback_query(F.data.startswith("admin_closebtn_reset:"))
+async def admin_closebtn_reset(c: CallbackQuery):
+    bot_id = int(c.data.split(":")[1])
+    cb, is_owner = await _access(bot_id, c.from_user.id)
+    if not cb or not is_owner:
+        await c.answer("Только владелец", show_alert=True); return
+    async with Session() as s:
+        obj = await s.get(ChildBot, bot_id)
+        obj.admin_close_button_text = None
+        obj.admin_close_button_style = None
+        obj.admin_close_button_icon = None
+        await s.commit()
+    await c.answer(f"{em('check')} Сброшено до дефолта", show_alert=True)
+    c2 = c.model_copy(update={"data": f"admin_closebtn:{bot_id}"})
+    await admin_closebtn_start(c2, state=None)
+
+
+@router.callback_query(F.data.startswith("admin_closebtn_edit:"))
+async def admin_closebtn_edit(c: CallbackQuery, state: FSMContext):
+    bot_id = int(c.data.split(":")[1])
+    cb, is_owner = await _access(bot_id, c.from_user.id)
+    if not cb or not is_owner:
+        await c.answer("Только владелец", show_alert=True); return
+    await state.set_state(St.admin_close_btn_text)
+    await state.update_data(bot_id=bot_id, last_msg_id=c.message.message_id)
+    cur = cb.admin_close_button_text or "🔒 Закрыть обращение"
+    await c.message.edit_text(f"Текущий текст: «{cur}»\n\nПришлите новый текст кнопки:")
+    await c.answer()
+
+
+@router.message(St.admin_close_btn_text)
+async def admin_closebtn_text(m: Message, state: FSMContext):
+    await delete_previous(m, state)
+    if not m.text or not m.text.strip():
+        msg = await m.answer("Нужен текст. Попробуйте ещё раз.")
+        await state.update_data(last_msg_id=msg.message_id)
+        return
+    await state.update_data(text=m.text.strip()[:64])
+    await state.set_state(St.admin_close_btn_style)
+    msg = await m.answer("Выберите цвет кнопки:",
+                         reply_markup=kb([[(t, f"acbstyle:{v}")] for t, v in STYLES]))
+    await state.update_data(last_msg_id=msg.message_id)
+
+
+@router.callback_query(St.admin_close_btn_style, F.data.startswith("acbstyle:"))
+async def admin_closebtn_style(c: CallbackQuery, state: FSMContext):
+    style = c.data.split(":", 1)[1]
+    await state.update_data(style=None if style == "-" else style)
+    await state.set_state(St.admin_close_btn_icon)
+    await c.message.edit_text(
+        f"{em('sparkles')} Пришлите premium-эмодзи для кнопки или «-» чтобы пропустить."
+    )
+    await c.answer()
+
+
+@router.message(St.admin_close_btn_icon)
+async def admin_closebtn_icon(m: Message, state: FSMContext):
+    icon_id = None
+    if m.text and m.text.strip() != "-" and m.entities:
+        for e in m.entities:
+            if e.type == "custom_emoji":
+                icon_id = e.custom_emoji_id
+                break
+    data = await state.get_data()
+    bot_id = data["bot_id"]
+    async with Session() as s:
+        obj = await s.get(ChildBot, bot_id)
+        obj.admin_close_button_text = data["text"]
+        obj.admin_close_button_style = data.get("style")
+        obj.admin_close_button_icon = icon_id
+        await s.commit()
+    await state.clear()
+    await m.answer(
+        f"{em('check')} Кнопка закрытия в admin-чате обновлена!",
+        reply_markup=nav_kb(bot_id)
+    )
 
 
 # --- текст/цвет/premium-эмодзи кнопки доната (Bot API 9.4) ---
