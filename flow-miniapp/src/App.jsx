@@ -479,9 +479,13 @@ function ConfigPanel({ node, onChange, onClose, onDelete, isMobile }) {
           </FieldBlock>
           <FieldBlock label="Кнопки" hint="Каждая строка — одна кнопка. Текст кнопки = метка ветки.">
             <textarea style={{ ...inputStyle, height: 100, resize: "vertical" }}
-              value={(cfg.buttons || []).join("\n")}
-              onChange={e => set("buttons", e.target.value.split("\n").map(s => s.trim()).filter(Boolean))}
-              placeholder={"Вариант А\nВариант Б\nВариант В"} />
+              value={(cfg.buttons || []).join("
+")}
+              onChange={e => set("buttons", e.target.value.split("
+").map(s => s.trim()).filter(Boolean))}
+              placeholder={"Вариант А
+Вариант Б
+Вариант В"} />
           </FieldBlock>
           <div style={{ background: C.elevated, borderRadius: 8, padding: "8px 12px",
             fontSize: 12, color: C.textMid, marginTop: 4, lineHeight: 1.6 }}>
