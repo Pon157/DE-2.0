@@ -102,6 +102,26 @@ const Icons = {
         strokeLinecap="round" />
     </svg>
   ),
+  setvar: () => (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+      <path d="M3 5h10M3 8h6M3 11h4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
+      <circle cx="12.5" cy="10.5" r="2.5" stroke="currentColor" strokeWidth="1.3" fill="none"/>
+      <path d="M14.5 12.5l1.5 1.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
+    </svg>
+  ),
+  random: () => (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+      <path d="M1 4h3l8 8h3M14 4h-3L9.5 5.5M6.5 10.5L4 13H1" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+      <path d="M12 2l2 2-2 2M12 10l2 2-2 2" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+    </svg>
+  ),
+  buttons: () => (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+      <rect x="1" y="2" width="14" height="5" rx="1.5" stroke="currentColor" strokeWidth="1.4" fill="none"/>
+      <rect x="1" y="9" width="14" height="5" rx="1.5" stroke="currentColor" strokeWidth="1.4" fill="none"/>
+      <path d="M5 4.5h6M5 11.5h6" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/>
+    </svg>
+  ),
 };
 
 // ─── Цветовая палитра ─────────────────────────────────────────────────────────
@@ -123,13 +143,15 @@ const C = {
 };
 
 const NODE_TYPES_META = {
-  trigger:   { label: "Триггер",    color: "#6366f1", Icon: Icons.trigger,   hint: "Точка входа в сценарий. Каждый сценарий начинается здесь." },
-  message:   { label: "Сообщение",  color: C.green,   Icon: Icons.message,   hint: "Отправляет сообщение пользователю." },
-  input:     { label: "Ввод",       color: C.warn,    Icon: Icons.input,     hint: "Задаёт вопрос и сохраняет ответ в переменную." },
-  condition: { label: "Условие",    color: "#8b5cf6", Icon: Icons.condition, hint: "Разветвляет сценарий по условию (да / нет)." },
-  delay:     { label: "Задержка",   color: "#6b7280", Icon: Icons.delay,     hint: "Пауза перед следующим шагом." },
-  http:      { label: "HTTP-запрос",color: C.danger,  Icon: Icons.http,      hint: "Вызывает внешний сервис по HTTPS." },
-  end:       { label: "Конец",      color: "#374151", Icon: Icons.end,       hint: "Завершает сценарий." },
+  trigger:      { label: "Триггер",        color: "#6366f1", Icon: Icons.trigger,      hint: "Точка входа в сценарий. Каждый сценарий начинается здесь." },
+  message:      { label: "Сообщение",      color: C.green,   Icon: Icons.message,      hint: "Отправляет сообщение пользователю. Можно вставить прямую ссылку на фото (jpg/png)." },
+  input:        { label: "Ввод",           color: C.warn,    Icon: Icons.input,        hint: "Задаёт вопрос и сохраняет ответ в переменную." },
+  condition:    { label: "Условие",        color: "#8b5cf6", Icon: Icons.condition,    hint: "Разветвляет сценарий по условию (да / нет)." },
+  delay:        { label: "Задержка",       color: "#6b7280", Icon: Icons.delay,        hint: "Пауза перед следующим шагом." },
+  set_variable: { label: "Задать перем.",  color: "#0ea5e9", Icon: Icons.setvar,       hint: "Устанавливает переменную вручную (статическое значение)." },
+  random_branch:{ label: "Случайный выбор",color: "#f97316", Icon: Icons.random,       hint: "Случайно выбирает одну из веток (A или B)." },
+  buttons:      { label: "Кнопки",         color: "#a855f7", Icon: Icons.buttons,      hint: "Отправляет сообщение с инлайн-кнопками. Пользователь выбирает ветку." },
+  end:          { label: "Конец",          color: "#374151", Icon: Icons.end,          hint: "Завершает сценарий." },
 };
 
 const TRIGGER_OPTIONS = [
@@ -202,7 +224,7 @@ function FlowNode({ id, data, selected }) {
         </div>
       )}
 
-      {hasOutput && !isBranch && (
+      {hasOutput && !isBranch && !isRandom && !isButtons && (
         <Handle type="source" position={Position.Bottom} style={{
           background: meta.color, border: `2px solid ${C.surface}`,
           width: 12, height: 12, bottom: -7,
@@ -224,6 +246,46 @@ function FlowNode({ id, data, selected }) {
             <span style={{ color: C.danger }}>НЕТ</span>
           </div>
         </>
+      )}
+      {isRandom && (
+        <>
+          <Handle type="source" id="a" position={Position.Bottom} style={{
+            background: "#fb923c", border: `2px solid ${C.surface}`,
+            width: 12, height: 12, bottom: -7, left: "30%",
+          }} />
+          <Handle type="source" id="b" position={Position.Bottom} style={{
+            background: "#a78bfa", border: `2px solid ${C.surface}`,
+            width: 12, height: 12, bottom: -7, left: "70%",
+          }} />
+          <div style={{ display: "flex", justifyContent: "space-between",
+            padding: "4px 10px 8px", fontSize: 10 }}>
+            <span style={{ color: "#fb923c" }}>A</span>
+            <span style={{ color: "#a78bfa" }}>B</span>
+          </div>
+        </>
+      )}
+      {isButtons && data.config?.buttons?.length > 0 && (
+        <div style={{ padding: "0 10px 10px", display: "flex", flexWrap: "wrap", gap: 4 }}>
+          {data.config.buttons.map((btn, i) => (
+            <div key={i} style={{
+              background: "#a855f722", border: "1px solid #a855f744",
+              borderRadius: 4, padding: "2px 8px", fontSize: 10, color: "#d8b4fe",
+              position: "relative",
+            }}>
+              {btn}
+              <Handle type="source" id={`btn_${i}`} position={Position.Bottom} style={{
+                background: "#a855f7", border: `2px solid ${C.surface}`,
+                width: 8, height: 8, bottom: -5, left: "50%",
+              }} />
+            </div>
+          ))}
+        </div>
+      )}
+      {isButtons && (!data.config?.buttons?.length) && (
+        <Handle type="source" position={Position.Bottom} style={{
+          background: "#a855f7", border: `2px solid ${C.surface}`,
+          width: 12, height: 12, bottom: -7,
+        }} />
       )}
     </div>
   );
@@ -253,8 +315,20 @@ function NodeSummary({ type, config }) {
   if (type === "delay") return (
     <span style={{ color: C.textMid }}>{config.seconds || 0} сек</span>
   );
-  if (type === "http") return (
-    <span style={{ color: "#fca5a5", fontSize: 12 }}>{truncate(config.url || "—", 38)}</span>
+  if (type === "set_variable") return (
+    <span style={{ color: "#7dd3fc" }}>
+      <span style={{ color: "#38bdf8" }}>{config.variable_name || "перем."}</span>
+      <span style={{ color: C.textMid }}> = </span>
+      <span style={{ color: C.warn }}>"{truncate(config.value || "?", 24)}"</span>
+    </span>
+  );
+  if (type === "random_branch") return (
+    <span style={{ color: "#fdba74", fontSize: 12 }}>50% A · 50% B</span>
+  );
+  if (type === "buttons") return (
+    <span style={{ color: "#d8b4fe", fontSize: 12 }}>
+      {config.buttons?.length ? `${config.buttons.length} кнопк${config.buttons.length === 1 ? "а" : "и"}` : "Кнопки не заданы"}
+    </span>
   );
   return null;
 }
@@ -313,10 +387,10 @@ function ConfigPanel({ node, onChange, onClose, onDelete, isMobile }) {
               onChange={e => set("text", e.target.value)}
               placeholder="Введите текст сообщения..." />
           </FieldBlock>
-          <FieldBlock label="Фото (необязательно)" hint="Telegram file_id фотографии">
+          <FieldBlock label="Фото (необязательно)" hint="Прямая ссылка на фото (jpg/png) или Telegram file_id">
             <input style={inputStyle} value={cfg.photo_file_id || ""}
               onChange={e => set("photo_file_id", e.target.value)}
-              placeholder="AgAC..." />
+              placeholder="https://example.com/photo.jpg  или  AgAC..." />
           </FieldBlock>
         </>
       )}
@@ -371,31 +445,52 @@ function ConfigPanel({ node, onChange, onClose, onDelete, isMobile }) {
         </FieldBlock>
       )}
 
-      {node.data.nodeType === "http" && (
+      {node.data.nodeType === "set_variable" && (
         <>
-          <FieldBlock label="URL сервиса" hint="Только HTTPS-адреса. Это адрес, куда будет отправлен запрос.">
-            <input style={inputStyle} value={cfg.url || ""} maxLength={512}
-              onChange={e => set("url", e.target.value)} placeholder="https://example.com/webhook" />
+          <FieldBlock label="Имя переменной" hint="Только буквы, цифры и _">
+            <input style={inputStyle} value={cfg.variable_name || ""} maxLength={64}
+              onChange={e => set("variable_name", e.target.value.replace(/\W/g, "_"))}
+              placeholder="например: score" />
           </FieldBlock>
-          <FieldBlock label="Метод запроса">
-            <select style={inputStyle} value={cfg.method || "POST"}
-              onChange={e => set("method", e.target.value)}>
-              <option value="POST">POST</option>
-              <option value="GET">GET</option>
-            </select>
+          <FieldBlock label="Значение">
+            <input style={inputStyle} value={cfg.value || ""} maxLength={512}
+              onChange={e => set("value", e.target.value)}
+              placeholder="42" />
           </FieldBlock>
-          <FieldBlock label="Тело запроса" hint={`Шаблон JSON. Переменные пишутся так: {{user_name}}`}>
+        </>
+      )}
+
+      {node.data.nodeType === "random_branch" && (
+        <div style={{ background: C.elevated, borderRadius: 8, padding: "10px 12px",
+          fontSize: 12, color: C.textMid, lineHeight: 1.7 }}>
+          Случайно выбирает одну из двух веток с вероятностью 50/50.<br/>
+          <span style={{ color: "#fb923c" }}>●</span> Левый выход → ветка A<br/>
+          <span style={{ color: "#a78bfa" }}>●</span> Правый выход → ветка B
+        </div>
+      )}
+
+      {node.data.nodeType === "buttons" && (
+        <>
+          <FieldBlock label="Текст сообщения">
             <textarea style={{ ...inputStyle, height: 80, resize: "vertical" }}
-              value={cfg.body_template || ""} maxLength={2000}
-              onChange={e => set("body_template", e.target.value)}
-              placeholder={'{"name": "{{user_name}}"}'} />
+              value={cfg.text || ""} maxLength={1000}
+              onChange={e => set("text", e.target.value)}
+              placeholder="Выберите вариант:" />
           </FieldBlock>
-          <FieldBlock label="Сохранить ответ в переменную">
-            <input style={inputStyle} value={cfg.output_variable || "_http_body"} maxLength={64}
-              onChange={e => set("output_variable", e.target.value)} />
+          <FieldBlock label="Кнопки" hint="Каждая строка — одна кнопка. Текст кнопки = метка ветки.">
+            <textarea style={{ ...inputStyle, height: 100, resize: "vertical" }}
+              value={(cfg.buttons || []).join("
+")}
+              onChange={e => set("buttons", e.target.value.split("
+").map(s => s.trim()).filter(Boolean))}
+              placeholder={"Вариант А
+Вариант Б
+Вариант В"} />
           </FieldBlock>
-          <div style={{ fontSize: 12, color: C.textMid, marginTop: 4 }}>
-            HTTP-статус → <code style={{ color: C.textMid }}>_http_status</code>
+          <div style={{ background: C.elevated, borderRadius: 8, padding: "8px 12px",
+            fontSize: 12, color: C.textMid, marginTop: 4, lineHeight: 1.6 }}>
+            Каждая кнопка создаёт отдельный выход из узла.<br/>
+            Соедините выходы со следующими шагами.
           </div>
         </>
       )}
