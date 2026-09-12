@@ -62,12 +62,7 @@ def _question_kb(resp_id: int, q: SurveyQuestion) -> InlineKeyboardMarkup | None
 
 async def _send_question_media(m: Message, media_type: str, file_id: str,
                                caption: str | None, reply_markup):
-    """Отправка медиа-вложения вопроса анкеты (см. докстринг SurveyQuestion в
-    db/models.py) — caption поддерживает HTML/premium-эмодзи, т.к. дочерний
-    бот создаётся с default parse_mode="HTML" (см. services/bot_manager.py).
-    Caption ограничен 1024 символами — если текст вопроса длиннее, шлём
-    медиа без подписи и текст отдельным сообщением следом (тот же приём,
-    что и в send_response/send_with_keyboards в child/common.py)."""
+    """Отправка медиа-вложения вопроса анкеты."""
     kwargs = {"reply_markup": reply_markup}
     text_after = None
     if caption and len(caption) > 1024:
@@ -89,9 +84,6 @@ async def _send_question_media(m: Message, media_type: str, file_id: str,
         elif media_type == "voice":
             sent = await m.answer_voice(file_id, **kwargs_media, **({} if text_after else kwargs))
         elif media_type == "video_note":
-            # video_note не поддерживает caption/reply_markup вообще —
-            # шлём кружок, а текст вопроса и кнопки вариантов — отдельным
-            # сообщением следом, иначе они бы просто терялись.
             await m.answer_video_note(file_id)
             text_after = caption
             sent = None
@@ -110,8 +102,6 @@ async def _send_question_media(m: Message, media_type: str, file_id: str,
     if text_after:
         sent = await m.answer(text_after, reply_markup=reply_markup)
     elif reply_markup is not None and sent is None:
-        # Медиа без caption (video_note/sticker) и без текста вопроса, но
-        # есть варианты ответа кнопками — кнопкам нужно на чём-то висеть.
         sent = await m.answer(f"{em('info')} Выберите вариант ответа:", reply_markup=reply_markup)
     return sent
 
@@ -120,16 +110,9 @@ async def _ask_current(m: Message, resp: SurveyResponse, questions: list[SurveyQ
                        cfg: ChildBot | None = None):
     q = questions[resp.current_index]
     kb = _question_kb(resp.id, q)
-    # НОВОЕ (фикс бага п.1 из запроса): вопрос анкеты теперь может нести
-    # медиа-вложение, а текст вопроса — это HTML (см. миграцию вопроса на
-    # m.html_text в master/router.py::survey_q_text_save) — раньше сюда
-    # приходил голый m.text без единого тега форматирования/premium-эмодзи.
     if q.media_file_id:
         await _send_question_media(m, q.media_type, q.media_file_id, q.text or None, kb)
         return
-    # НОВОЕ: рич-текст вопроса (Pro, расширение "на все экраны" по запросу)
-    # — рич-сообщение не совместимо с media, поэтому только для текстовых
-    # вопросов без вложения.
     if cfg is not None and await rich_enabled(None, cfg=cfg):
         if await send_rich_or_plain(m, q.text, reply_markup=kb) is not None:
             return
@@ -137,12 +120,7 @@ async def _ask_current(m: Message, resp: SurveyResponse, questions: list[SurveyQ
 
 
 async def _get_or_create_topic(bot: Bot, cfg: ChildBot, user_id: int) -> int | None:
-    """Топик в чате админов для анкет этого пользователя в этом боте (фикс
-    бага "в анкетах по топикам анкеты не отправляются" — см. докстринг
-    SurveyResponse.topic_id в db/models.py). Переиспользует топик последней
-    анкеты/диалога этого пользователя, если он уже есть, иначе заводит новый
-    — тот же приём, что и в child/common.py::open_ticket, с тем же мягким
-    фолбэком на отправку без топика, если чат админов — не форум."""
+    """Топик в чате админов для анкет этого пользователя в этом боте."""
     if not cfg.use_topics or not cfg.admin_chat_id:
         return None
     async with Session() as s:
@@ -156,9 +134,9 @@ async def _get_or_create_topic(bot: Bot, cfg: ChildBot, user_id: int) -> int | N
     topic_name = build_topic_name(cfg, user_id,
                                   full_name=(u.full_name if u else None),
                                   username=(u.username if u else None))
-    # Иконка топика — Pro-функция; если Pro у владельца истёк, топик всё
-    # равно создаём (топики — это фикс бага, не Pro-фича), просто без иконки.
     create_kwargs: dict = {}
+    if getattr(cfg, "topic_icon_emoji_id", None):
+        create_kwargs["icon_custom_emoji_id"] = cfg.topic_icon_emoji_id
     topic_color = getattr(cfg, "topic_color", None)
     if topic_color is not None:
         create_kwargs["icon_color"] = topic_color
@@ -173,14 +151,9 @@ async def _get_or_create_topic(bot: Bot, cfg: ChildBot, user_id: int) -> int | N
 
 
 async def _finish(bot: Bot, cfg: ChildBot, resp_id: int):
-    """Сохраняет (уже сохранено по ходу анкеты) и пересылает заполненную
-    анкету в чат админов — как обычное обращение."""
+    """Сохраняет и пересылает заполненную анкету в чат админов."""
     async with Session() as s:
         user_id = (await s.get(SurveyResponse, resp_id)).user_id
-    # НОВОЕ (фикс бага топиков): топик заводится/переиспользуется ДО того,
-    # как анкета помечается завершённой — resp.topic_id сохраняется вместе с
-    # ответами, чтобы дальнейшие сообщения "режима диалога" от этого же
-    # пользователя (см. _relay_dialog_message) уходили в тот же топик.
     thread = await _get_or_create_topic(bot, cfg, user_id)
     async with Session() as s:
         resp = await s.get(SurveyResponse, resp_id)
@@ -192,21 +165,22 @@ async def _finish(bot: Bot, cfg: ChildBot, resp_id: int):
     answers = json.loads(resp.answers_json or "[]")
     lines = [f"📋 <b>Анкета «{html.escape(survey.name)}»</b>",
             f"👤 <code>{resp.user_id}</code>"]
-    # media-ответы (по запросу: фото/аудио/etc. в ответ на вопрос анкеты) —
-    # шлём ОТДЕЛЬНЫМИ сообщениями после текста анкеты, т.к. эти файлы
-    # получены ЭТИМ ЖЕ (дочерним) ботом — в отличие от рассылки, здесь
-    # file_id валиден напрямую, перезаливка не нужна.
+    # Собираем все медиа-ответы (каждый ответ может содержать несколько
+    # файлов, если пользователь отправил альбом — хранятся как список в
+    # поле "media_items", либо одиночный файл в "media_file_id").
     media_answers = []
     for a in answers:
         a_text = a["a"] if a["a"] else "(без текста)"
         lines.append(f"\n<b>{html.escape(a['q'])}</b>\n{html.escape(a_text)[:3500]}")
-        if a.get("media_file_id"):
+        # Поддерживаем оба формата: новый (media_items — список) и старый
+        # (media_file_id — одиночный файл) для обратной совместимости.
+        if a.get("media_items"):
+            for item in a["media_items"]:
+                media_answers.append({"q": a["q"], **item})
+        elif a.get("media_file_id"):
             media_answers.append(a)
     text = "\n".join(lines)
     if cfg.admin_chat_id:
-        # Длинный текст анкеты может легко перевалить за 4096 — режем на
-        # части, чтобы отправка не падала целиком (тот же класс бага, что и
-        # в п.1 с рассылкой).
         first_sent = None
         for i in range(0, len(text), 4000):
             try:
@@ -216,17 +190,12 @@ async def _finish(bot: Bot, cfg: ChildBot, resp_id: int):
             except Exception as e:
                 log.warning("survey._finish: не удалось отправить в admin_chat_id "
                             "бота %s: %s", cfg.id, e)
-        # НОВОЕ (по запросу): чтобы админ мог написать подавшему анкету —
-        # реплаем на её сообщение в чате админов, как это уже работает в
-        # фидбек-ботах. Сама доставка ответа обрабатывается ОБЩИМ хендлером
-        # admin_reply в child/common.py::build_common_router() — он ищет
-        # MsgMap по id сообщения, на которое ответил админ, и копирует ответ
-        # адресату. Тут нужно только создать эту связь при отправке анкеты.
         if first_sent:
             async with Session() as s:
                 s.add(MsgMap(bot_id=cfg.id, admin_chat_msg_id=first_sent.message_id,
                              user_id=resp.user_id, user_chat_msg_id=None))
                 await s.commit()
+        # Отправляем все медиа-файлы (включая все фото из альбомов)
         for a in media_answers:
             try:
                 await _send_answer_media(bot, cfg.admin_chat_id, a["media_type"],
@@ -260,14 +229,7 @@ async def _send_answer_media(bot: Bot, chat_id: int, media_type: str, file_id: s
 
 
 async def _relay_dialog_message(m: Message, bot: Bot, cfg: ChildBot):
-    """НОВОЕ (по запросу): "режим диалога" — свободное сообщение
-    респондента ПОСЛЕ отправки анкеты (не ответ на текущий вопрос)
-    пересылается в чат админов копией, с привязкой MsgMap, чтобы админ мог
-    ответить (доставку ответа берёт на себя общий admin_reply в
-    child/common.py). Если это реплай на сообщение, у которого уже есть
-    копия в чате админов — прикрепляем нашу копию туда же (видно, на что
-    именно отвечает респондент), как и в фидбек-ботах.
-    """
+    """Режим диалога — свободное сообщение пересылается в чат админов."""
     reply_params = None
     if m.reply_to_message:
         async with Session() as s:
@@ -277,9 +239,6 @@ async def _relay_dialog_message(m: Message, bot: Bot, cfg: ChildBot):
             ).order_by(MsgMap.id.desc()))
         if mp:
             reply_params = ReplyParameters(message_id=mp.admin_chat_msg_id)
-    # НОВОЕ (фикс бага топиков): сообщения "режима диалога" тоже должны
-    # уходить в топик пользователя, а не теряться/падать в General, если он
-    # закрыт (см. _get_or_create_topic).
     thread = await _get_or_create_topic(bot, cfg, m.from_user.id)
     try:
         sent = await bot.copy_message(cfg.admin_chat_id, m.chat.id, m.message_id,
@@ -301,11 +260,6 @@ async def _advance_or_finish(bot: Bot, cfg: ChildBot, m: Message, resp_id: int):
     questions = await _questions(resp.survey_id)
     if resp.current_index >= len(questions):
         await _finish(bot, cfg, resp_id)
-        # НОВОЕ (фикс бага п.2 из запроса): финальное сообщение теперь может
-        # нести медиа-вложение вместе с HTML-текстом/premium-эмодзи — раньше
-        # это был только m.answer(текст) без единой возможности прикрепить
-        # фото/видео (см. survey_finish_media_id в db/models.py и
-        # surveyfinish_save в master/router.py).
         finish_text = cfg.survey_start_text or f"{em('check')} Спасибо! Анкета отправлена."
         if cfg.survey_finish_media_id:
             await _send_question_media(m, cfg.survey_finish_media_type,
@@ -330,15 +284,6 @@ async def _start_or_resume(m: Message, bot_db_id: int, user_id: int, survey_id: 
             SurveyResponse.bot_id == bot_db_id, SurveyResponse.user_id == user_id,
             SurveyResponse.survey_id == survey_id, SurveyResponse.completed == False))  # noqa: E712
         if not resp:
-            # БАГ: раньше тут ничего не мешало завести ВТОРУЮ незавершённую
-            # SurveyResponse параллельно с уже начатой анкетой (по другому
-            # survey_id) — везде в файле "текущая незавершённая анкета"
-            # ищется через _in_progress() как select(...).scalar() ПО
-            # bot_id+user_id БЕЗ survey_id, а scalar() при двух подходящих
-            # строках падает с MultipleResultsFound — весь диалог с ботом
-            # переставал отвечать пользователю. Теперь правило "1
-            # пользователь = 1 анкета в процессе одновременно" — как и с
-            # обращениями в фидбек-ботах (см. child/common.py::open_ticket).
             other = await s.scalar(select(SurveyResponse).where(
                 SurveyResponse.bot_id == bot_db_id, SurveyResponse.user_id == user_id,
                 SurveyResponse.completed == False))  # noqa: E712
@@ -372,11 +317,8 @@ def build_survey_router() -> Router:
 
     @r.message(Command("close"), F.chat.type == "private")
     async def cmd_close(m: Message, bot_db_id: int):
-        # У анкет нет "обращений"-тикетов — /close тут отменяет текущую
-        # незавершённую анкету (чтобы можно было начать заново с чистого
-        # листа, не отвечая на "хвост" старой).
         if await is_bot_admin(bot_db_id, m.from_user.id):
-            return  # у админов свой /close — см. child/common.py
+            return
         resp = await _in_progress(bot_db_id, m.from_user.id)
         if not resp:
             await m.answer(f"{em('info')} У вас нет анкеты в процессе заполнения.")
@@ -472,15 +414,9 @@ def build_survey_router() -> Router:
         if m.text and m.text.startswith("/"):
             return
 
-        # Если пользователь сейчас в процессе анкеты — это ответ на текущий
-        # текстовый вопрос.
+        # Если пользователь сейчас в процессе анкеты — это ответ на текущий вопрос.
         resp = await _in_progress(bot_db_id, m.from_user.id)
         if resp:
-            # БАГ (по запросу): при отправке альбома (несколько фото одной
-            # группой) user_message вызывался для КАЖДОГО фото — каждое
-            # двигало current_index, и пользователь «проскакивал» несколько
-            # вопросов разом вместо одного. Теперь альбом буферизируется:
-            # берём первый файл из группы как ответ, остальные игнорируем.
             async def _process_answer(msgs: list[Message]):
                 first = msgs[0]
                 r2_check = await _in_progress(bot_db_id, first.from_user.id)
@@ -494,13 +430,31 @@ def build_survey_router() -> Router:
                     await first.answer(f"{em('warn')} Пожалуйста, выберите один из вариантов "
                                        "кнопкой выше.")
                     return
-                # Для альбома берём первый медиа-файл + подпись (если есть)
-                media_file_id, media_type = message_media(first)
-                answer_text = first.text or first.caption or ("" if media_file_id else "")
-                answer = {"q": q2.text, "a": answer_text}
-                if media_file_id:
-                    answer["media_file_id"] = media_file_id
-                    answer["media_type"] = media_type
+
+                # ИСПРАВЛЕНИЕ БАГА: при альбоме (несколько фото/файлов одной
+                # группой) раньше брался только первый файл (msgs[0]), остальные
+                # терялись. Теперь собираем ВСЕ медиа-файлы из группы и
+                # сохраняем их списком в поле "media_items".
+                answer_text = first.text or first.caption or ""
+
+                if len(msgs) > 1:
+                    # Альбом: собираем все файлы
+                    media_items = []
+                    for msg in msgs:
+                        fid, mtype = message_media(msg)
+                        if fid:
+                            media_items.append({"media_file_id": fid, "media_type": mtype})
+                    answer = {"q": q2.text, "a": answer_text or f"({len(media_items)} файлов)"}
+                    if media_items:
+                        answer["media_items"] = media_items
+                else:
+                    # Одиночное сообщение — обратно совместимый формат
+                    media_file_id, media_type = message_media(first)
+                    answer = {"q": q2.text, "a": answer_text}
+                    if media_file_id:
+                        answer["media_file_id"] = media_file_id
+                        answer["media_type"] = media_type
+
                 async with Session() as s:
                     r3 = await s.get(SurveyResponse, r2_check.id)
                     answers = json.loads(r3.answers_json or "[]")
@@ -513,15 +467,7 @@ def build_survey_router() -> Router:
             await buffer_or_process(m, _process_answer)
             return
 
-        # Ни одна анкета не начата и это не ответ — если включён "режим
-        # диалога", относимся к сообщению как к продолжению переписки с
-        # админами (по запросу): пересылаем в admin_chat_id и запоминаем
-        # связь, чтобы админ мог ответить (общий admin_reply в
-        # child/common.py это подхватит). Реплай на сообщение админа
-        # цепляется к той же ветке через reply_parameters, если получится
-        # найти исходную копию.
-        # БАГ (по запросу): альбомы в "режиме диалога" тоже буферизируем —
-        # раньше каждое фото из группы релеилось отдельным сообщением.
+        # Ни одна анкета не начата и это не ответ — если включён "режим диалога".
         if cfg.survey_dialog_enabled and cfg.admin_chat_id:
             async def _relay_album(msgs: list[Message]):
                 if len(msgs) == 1:
