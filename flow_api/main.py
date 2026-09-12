@@ -16,13 +16,13 @@ import hmac
 import json
 import logging
 import os
+import time
 from urllib.parse import parse_qsl, unquote
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
-from sqlalchemy.orm import Mapped, mapped_column, synonym
 
 # Подключаемся к той же БД через тот же движок что и основной бот
 import sys
@@ -69,6 +69,8 @@ def _verify_init_data(init_data_raw: str) -> dict:
     # Формируем data-check-string: отсортированные пары key=value через \n
     data_check = "\n".join(f"{k}={v}" for k, v in sorted(params.items()))
 
+    # FIX: hmac.new не существует — правильно hmac.new → hmac.new(key, msg, digestmod)
+    # Правильный вызов: hmac.new(key, msg, digestmod)
     secret_key = hmac.new(b"WebAppData", MASTER_BOT_TOKEN.encode(), hashlib.sha256).digest()
     expected_hash = hmac.new(secret_key, data_check.encode(), hashlib.sha256).hexdigest()
 
@@ -76,7 +78,6 @@ def _verify_init_data(init_data_raw: str) -> dict:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Неверная подпись initData")
 
     # auth_date проверяем — не старше 1 часа
-    import time
     auth_date = int(params.get("auth_date", 0))
     if time.time() - auth_date > 3600:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "initData устарел (> 1 ч)")
@@ -116,9 +117,10 @@ async def _require_pro_owner(bot_id: int, user: dict = Depends(_get_verified_use
 # =========================================================================
 
 _ALLOWED_NODE_TYPES = {"trigger", "message", "input", "condition", "delay", "http", "end"}
+# FIX: используем реальные значения enum из модели
 _ALLOWED_TRIGGERS = {t.value for t in ScenarioTrigger}
 
-# Максимальный размер config_json одного узла (символов)
+# Максимальный размер config одного узла (символов)
 _MAX_CONFIG_LEN = 4096
 _MAX_NODES = 100
 _MAX_EDGES = 200
@@ -156,6 +158,7 @@ class NodeIn(BaseModel):
 class EdgeIn(BaseModel):
     from_id: str = Field(..., max_length=64)
     to_id: str = Field(..., max_length=64)
+    # FIX: condition хранится в label (поле ScenarioEdge.label), не в отдельном JSON-столбце
     condition: dict = {}
 
 
@@ -171,7 +174,7 @@ class ScenarioSaveRequest(BaseModel):
     @classmethod
     def check_trigger(cls, v):
         if v not in _ALLOWED_TRIGGERS:
-            raise ValueError(f"Неизвестный триггер: {v}")
+            raise ValueError(f"Неизвестный триггер: {v}. Допустимые: {_ALLOWED_TRIGGERS}")
         return v
 
     @field_validator("nodes")
@@ -187,6 +190,28 @@ class ScenarioSaveRequest(BaseModel):
         if len(v) > _MAX_EDGES:
             raise ValueError(f"Слишком много рёбер (максимум {_MAX_EDGES})")
         return v
+
+
+# =========================================================================
+# Вспомогательные функции
+# =========================================================================
+
+def _condition_to_label(condition: dict) -> str | None:
+    """Сериализуем condition dict в строку для хранения в ScenarioEdge.label."""
+    if not condition:
+        return None
+    # label ограничен 32 символами — храним только branch (true/false/None)
+    branch = condition.get("branch")
+    if branch:
+        return str(branch)[:32]
+    return None
+
+
+def _label_to_condition(label: str | None) -> dict:
+    """Восстанавливаем condition dict из label."""
+    if label in ("true", "false"):
+        return {"branch": label}
+    return {}
 
 
 # =========================================================================
@@ -224,12 +249,14 @@ async def get_scenario(bot_id: int, scenario_id: int,
         "trigger_value": sc.trigger_value,
         "is_active": sc.is_active,
         "nodes": [{"id": n.id, "node_type": n.node_type,
-                   "config": json.loads(n.config_json or "{}"),
-                   "pos_x": n.pos_x, "pos_y": n.pos_y, "label": n.label}
+                   # FIX: поле называется .config, не .config_json
+                   "config": json.loads(n.config or "{}"),
+                   "pos_x": n.pos_x or 0.0, "pos_y": n.pos_y or 0.0, "label": n.label}
                   for n in nodes],
         "edges": [{"id": e.id, "from_node_id": e.from_node_id,
                    "to_node_id": e.to_node_id,
-                   "condition": json.loads(e.condition_json or "{}")}
+                   # FIX: condition восстанавливаем из label, не из condition_json
+                   "condition": _label_to_condition(e.label)}
                   for e in edges],
     }
 
@@ -254,7 +281,8 @@ async def create_scenario(bot_id: int, body: ScenarioSaveRequest,
             node = ScenarioNode(
                 scenario_id=sc.id,
                 node_type=ni.node_type,
-                config_json=json.dumps(ni.config, ensure_ascii=False),
+                # FIX: поле называется .config, не .config_json
+                config=json.dumps(ni.config, ensure_ascii=False),
                 pos_x=ni.pos_x,
                 pos_y=ni.pos_y,
                 label=ni.label,
@@ -272,7 +300,8 @@ async def create_scenario(bot_id: int, body: ScenarioSaveRequest,
                 scenario_id=sc.id,
                 from_node_id=from_db,
                 to_node_id=to_db,
-                condition_json=json.dumps(ei.condition, ensure_ascii=False),
+                # FIX: condition хранится в label (нет поля condition_json в модели)
+                label=_condition_to_label(ei.condition),
             )
             s.add(edge)
 
@@ -294,13 +323,15 @@ async def update_scenario(bot_id: int, scenario_id: int,
         sc.trigger_value = body.trigger_value
         sc.is_active = body.is_active
 
-        # Удаляем старые узлы и рёбра (каскадом удалятся через FK)
-        old_nodes = list((await s.scalars(select(ScenarioNode).where(
-            ScenarioNode.scenario_id == scenario_id))).all())
+        # Удаляем старые рёбра, потом узлы (порядок важен из-за FK)
         old_edges = list((await s.scalars(select(ScenarioEdge).where(
             ScenarioEdge.scenario_id == scenario_id))).all())
         for e in old_edges:
             await s.delete(e)
+        await s.flush()
+
+        old_nodes = list((await s.scalars(select(ScenarioNode).where(
+            ScenarioNode.scenario_id == scenario_id))).all())
         for n in old_nodes:
             await s.delete(n)
         await s.flush()
@@ -316,7 +347,8 @@ async def update_scenario(bot_id: int, scenario_id: int,
             node = ScenarioNode(
                 scenario_id=sc.id,
                 node_type=ni.node_type,
-                config_json=json.dumps(ni.config, ensure_ascii=False),
+                # FIX: поле называется .config, не .config_json
+                config=json.dumps(ni.config, ensure_ascii=False),
                 pos_x=ni.pos_x,
                 pos_y=ni.pos_y,
                 label=ni.label,
@@ -334,7 +366,8 @@ async def update_scenario(bot_id: int, scenario_id: int,
                 scenario_id=sc.id,
                 from_node_id=from_db,
                 to_node_id=to_db,
-                condition_json=json.dumps(ei.condition, ensure_ascii=False),
+                # FIX: condition хранится в label
+                label=_condition_to_label(ei.condition),
             ))
 
         await s.commit()
