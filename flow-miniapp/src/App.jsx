@@ -176,7 +176,8 @@ function FlowNode({ id, data, selected }) {
   const hasInput = data.nodeType !== "trigger";
   const hasOutput = data.nodeType !== "end";
   const isBranch = data.nodeType === "condition";
-
+  const isRandom = data.nodeType === "random_branch";
+  const isButtons = data.nodeType === "buttons";
   return (
     <div style={{
       background: selected ? C.elevated : C.surface,
