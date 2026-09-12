@@ -22,6 +22,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
+from sqlalchemy.orm import Mapped, mapped_column, synonym
 
 # Подключаемся к той же БД через тот же движок что и основной бот
 import sys
