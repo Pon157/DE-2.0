@@ -10,12 +10,7 @@ from utils.crypto import encrypt_token, decrypt_token
 
 
 class EncryptedToken(TypeDecorator):
-    """Прозрачно шифрует токен бота на запись и расшифровывает на чтение —
-    весь остальной код (Bot(cb.token), run_broadcast(cb.token, ...) и т.п.)
-    продолжает работать как раньше, ничего не зная о шифровании. ВАЖНО:
-    так как Fernet НЕ детерминирован, эту колонку нельзя использовать в
-    `WHERE token = :значение` — для поиска/уникальности есть отдельная
-    колонка token_fingerprint (см. ChildBot ниже)."""
+    """Прозрачно шифрует токен бота на запись и расшифровывает на чтение."""
     impl = SAString(512)
     cache_ok = True
 
@@ -37,9 +32,9 @@ class BotType(str, enum.Enum):
 
 
 class OpenMode(str, enum.Enum):
-    first_message = "first_message"   # обращение при первом сообщении
-    start_command = "start_command"   # при /start (потом /restart)
-    button = "button"                  # по кнопке
+    first_message = "first_message"
+    start_command = "start_command"
+    button = "button"
 
 
 class ForwardMode(str, enum.Enum):
@@ -63,222 +58,110 @@ class ChildBot(Base):
     open_mode: Mapped[OpenMode] = mapped_column(Enum(OpenMode), default=OpenMode.first_message)
     forward_mode: Mapped[ForwardMode] = mapped_column(Enum(ForwardMode), default=ForwardMode.forward)
     copy_header: Mapped[str] = mapped_column(Text, default="{name} | @{username} | <code>{id}</code> · {anon_id}")
-    admin_chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)  # куда слать
+    admin_chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     use_topics: Mapped[bool] = mapped_column(Boolean, default=False)
-    header_mode: Mapped[str] = mapped_column(String(16), default="separate")  # separate|merge|off
-    topic_name_template: Mapped[str] = mapped_column(Text, default="✉️ {name} · {id}")
-    # НОВОЕ: иконка топика — premium-эмодзи (create_forum_topic поддерживает
-    # icon_custom_emoji_id, Bot API 9.4+) — раньше топики создавались вообще
-    # без иконки, хотя выбор цвета/иконки у обычных кнопок уже был.
+    topic_name_template: Mapped[str | None] = mapped_column(Text, nullable=True)
+    topic_icon_emoji_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     topic_color: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    welcome_text: Mapped[str] = mapped_column(Text, default="Привет! Напишите ваше сообщение.")
-    welcome_photo: Mapped[str | None] = mapped_column(String(256), nullable=True)  # file_id
-    # НОВОЕ: эффект на приветственном сообщении (message_effect_id, Bot API,
-    # доступно только в личных чатах — как раз наш случай) — 🔥/❤️/🎉 и т.п.
+    pin_first_message: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    # ---- приветственное сообщение ----
+    welcome_text: Mapped[str] = mapped_column(Text, default="Привет! Чем могу помочь?")
+    welcome_photo: Mapped[str | None] = mapped_column(String(256), nullable=True)
     welcome_effect_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    # НОВОЕ: рич-текст приветствия (send_rich_message / InputRichMessage,
-    # Bot API 10.1, июнь 2026) — Pro-функция, см. referrals.is_pro.
     rich_welcome: Mapped[bool] = mapped_column(Boolean, default=False)
-    warn_limit: Mapped[int] = mapped_column(Integer, default=3)
-    donate_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
-    donate_button_type: Mapped[str] = mapped_column(String(10), default="inline")  # inline|keyboard
-    donate_button_text: Mapped[str] = mapped_column(String(64), default="⭐️ Донат")
-    # НОВОЕ (Bot API 9.4): цвет/premium-эмодзи для кнопки доната — работает
-    # и для inline-, и для kayboard-варианта (donate_button_type).
-    donate_button_style: Mapped[str | None] = mapped_column(String(16), nullable=True)
-    donate_button_icon: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    ticket_button_text: Mapped[str] = mapped_column(String(64), default="✉️ Открыть обращение")
+
+    # ---- тикет-кнопка ----
+    ticket_button_text: Mapped[str] = mapped_column(String(64), default="📩 Написать")
     ticket_button_style: Mapped[str | None] = mapped_column(String(16), nullable=True)
     ticket_button_icon: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    # НОВОЕ (по запросу): NULL/пусто = кнопка "Закрыть обращение" у
-    # пользователя вообще не показывается (раньше её нельзя было убрать —
-    # только переименовать). Раньше поле было NOT NULL с дефолтом.
-    close_ticket_button_text: Mapped[str | None] = mapped_column(
-        String(64), nullable=True, default="❌ Закрыть обращение")
-    # НОВОЕ (по запросу): цвет/premium-эмодзи именно КНОПКИ "Закрыть
-    # обращение" (не путать с close_notify_text — это текст, который
-    # приходит пользователю ПОСЛЕ закрытия админом, разные вещи).
+    close_ticket_button_text: Mapped[str | None] = mapped_column(String(64), nullable=True, default="❌ Закрыть обращение")
     close_ticket_button_style: Mapped[str | None] = mapped_column(String(16), nullable=True)
     close_ticket_button_icon: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    close_notify_text: Mapped[str | None] = mapped_column(
-        Text, nullable=True,
+    close_notify_text: Mapped[str | None] = mapped_column(Text, nullable=True,
         default="🔒 Обращение закрыто администрацией. Ваше новое сообщение откроет новое обращение.")
-    # Кнопка «Закрыть / Открыть снова» в ADMIN-ЧАТЕ под каждым сообщением.
-    # Отдельные поля от close_ticket_button_* (которые про reply-кнопку у
-    # пользователя). NULL = показываем дефолт «🔒 Закрыть обращение».
-    # Пустая строка («») = кнопка не показывается вообще.
-    admin_close_button_text: Mapped[str | None] = mapped_column(
-        String(64), nullable=True, default=None)   # None → дефолтный текст
-    admin_close_button_style: Mapped[str | None] = mapped_column(
-        String(16), nullable=True)
-    admin_close_button_icon: Mapped[str | None] = mapped_column(
-        String(32), nullable=True)
-    always_new_ticket: Mapped[bool] = mapped_column(Boolean, default=False)
-    pin_first_message: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    # ---- донат ----
+    donate_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    donate_button_text: Mapped[str] = mapped_column(String(64), default="💳 Задонатить")
+    donate_button_type: Mapped[str] = mapped_column(String(16), default="inline")
+    donate_button_style: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    donate_button_icon: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    donate_stars_min: Mapped[int] = mapped_column(Integer, default=1)
+    donate_stars_max: Mapped[int] = mapped_column(Integer, default=10000)
+    donate_subscription_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    donate_subscription_stars: Mapped[int] = mapped_column(Integer, default=50)
+
+    # ---- реакция на ответ админа ----
+    admin_reply_reaction: Mapped[str | None] = mapped_column(String(16), nullable=True, default="👍")
+
+    # ---- анкеты (survey) ----
     survey_start_text: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # НОВОЕ (фикс бага п.2 из запроса): текст благодарности после анкеты
-    # раньше сохранялся только если m.text был непустым — сообщение с
-    # фото/видео без текста отклонялось ("Нужен текст"), медиа к финальному
-    # сообщению приложить было вообще нельзя. survey_start_text уже хранит
-    # HTML (m.html_text, формат/premium-эмодзи и так сохранялись) —
-    # не хватало именно медиа-вложения.
+    survey_dialog_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     survey_finish_media_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
     survey_finish_media_type: Mapped[str | None] = mapped_column(String(16), nullable=True)
-    # НОВОЕ (по запросу): "режим диалога" для ботов-анкет — если выключен
-    # (по умолчанию), ни ответ админа на присланную анкету, ни последующее
-    # сообщение респондента НЕ доставляются друг другу (см.
-    # child/common.py::admin_reply и child/survey.py::user_message) — анкета
-    # остаётся чисто "прислал и всё", без переписки.
-    survey_dialog_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
-    
-    # Реакция (эмодзи), которую бот ставит на сообщение админа при ответе
-    admin_reply_reaction: Mapped[str | None] = mapped_column(String(32), nullable=True)
-
-    # ---- настройки posting ----
-    channel_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    accept_suggestions: Mapped[bool] = mapped_column(Boolean, default=True)
-    post_template: Mapped[str] = mapped_column(Text, default="{text}")
-    template_buttons_json: Mapped[str | None] = mapped_column(Text, nullable=True)  # кнопки на КАЖДЫЙ пост
-    channel_delivery_mode: Mapped[str] = mapped_column(String(10), default="template")  # template|copy
-    channel_publish_mode: Mapped[str] = mapped_column(String(10), default="copy")  # copy|forward
-
-    # ---- антиспам (services/antispam.py) ----
-    antispam_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
-    rate_limit_max: Mapped[int] = mapped_column(Integer, default=6)
-    rate_limit_window: Mapped[int] = mapped_column(Integer, default=10)
-    captcha_every: Mapped[int] = mapped_column(Integer, default=20)
-    antispam_ignore_owner: Mapped[bool] = mapped_column(Boolean, default=True)
-
-
-class BotAdmin(Base):
-    __tablename__ = "bot_admins"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    bot_id: Mapped[int] = mapped_column(ForeignKey("child_bots.id", ondelete="CASCADE"), index=True)
-    user_id: Mapped[int] = mapped_column(BigInteger)
-    __table_args__ = (UniqueConstraint("bot_id", "user_id"),)
 
 
 class BotButton(Base):
-    """Инлайн / кейборд кнопки + триггер-команды."""
     __tablename__ = "bot_buttons"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     bot_id: Mapped[int] = mapped_column(ForeignKey("child_bots.id", ondelete="CASCADE"), index=True)
-    kind: Mapped[str] = mapped_column(String(16))        # inline_url | inline_trigger | keyboard | command
-    text: Mapped[str] = mapped_column(String(128))       # надпись на кнопке / имя команды
-    icon_emoji_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    style: Mapped[str | None] = mapped_column(String(16), nullable=True)  # primary|secondary|success|danger
-    url: Mapped[str | None] = mapped_column(String(512), nullable=True)
-    response_text: Mapped[str | None] = mapped_column(Text, nullable=True)    # HTML ответ триггера
-    response_photo: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    kind: Mapped[str] = mapped_column(String(32))
+    text: Mapped[str] = mapped_column(String(128))
+    url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     position: Mapped[int] = mapped_column(Integer, default=0)
-    survey_id: Mapped[int | None] = mapped_column(
-        ForeignKey("surveys.id", ondelete="CASCADE"), nullable=True)
+    response_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    response_photo: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    style: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    icon_emoji_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    survey_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    disown_text: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class BotUser(Base):
     __tablename__ = "bot_users"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     bot_id: Mapped[int] = mapped_column(ForeignKey("child_bots.id", ondelete="CASCADE"), index=True)
-    user_id: Mapped[int] = mapped_column(BigInteger)
+    user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    full_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
     username: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    full_name: Mapped[str] = mapped_column(String(256), default="")
-    first_seen: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
-    last_active: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
-    is_blocked_bot: Mapped[bool] = mapped_column(Boolean, default=False)
     is_banned: Mapped[bool] = mapped_column(Boolean, default=False)
-    ban_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     ban_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
-    warns: Mapped[int] = mapped_column(Integer, default=0)
-
-    # ---- антиспам (services/antispam.py) ----
-    req_window_start: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    req_window_count: Mapped[int] = mapped_column(Integer, default=0)
-    total_requests: Mapped[int] = mapped_column(Integer, default=0)
-    captcha_pending: Mapped[bool] = mapped_column(Boolean, default=False)
-    captcha_answer: Mapped[str | None] = mapped_column(String(8), nullable=True)
-    captcha_asked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    spam_strikes: Mapped[int] = mapped_column(Integer, default=0)
-    throttled_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    # Счётчик входящих сообщений — для автоответов (every_n / first_message).
-    # Не путать с total_requests: тот включает /start и системные события;
-    # этот считает только реальные сообщения пользователя из user_message.
+    warnings: Mapped[int] = mapped_column(Integer, default=0)
+    joined_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     incoming_msg_count: Mapped[int] = mapped_column(Integer, default=0)
-
     __table_args__ = (UniqueConstraint("bot_id", "user_id"),)
 
 
 class Ticket(Base):
     __tablename__ = "tickets"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    bot_id: Mapped[int] = mapped_column(ForeignKey("child_bots.id", ondelete="CASCADE"), index=True)
+    bot_id: Mapped[int] = mapped_column(Integer, index=True)
     user_id: Mapped[int] = mapped_column(BigInteger, index=True)
     topic_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     is_open: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     subject: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    last_active_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
-
-
-class MessageLog(Base):
-    __tablename__ = "message_log"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    bot_id: Mapped[int] = mapped_column(ForeignKey("child_bots.id", ondelete="CASCADE"), index=True)
-    user_id: Mapped[int] = mapped_column(BigInteger)
-    direction: Mapped[str] = mapped_column(String(8))    # in | out
-    is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
-    admin_username: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), index=True)
+    last_active_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class MsgMap(Base):
-    """Связь: сообщение в админ-чате ↔ юзер (для ответов reply) + связь с
-    исходным сообщением юзера (для reply-контекста и зеркалирования реакций)."""
     __tablename__ = "msg_map"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     bot_id: Mapped[int] = mapped_column(Integer, index=True)
-    admin_chat_msg_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    admin_chat_msg_id: Mapped[int] = mapped_column(BigInteger)
     user_id: Mapped[int] = mapped_column(BigInteger)
     user_chat_msg_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    ticket_id: Mapped[int | None] = mapped_column(
-        ForeignKey("tickets.id", ondelete="SET NULL"), nullable=True)
+    ticket_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
-class Suggestion(Base):
-    __tablename__ = "suggestions"
+class MessageLog(Base):
+    __tablename__ = "message_logs"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    bot_id: Mapped[int] = mapped_column(ForeignKey("child_bots.id", ondelete="CASCADE"), index=True)
+    bot_id: Mapped[int] = mapped_column(Integer, index=True)
     user_id: Mapped[int] = mapped_column(BigInteger)
-    html_text: Mapped[str] = mapped_column(Text, default="")
-    media_file_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
-    media_type: Mapped[str | None] = mapped_column(String(16), nullable=True)
-    media_group_json: Mapped[str | None] = mapped_column(Text, nullable=True)
-    origin_chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    origin_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    origin_message_ids: Mapped[str | None] = mapped_column(Text, nullable=True)
-    status: Mapped[str] = mapped_column(String(16), default="pending")
-    decided_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    decided_by_username: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
-    decided_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-
-
-class Post(Base):
-    __tablename__ = "posts"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    bot_id: Mapped[int] = mapped_column(ForeignKey("child_bots.id", ondelete="CASCADE"), index=True)
-    author_id: Mapped[int] = mapped_column(BigInteger)
-    html_text: Mapped[str] = mapped_column(Text, default="")
-    media_file_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
-    media_type: Mapped[str | None] = mapped_column(String(16), nullable=True)
-    media_group_json: Mapped[str | None] = mapped_column(Text, nullable=True)
-    origin_chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    origin_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    origin_message_ids: Mapped[str | None] = mapped_column(Text, nullable=True)
-    buttons_json: Mapped[str | None] = mapped_column(Text, nullable=True)
-    buttons_mode: Mapped[str] = mapped_column(String(16), default="both")
-    publish_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
-    published: Mapped[bool] = mapped_column(Boolean, default=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    direction: Mapped[str] = mapped_column(String(4))   # in | out
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), index=True)
 
 
 class Donation(Base):
@@ -288,15 +171,8 @@ class Donation(Base):
     user_id: Mapped[int] = mapped_column(BigInteger)
     stars: Mapped[int] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
-    # НОВОЕ: ежемесячная Stars-подписка (createInvoiceLink/send_invoice с
-    # subscription_period, Bot API) — отличаем от разового доната.
     is_subscription: Mapped[bool] = mapped_column(Boolean, default=False)
-    # НОВОЕ (докрутка продления/отмены подписки): состояние подписки и
-    # реквизиты, нужные для editUserStarSubscription (владелец бота может
-    # отменить подписку пользователя вручную) — заполняются из
-    # successful_payment/Update.subscription (см. child/common.py).
     subscription_state: Mapped[str | None] = mapped_column(String(16), nullable=True)
-    # active / canceled / failed / expired
     telegram_payment_charge_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     subscription_expiration: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
@@ -315,7 +191,6 @@ class AdKind(str, enum.Enum):
 
 
 class Advertisement(Base):
-    """Рекламная кампания (см. /ads в дочерних ботах)."""
     __tablename__ = "advertisements"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     buyer_id: Mapped[int] = mapped_column(BigInteger, index=True)
@@ -338,7 +213,6 @@ class Advertisement(Base):
 
 
 class AdCooldown(Base):
-    """Ограничение 'разослать во все боты' — не чаще раза в 5 дней на покупателя."""
     __tablename__ = "ad_cooldowns"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     buyer_id: Mapped[int] = mapped_column(BigInteger, unique=True)
@@ -346,21 +220,18 @@ class AdCooldown(Base):
 
 
 class ModerationLog(Base):
-    """Кто из админов банил/варнил кого — для блока статистики по админам."""
     __tablename__ = "moderation_log"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     bot_id: Mapped[int] = mapped_column(Integer, index=True)
     admin_id: Mapped[int] = mapped_column(BigInteger)
     admin_username: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    action: Mapped[str] = mapped_column(String(16))   # ban|unban|warn|unwarn
+    action: Mapped[str] = mapped_column(String(16))
     target_user_id: Mapped[int] = mapped_column(BigInteger)
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), index=True)
 
 
 class PlatformUser(Base):
-    """Пользователь ПЛАТФОРМЫ (не бота) — для рефералки и Pro-подписки.
-    id — это Telegram user_id владельца/пользователя master-бота."""
     __tablename__ = "platform_users"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     referred_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
@@ -379,7 +250,6 @@ class PlatformUser(Base):
 
 
 class ReferralEvent(Base):
-    """Фиксирует факт 'этого юзера привёл этот реферер' (защита от повторного счёта)."""
     __tablename__ = "referral_events"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     inviter_id: Mapped[int] = mapped_column(BigInteger, index=True)
@@ -388,10 +258,9 @@ class ReferralEvent(Base):
 
 
 class BotRuntimeLock(Base):
-    """Распределённый лок 'кто сейчас держит getUpdates для этого бота'."""
     __tablename__ = "bot_runtime_locks"
     bot_id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    holder: Mapped[str] = mapped_column(String(36))       # uuid процесса
+    holder: Mapped[str] = mapped_column(String(36))
     last_seen: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
@@ -412,18 +281,11 @@ class SurveyQuestion(Base):
     text: Mapped[str] = mapped_column(Text)
     qtype: Mapped[str] = mapped_column(String(16), default="text")
     options_json: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # НОВОЕ (фикс бага п.1 из запроса): текст вопроса раньше сохранялся как
-    # m.text (голый plain text) — форматирование, стили и premium-эмодзи
-    # (<tg-emoji>, Bot API 9.4) молча терялись. Теперь текст хранится как
-    # HTML (m.html_text), плюс вопрос может нести медиа-вложение (фото/видео/
-    # гиф/документ/аудио) — раньше при попытке прислать в конструкторе фото
-    # вместо текста вопрос вообще не сохранялся ("Нужен текст").
     media_file_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
     media_type: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
 
 class SurveyResponse(Base):
-    """Одно прохождение анкеты одним пользователем."""
     __tablename__ = "survey_responses"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     survey_id: Mapped[int] = mapped_column(ForeignKey("surveys.id", ondelete="CASCADE"), index=True)
@@ -434,35 +296,101 @@ class SurveyResponse(Base):
     completed: Mapped[bool] = mapped_column(Boolean, default=False)
     started_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    # НОВОЕ (фикс бага "в анкетах по топикам анкеты не отправляются"):
-    # боты-анкеты никогда не создавали форум-топик, даже когда владелец
-    # включал тумблер "Топики" в настройках — заполненная анкета уходила
-    # send_message'ом без message_thread_id. Если чат админов — форум с
-    # закрытым/скрытым General-топиком (обычная настройка при работе через
-    # топики), Telegram отклонял такую отправку и анкета терялась молча.
-    # Теперь на каждое прохождение анкеты (или переиспользование) заводится
-    # свой топик, как это уже работает в боте-обращений (см.
-    # child/common.py::open_ticket).
     topic_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
 
 class AutoReplyKind(str, enum.Enum):
-    first_message = "first_message"   # один раз при первом сообщении пользователя
-    every_n       = "every_n"         # каждые N входящих сообщений
-    keyword       = "keyword"         # при вхождении фразы/слова в текст
+    first_message = "first_message"
+    every_n       = "every_n"
+    keyword       = "keyword"
 
 
 class AutoReply(Base):
-    """Правило автоответа — настраивается владельцем бота в конструкторе."""
     __tablename__ = "auto_replies"
     id:        Mapped[int] = mapped_column(Integer, primary_key=True)
     bot_id:    Mapped[int] = mapped_column(
         ForeignKey("child_bots.id", ondelete="CASCADE"), index=True)
     kind:      Mapped[AutoReplyKind] = mapped_column(Enum(AutoReplyKind))
-    # keyword → ключевая фраза; every_n → строка с числом N; first_message → None
     param:     Mapped[str | None] = mapped_column(String(256), nullable=True)
     text:      Mapped[str] = mapped_column(Text, default="")
     photo:     Mapped[str | None] = mapped_column(String(256), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     position:  Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+# =============================================================================
+# Сценарии (flow_api / scenario_runner) — Pro-функция.
+# Модели добавлены сюда, т.к. flow_api/main.py и services/scenario_runner.py
+# оба импортируют их из db.models.
+# =============================================================================
+
+class ScenarioTrigger(str, enum.Enum):
+    """Тип триггера, запускающего сценарий."""
+    command = "command"     # /команда
+    button  = "button"      # текст reply-кнопки
+    keyword = "keyword"     # вхождение слова/фразы в текст
+    start   = "start"       # при /start
+
+
+class Scenario(Base):
+    """Сценарий — корневая сущность визуального редактора (flow_api)."""
+    __tablename__ = "scenarios"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    bot_id: Mapped[int] = mapped_column(
+        ForeignKey("child_bots.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(128), default="Новый сценарий")
+    trigger_type: Mapped[ScenarioTrigger] = mapped_column(
+        Enum(ScenarioTrigger), default=ScenarioTrigger.command)
+    # Значение триггера: имя команды (без /), текст кнопки или ключевое слово.
+    # Для trigger_type=start — игнорируется.
+    trigger_value: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class ScenarioNode(Base):
+    """Узел графа сценария."""
+    __tablename__ = "scenario_nodes"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    scenario_id: Mapped[int] = mapped_column(
+        ForeignKey("scenarios.id", ondelete="CASCADE"), index=True)
+    # node_type: trigger | message | input | condition | delay | http | end
+    node_type: Mapped[str] = mapped_column(String(32))
+    # JSON-конфиг узла (текст, url, секунды, переменные и т.п.)
+    config: Mapped[str] = mapped_column(Text, default="{}")
+    # Человекочитаемая подпись — только для интерфейса редактора
+    label: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Позиция в редакторе (необязательная — только для фронтенда)
+    pos_x: Mapped[float | None] = mapped_column(nullable=True)
+    pos_y: Mapped[float | None] = mapped_column(nullable=True)
+
+
+class ScenarioEdge(Base):
+    """Ребро (переход) между узлами сценария."""
+    __tablename__ = "scenario_edges"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    scenario_id: Mapped[int] = mapped_column(
+        ForeignKey("scenarios.id", ondelete="CASCADE"), index=True)
+    from_node_id: Mapped[int] = mapped_column(
+        ForeignKey("scenario_nodes.id", ondelete="CASCADE"), index=True)
+    to_node_id: Mapped[int] = mapped_column(
+        ForeignKey("scenario_nodes.id", ondelete="CASCADE"))
+    # Метка ребра — для condition-узла: "true" или "false"
+    label: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+
+class ScenarioSession(Base):
+    """Активная сессия пользователя внутри сценария."""
+    __tablename__ = "scenario_sessions"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    bot_id: Mapped[int] = mapped_column(Integer, index=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    scenario_id: Mapped[int] = mapped_column(Integer, index=True)
+    current_node_id: Mapped[int] = mapped_column(Integer)
+    # JSON-словарь переменных, накопленных в ходе сценария
+    variables_json: Mapped[str] = mapped_column(Text, default="{}")
+    # True — ждём ввода от пользователя (узел типа "input")
+    waiting_input: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    __table_args__ = (UniqueConstraint("bot_id", "user_id"),)
