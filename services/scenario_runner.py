@@ -369,7 +369,7 @@ async def _advance(session: ScenarioSession, bot: Bot,
         return
 
     # --- выполняем текущий узел ---
-    cfg = json.loads(node.config_json or "{}")
+    cfg = json.loads(node.config or "{}")
     ntype = node.node_type
 
     if ntype == "trigger":
@@ -403,7 +403,7 @@ async def _advance(session: ScenarioSession, bot: Bot,
         edges = await _next_edges(node.id, session.scenario_id)
         next_node_id = None
         for edge in edges:
-            ecfg = json.loads(edge.condition_json or "{}")
+            ecfg = {"branch": edge.label} if edge.label in ("true", "false") else {}
             if ecfg.get("branch") == branch:
                 next_node_id = edge.to_node_id
                 break
@@ -429,6 +429,77 @@ async def _advance(session: ScenarioSession, bot: Bot,
         import asyncio
         seconds = max(0, min(int(cfg.get("seconds", 0)), 300))  # не больше 5 мин
         await asyncio.sleep(seconds)
+
+    elif ntype == "set_variable":
+        var_name = cfg.get("variable_name", "_var")
+        val = cfg.get("value", "")
+        if len(variables) < _MAX_VARIABLES and re.match(r'^\w{1,64}$', var_name):
+            variables[var_name] = _render_template(val, variables)
+        async with Session() as s:
+            sess2 = await s.get(ScenarioSession, session.id)
+            if not sess2:
+                return
+            sess2.variables_json = json.dumps(variables, ensure_ascii=False)
+            await s.commit()
+        async with Session() as s:
+            session = await s.get(ScenarioSession, session.id)
+        if not session:
+            return
+
+    elif ntype == "random_branch":
+        import random
+        branch = random.choice(["a", "b"])
+        edges = await _next_edges(node.id, session.scenario_id)
+        next_node_id = None
+        for edge in edges:
+            if edge.label == branch:
+                next_node_id = edge.to_node_id
+                break
+        if not next_node_id and edges:
+            next_node_id = edges[0].to_node_id
+        if not next_node_id:
+            await _end_session(session)
+            return
+        async with Session() as s:
+            sess2 = await s.get(ScenarioSession, session.id)
+            if not sess2:
+                return
+            sess2.current_node_id = next_node_id
+            sess2.last_step_at = datetime.utcnow()
+            await s.commit()
+        async with Session() as s:
+            session = await s.get(ScenarioSession, session.id)
+        if not session:
+            return
+        await _advance(session, bot, steps_left=steps_left - 1)
+        return
+
+    elif ntype == "buttons":
+        # Отправить сообщение с кнопками, ждать нажатия
+        text = _render_template(cfg.get("text", "Выберите:"), variables)
+        button_labels = cfg.get("buttons", [])
+        if not button_labels:
+            pass  # нет кнопок — идём дальше как обычно
+        else:
+            from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=label, callback_data=f"scen_btn:{session.id}:{label}")]
+                for label in button_labels
+            ])
+            try:
+                await bot.send_message(session.user_id, text, reply_markup=keyboard, parse_mode="HTML")
+            except Exception as e:
+                log.warning("scenario_runner buttons send: %s", e)
+            # Встаём в ожидание нажатия кнопки
+            async with Session() as s:
+                sess2 = await s.get(ScenarioSession, session.id)
+                if not sess2:
+                    return
+                sess2.waiting_input = True
+                sess2.input_variable = "_btn_choice"
+                sess2.last_step_at = datetime.utcnow()
+                await s.commit()
+            return  # ждём callback
 
     elif ntype == "http":
         result = await _execute_http(cfg, variables)
