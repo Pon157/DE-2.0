@@ -1552,13 +1552,23 @@ def build_common_router() -> Router:
         if not target_uid:
             return
         try:
-            await bot.copy_message(target_uid, m.chat.id, m.message_id,
-                                   reply_parameters=reply_params)
+            sent = await bot.copy_message(target_uid, m.chat.id, m.message_id,
+                                          reply_parameters=reply_params)
             async with Session() as s:
                 s.add(MessageLog(bot_id=bot_db_id, user_id=m.from_user.id,
                                  direction="out", is_admin=True,
                                  admin_username=m.from_user.username))
                 await s.commit()
+            # ФИКС (реакции): сохраняем маппинг исходящего сообщения —
+            # admin_msg_id=m.message_id (оригинал в чате),
+            # user_chat_msg_id=sent.message_id (копия у юзера).
+            # Без этого user_reaction не находил mp для сообщений от админа
+            # и не мог ни зеркалить реакцию, ни убирать admin_reply_reaction.
+            # set_message_reaction полностью заменяет реакции бота, поэтому
+            # когда юзер ставит реакцию на ответ админа — admin_reply_reaction
+            # автоматически сбрасывается и заменяется реакцией юзера.
+            await _map_msg(bot_db_id, m.message_id, target_uid,
+                           user_msg_id=sent.message_id)
             # НОВОЕ (по запросу, п.6): реакция теперь настраивается
             # (cfg.admin_reply_reaction) и может быть выключена (None/"").
             if cfg.admin_reply_reaction:
@@ -1652,7 +1662,14 @@ def build_common_router() -> Router:
     async def admin_edit(m: Message, bot: Bot, bot_db_id: int):
         """Админ отредактировал сообщение в чате — правим копию у юзера."""
         cfg = await get_cfg(bot_db_id)
-        if not cfg or m.chat.id != cfg.admin_chat_id or (m.from_user and m.from_user.is_bot):
+        if not cfg or m.chat.id != cfg.admin_chat_id:
+            return
+        # ФИКС: from_user может быть None (анонимный администратор группы) —
+        # раньше (m.from_user and m.from_user.is_bot) работало корректно, но
+        # если from_user is None — is_bot не проверяется и хендлер падал с
+        # AttributeError при попытке прочитать .is_bot на None в других местах.
+        # Теперь: пропускаем только если явно известно что это бот.
+        if m.from_user is not None and m.from_user.is_bot:
             return
         if cfg.bot_type == BotType.survey and not cfg.survey_dialog_enabled:
             return
@@ -1696,7 +1713,11 @@ def build_common_router() -> Router:
         cfg = await get_cfg(bot_db_id)
         if not cfg or m.chat.id != cfg.admin_chat_id:
             return
-        if not await is_bot_admin(m.from_user.id, bot_db_id, bot, cfg):
+        # ФИКС: анонимные администраторы группы присылают сообщения с
+        # from_user=None — раньше m.from_user.id падал с AttributeError и
+        # /del просто не работал. Анонимных пропускаем как доверенных
+        # (они уже прошли проверку Telegram на уровне прав в чате).
+        if m.from_user is not None and not await is_bot_admin(m.from_user.id, bot_db_id, bot, cfg):
             return
         if _mod_cmd_already_handled(bot_db_id, m.message_id):
             return
