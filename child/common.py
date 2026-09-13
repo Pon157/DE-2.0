@@ -1609,4 +1609,137 @@ def build_common_router() -> Router:
             return
         await _mirror_reaction(bot, mp.user_id, mp.user_chat_msg_id, ev.new_reaction)
 
+    # ---------- редактирование: зеркалим в обе стороны ----------
+    # Юзер редактирует своё сообщение в ЛС -> правим копию в админ-чате.
+    # Админ редактирует сообщение в админ-чате -> правим копию у юзера.
+    # Telegram шлёт edited_message апдейт только для текста и caption;
+    # смену медиа (photo/video/document) не зеркалируем — Bot API не
+    # позволяет edit_message_media без file_id оригинала (который нам
+    # недоступен при copy_message).
+
+    @r.edited_message(F.chat.type == "private")
+    async def user_edit(m: Message, bot: Bot, bot_db_id: int):
+        """Юзер отредактировал сообщение — правим копию в админ-чате."""
+        cfg = await get_cfg(bot_db_id)
+        if not cfg or not cfg.admin_chat_id:
+            return
+        async with Session() as s:
+            mp = await s.scalar(select(MsgMap).where(
+                MsgMap.bot_id == bot_db_id,
+                MsgMap.user_chat_msg_id == m.message_id,
+            ).order_by(MsgMap.id.desc()))
+        if not mp or not mp.admin_chat_msg_id:
+            return
+        try:
+            if m.text:
+                await bot.edit_message_text(
+                    m.text, chat_id=cfg.admin_chat_id,
+                    message_id=mp.admin_chat_msg_id,
+                    parse_mode=None,  # не перепарсиваем — берём plain text
+                    entities=m.entities or None,
+                )
+            elif m.caption is not None:
+                await bot.edit_message_caption(
+                    chat_id=cfg.admin_chat_id,
+                    message_id=mp.admin_chat_msg_id,
+                    caption=m.caption,
+                    caption_entities=m.caption_entities or None,
+                )
+        except TelegramBadRequest:
+            pass  # сообщение уже удалено или не редактируемо — ок
+
+    @r.edited_message(F.chat.type.in_({"group", "supergroup"}))
+    async def admin_edit(m: Message, bot: Bot, bot_db_id: int):
+        """Админ отредактировал сообщение в чате — правим копию у юзера."""
+        cfg = await get_cfg(bot_db_id)
+        if not cfg or m.chat.id != cfg.admin_chat_id or (m.from_user and m.from_user.is_bot):
+            return
+        if cfg.bot_type == BotType.survey and not cfg.survey_dialog_enabled:
+            return
+        async with Session() as s:
+            mp = await s.scalar(select(MsgMap).where(
+                MsgMap.bot_id == bot_db_id,
+                MsgMap.admin_chat_msg_id == m.message_id,
+            ).order_by(MsgMap.id.desc()))
+        if not mp or not mp.user_chat_msg_id:
+            return
+        try:
+            if m.text:
+                await bot.edit_message_text(
+                    m.text, chat_id=mp.user_id,
+                    message_id=mp.user_chat_msg_id,
+                    parse_mode=None,
+                    entities=m.entities or None,
+                )
+            elif m.caption is not None:
+                await bot.edit_message_caption(
+                    chat_id=mp.user_id,
+                    message_id=mp.user_chat_msg_id,
+                    caption=m.caption,
+                    caption_entities=m.caption_entities or None,
+                )
+        except TelegramBadRequest:
+            pass
+
+    # ---------- удаление через /del ----------
+    # Telegram не шлёт апдейт когда пользователь сам удаляет сообщение —
+    # это принципиальное ограничение Bot API. Поэтому синхронное удаление
+    # реализовано через команду: админ пишет /del реплаем на нужное
+    # сообщение в чате — бот удаляет его с обеих сторон.
+    # Юзер не может вызвать /del (команда обрабатывается только в
+    # admin_chat_id). Чтобы юзер мог "попросить" об удалении — он пишет
+    # боту, админ сам решает.
+
+    @r.message(Command("del"), F.chat.type.in_({"group", "supergroup"}))
+    async def cmd_del(m: Message, bot: Bot, bot_db_id: int):
+        """/del реплаем на сообщение в админ-чате — удаляет его у обеих сторон."""
+        cfg = await get_cfg(bot_db_id)
+        if not cfg or m.chat.id != cfg.admin_chat_id:
+            return
+        if not await is_bot_admin(m.from_user.id, bot_db_id, bot, cfg):
+            return
+        if _mod_cmd_already_handled(bot_db_id, m.message_id):
+            return
+
+        target_msg = m.reply_to_message
+        if not target_msg:
+            await m.reply(f"{em('warn')} Используйте /del реплаем на нужное сообщение.")
+            return
+
+        async with Session() as s:
+            mp = await s.scalar(select(MsgMap).where(
+                MsgMap.bot_id == bot_db_id,
+                MsgMap.admin_chat_msg_id == target_msg.message_id,
+            ).order_by(MsgMap.id.desc()))
+
+        deleted_admin = False
+        deleted_user = False
+
+        # Удаляем копию в админ-чате
+        try:
+            await bot.delete_message(cfg.admin_chat_id, target_msg.message_id)
+            deleted_admin = True
+        except TelegramBadRequest:
+            pass
+
+        # Удаляем оригинал у пользователя (если знаем message_id)
+        if mp and mp.user_chat_msg_id:
+            try:
+                await bot.delete_message(mp.user_id, mp.user_chat_msg_id)
+                deleted_user = True
+            except TelegramBadRequest:
+                pass  # уже удалено юзером или истёк 48ч лимит
+
+        # Удаляем саму команду /del чтобы не засорять чат
+        try:
+            await bot.delete_message(m.chat.id, m.message_id)
+        except TelegramBadRequest:
+            pass
+
+        if not deleted_admin and not deleted_user:
+            try:
+                await m.answer(f"{em('warn')} Не удалось удалить (сообщение старше 48 ч или уже удалено).")
+            except Exception:
+                pass
+
     return r
