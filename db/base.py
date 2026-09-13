@@ -111,8 +111,6 @@ async def _reencrypt_plaintext_tokens():
     for row in rows:
         bot_id, token_value, fp_value = row.id, row.token, row.token_fingerprint
         if crypto.looks_like_plaintext_token(token_value):
-            # Открытый текст — шифруем и сразу считаем отпечаток от
-            # оригинала (единственный момент, когда мы ещё видим plaintext).
             encrypted = crypto.encrypt_token(token_value)
             fp = crypto.token_fingerprint(token_value)
             await _exec_params(
@@ -120,9 +118,6 @@ async def _reencrypt_plaintext_tokens():
                 {"t": encrypted, "fp": fp, "id": bot_id})
             migrated += 1
         elif not fp_value:
-            # Уже зашифрован (например, прошлым запуском этой же функции),
-            # но по какой-то причине остался без отпечатка — расшифровываем
-            # только чтобы посчитать fingerprint, сам токен не трогаем.
             if not crypto.is_valid_ciphertext(token_value):
                 broken += 1
                 log.error("child_bots.id=%s: токен не расшифровывается текущим "
@@ -182,19 +177,12 @@ async def init_db():
         "ALTER TABLE suggestions ADD COLUMN IF NOT EXISTS origin_chat_id BIGINT",
         "ALTER TABLE suggestions ADD COLUMN IF NOT EXISTS origin_message_id BIGINT",
         "ALTER TABLE suggestions ADD COLUMN IF NOT EXISTS origin_message_ids TEXT",
-        # Режим шапки (отдельно/слитно/выкл) и настраиваемое имя топика
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS header_mode VARCHAR(16) DEFAULT 'separate'",
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS topic_name_template TEXT DEFAULT '✉️ {name} · {id}'",
-        # id исходного сообщения юзера — reply-контекст и зеркалирование реакций
         "ALTER TABLE msg_map ADD COLUMN IF NOT EXISTS user_chat_msg_id BIGINT",
-        # Источник кнопок поста (шаблон/свои/оба/без)
         "ALTER TABLE posts ADD COLUMN IF NOT EXISTS buttons_mode VARCHAR(16) DEFAULT 'both'",
-        # Гарантированные точечные фиксы для УЖЕ ИЗВЕСТНЫХ застрявших колонок
-        # (в дополнение к универсальному поиску ниже — на случай, если он по
-        # какой-то причине не сработает на конкретной инсталляции).
         'ALTER TABLE child_bots ALTER COLUMN restart_creates_new_ticket DROP NOT NULL',
         'ALTER TABLE child_bots ALTER COLUMN open_ticket_button_text DROP NOT NULL',
-        # ---- антиспам (rate-limit / капча / прогрессирующие тайм-ауты) ----
         "ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS req_window_start TIMESTAMP",
         "ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS req_window_count INTEGER DEFAULT 0",
         "ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS total_requests INTEGER DEFAULT 0",
@@ -203,14 +191,11 @@ async def init_db():
         "ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS captcha_asked_at TIMESTAMP",
         "ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS spam_strikes INTEGER DEFAULT 0",
         "ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS throttled_until TIMESTAMP",
-        # ---- настраиваемые в конструкторе пороги антиспама на бота ----
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS antispam_enabled BOOLEAN DEFAULT true",
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS rate_limit_max INTEGER DEFAULT 6",
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS rate_limit_window INTEGER DEFAULT 10",
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS captcha_every INTEGER DEFAULT 20",
-        # владелец бота проверяется антиспамом или нет (тоггл для теста)
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS antispam_ignore_owner BOOLEAN DEFAULT true",
-        # бан пользователя в САМОМ КОНСТРУКТОРЕ (master-боте)
         "ALTER TABLE platform_users ADD COLUMN IF NOT EXISTS is_banned BOOLEAN DEFAULT false",
         "ALTER TABLE platform_users ADD COLUMN IF NOT EXISTS ban_reason TEXT",
         "ALTER TABLE platform_users ADD COLUMN IF NOT EXISTS banned_at TIMESTAMP",
@@ -218,75 +203,49 @@ async def init_db():
         "ALTER TABLE platform_users ADD COLUMN IF NOT EXISTS captcha_pending BOOLEAN DEFAULT false",
         "ALTER TABLE platform_users ADD COLUMN IF NOT EXISTS captcha_answer VARCHAR(8)",
         "ALTER TABLE platform_users ADD COLUMN IF NOT EXISTS captcha_asked_at TIMESTAMP",
-        # реклама: source_bot_id теперь может быть NULL ("показ во всех ботах")
         'ALTER TABLE advertisements ALTER COLUMN source_bot_id DROP NOT NULL',
-        # согласие с политикой конфиденциальности/соглашением/политикой
-        # возвратов — ТЕПЕРЬ ТОЛЬКО в самом конструкторе (master-боте), не в
-        # дочерних. Раньше эти же поля ошибочно вешались на BotUser/ChildBot
-        # (дочерние боты) без миграции модели — падало AttributeError.
         "ALTER TABLE platform_users ADD COLUMN IF NOT EXISTS accepted_terms BOOLEAN DEFAULT false",
         "ALTER TABLE platform_users ADD COLUMN IF NOT EXISTS accepted_terms_at TIMESTAMP",
-        # ---- шифрование токенов дочерних ботов (см. utils/crypto.py) ----
-        # Расширяем колонку под шифротекст (заметно длиннее сырого токена)
-        # и добавляем отдельный детерминированный отпечаток для поиска
-        # дублей, раз сам зашифрованный токен для этого больше не годится.
         "ALTER TABLE child_bots ALTER COLUMN token TYPE VARCHAR(512)",
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS token_fingerprint VARCHAR(64)",
-        # кнопка самостоятельного закрытия обращения пользователем (reply-клавиатура)
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS close_ticket_button_text VARCHAR(64) DEFAULT '❌ Закрыть обращение'",
         "ALTER TABLE advertisements ADD COLUMN IF NOT EXISTS extends_ad_id INTEGER",
-        # закреплять ли первое сообщение обращения в админ-чате (только вне топиков)
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS pin_first_message BOOLEAN DEFAULT false",
-        # несколько параллельных обращений по темам (кнопки inline_ticket/keyboard_ticket)
         "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS subject VARCHAR(128)",
         "ALTER TABLE tickets ADD COLUMN IF NOT EXISTS last_active_at TIMESTAMP DEFAULT now()",
         "ALTER TABLE msg_map ADD COLUMN IF NOT EXISTS ticket_id INTEGER",
-        # ---- боты-анкеты (п.4) ----
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS survey_start_text TEXT",
         "ALTER TABLE bot_buttons ADD COLUMN IF NOT EXISTS survey_id INTEGER",
-        # У bot_type — нативный Postgres ENUM (создан SQLAlchemy как
-        # "bottype"), просто ADD COLUMN тут не поможет — новое значение
-        # 'survey' нужно явно добавить в сам тип. ADD VALUE IF NOT EXISTS
-        # безопасно вызывать повторно.
         "ALTER TYPE bottype ADD VALUE IF NOT EXISTS 'survey'",
-        # ---- п.3: настраиваемый/удаляемый текст закрытия обращения ----
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS close_notify_text TEXT "
         "DEFAULT '🔒 Обращение закрыто администрацией. Ваше новое сообщение откроет новое обращение.'",
-        # ---- п.5: кнопка "отказаться от админа" (текст сообщения-эффекта) ----
         "ALTER TABLE bot_buttons ADD COLUMN IF NOT EXISTS disown_text TEXT",
-        # ---- п.6: настраиваемая/отключаемая реакция на сообщение админа ----
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS admin_reply_reaction VARCHAR(16) DEFAULT '👍'",
-        # ---- стили/premium-эмодзи (Bot API 9.4) на кнопке "Закрыть обращение" и кнопке доната ----
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS close_ticket_button_style VARCHAR(16)",
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS close_ticket_button_icon VARCHAR(32)",
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS donate_button_style VARCHAR(16)",
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS donate_button_icon VARCHAR(32)",
-        # ---- п. "удаление кнопки закрыть обращение": колонка стала nullable ----
         "ALTER TABLE child_bots ALTER COLUMN close_ticket_button_text DROP NOT NULL",
-        # ---- режим диалога в ботах-анкетах (переписка админ<->респондент) ----
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS survey_dialog_enabled BOOLEAN DEFAULT FALSE",
-        # ---- фикс багов ботов-анкет: топики, медиа+форматирование вопросов
-        # и финального сообщения (см. child/survey.py, master/router.py) ----
         "ALTER TABLE survey_questions ADD COLUMN IF NOT EXISTS media_file_id VARCHAR(256)",
         "ALTER TABLE survey_questions ADD COLUMN IF NOT EXISTS media_type VARCHAR(16)",
         "ALTER TABLE survey_responses ADD COLUMN IF NOT EXISTS topic_id BIGINT",
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS survey_finish_media_id VARCHAR(256)",
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS survey_finish_media_type VARCHAR(16)",
-        # ---- новые фичи из последних апдейтов Bot API ----
-        # иконка форум-топика (create_forum_topic + icon_custom_emoji_id)
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS topic_icon_emoji_id VARCHAR(32)",
-        # эффект на приветственном сообщении (message_effect_id)
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS welcome_effect_id VARCHAR(32)",
-        # ежемесячные Stars-подписки на донат (subscription_period)
         "ALTER TABLE donations ADD COLUMN IF NOT EXISTS is_subscription BOOLEAN DEFAULT FALSE",
-        # ---- докрутка: продление/отмена подписки + рич-текст + Pro-гейт ----
         "ALTER TABLE donations ADD COLUMN IF NOT EXISTS subscription_state VARCHAR(16)",
         "ALTER TABLE donations ADD COLUMN IF NOT EXISTS telegram_payment_charge_id VARCHAR(128)",
         "ALTER TABLE donations ADD COLUMN IF NOT EXISTS subscription_expiration TIMESTAMP",
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS rich_welcome BOOLEAN DEFAULT FALSE",
         "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS topic_color INTEGER",
-        # ---- автоответы ----
         "ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS incoming_msg_count INTEGER DEFAULT 0",
+        # ИСПРАВЛЕНИЕ: колонки, которых не хватало в ScenarioSession —
+        # scenario_runner.py записывает в них при каждом шаге,
+        # без них любой исполняемый сценарий падал с AttributeError.
+        "ALTER TABLE scenario_sessions ADD COLUMN IF NOT EXISTS input_variable VARCHAR(128)",
+        "ALTER TABLE scenario_sessions ADD COLUMN IF NOT EXISTS last_step_at TIMESTAMP",
     ):
         await _exec(stmt)
 
