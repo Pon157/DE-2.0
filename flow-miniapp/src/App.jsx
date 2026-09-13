@@ -362,10 +362,17 @@ function NodeSummary({ type, config }) {
     </span>
   );
   if (type === "input") return (
-    <span>
+    <div style={{ fontSize: 12 }}>
+      {(config.question || config.prompt)
+        ? <div style={{ color: C.textMid, marginBottom: 2 }}>
+            {truncate((config.question || config.prompt).replace(/<[^>]+>/g,""), 38)}
+          </div>
+        : null}
       <span style={{ color: C.warn }}>→ </span>
-      <span style={{ color: C.text }}>{config.variable_name || "переменная"}</span>
-    </span>
+      <span style={{ color: C.text }}>
+        {config.variable_name || <em style={{ color: C.textDim }}>задайте переменную</em>}
+      </span>
+    </div>
   );
   if (type === "condition") return (
     <span style={{ color: C.text }}>
@@ -737,11 +744,11 @@ function ConfigPanel({ node, onChange, onClose, onDelete, isMobile, allNodes }) 
 
       {/* ── ВВОД ── */}
       {type === "input" && (<>
-        <FieldBlock label="Вопрос пользователю" hint="ПКМ — форматирование текста.">
-          <RichTextArea style={taStyle} value={config.question || ""}
+        <FieldBlock label="Вопрос пользователю" hint="ПКМ по полю — форматирование. Поддерживается HTML.">
+          <RichTextArea style={taStyle} value={config.question || config.prompt || ""}
             onChange={v => set("question", v)} placeholder="Введите ваш вопрос..." />
         </FieldBlock>
-        <FieldBlock label="Имя переменной" hint="Латиница, без пробелов. Доступна как {{имя}}.">
+        <FieldBlock label="Имя переменной" hint="Латиница, без пробелов. Доступна как {{имя}} в следующих узлах.">
           <input style={inputStyle} value={config.variable_name || ""}
             onChange={e => set("variable_name", e.target.value.replace(/[^a-zA-Z0-9_]/g,""))}
             placeholder="user_answer" />
@@ -1479,11 +1486,12 @@ function FlowEditor({ botId, scenarioId, initData, onBack }) {
       {/* Панель настроек — открывается при клике на узел */}
       {selectedNode && (
         <ConfigPanel
-          node={selectedNode}
+          node={{ ...selectedNode, botId }}
           onChange={updateSelectedConfig}
           onClose={() => setSelectedNode(null)}
           onDelete={deleteSelected}
           isMobile={isMobile}
+          allNodes={nodes}
         />
       )}
 
