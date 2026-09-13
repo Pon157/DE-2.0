@@ -122,6 +122,14 @@ const Icons = {
       <path d="M5 4.5h6M5 11.5h6" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/>
     </svg>
   ),
+  report: () => (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+      <rect x="2" y="1" width="12" height="14" rx="1.5" stroke="currentColor" strokeWidth="1.4" fill="none"/>
+      <path d="M5 5h6M5 8h6M5 11h3" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/>
+      <circle cx="12" cy="12" r="3" fill="currentColor" opacity=".25" stroke="currentColor" strokeWidth="1.2"/>
+      <path d="M11 12h2M12 11v2" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/>
+    </svg>
+  ),
 };
 
 // ─── Цветовая палитра ─────────────────────────────────────────────────────────
@@ -151,6 +159,7 @@ const NODE_TYPES_META = {
   set_variable: { label: "Задать перем.",  color: "#0ea5e9", Icon: Icons.setvar,       hint: "Устанавливает переменную вручную (статическое значение)." },
   random_branch:{ label: "Случайный выбор",color: "#f97316", Icon: Icons.random,       hint: "Случайно выбирает одну из веток (A или B)." },
   buttons:      { label: "Кнопки",         color: "#a855f7", Icon: Icons.buttons,      hint: "Отправляет сообщение с инлайн-кнопками. Пользователь выбирает ветку." },
+  report:       { label: "Отчёт",          color: "#0891b2", Icon: Icons.report,      hint: "Отправляет отчёт с переменными в чат администраторов." },
   end:          { label: "Конец",          color: "#374151", Icon: Icons.end,          hint: "Завершает сценарий." },
 };
 
@@ -331,6 +340,13 @@ function NodeSummary({ type, config }) {
       {config.buttons?.length ? `${config.buttons.length} кнопк${config.buttons.length === 1 ? "а" : "и"}` : "Кнопки не заданы"}
     </span>
   );
+  if (type === "report") return (
+    <span style={{ color: "#67e8f9", fontSize: 12 }}>
+      {config.variables?.length
+        ? `${config.variables.length} перем. → чат администраторов`
+        : <em style={{ color: C.textDim }}>Настройте переменные</em>}
+    </span>
+  );
   return null;
 }
 
@@ -488,6 +504,38 @@ function ConfigPanel({ node, onChange, onClose, onDelete, isMobile }) {
             fontSize: 12, color: C.textMid, marginTop: 4, lineHeight: 1.6 }}>
             Каждая кнопка создаёт отдельный выход из узла.<br/>
             Соедините выходы со следующими шагами.
+          </div>
+        </>
+      )}
+
+      {node.data.nodeType === "report" && (
+        <>
+          <FieldBlock label="Заголовок отчёта" hint="Отображается в сообщении администраторам">
+            <input style={inputStyle} value={cfg.title || ""}
+              onChange={e => set("title", e.target.value)}
+              placeholder="📋 Отчёт по сценарию" />
+          </FieldBlock>
+          <FieldBlock
+            label="Переменные для отчёта"
+            hint="Введите имена переменных из узлов «Ввод», по одной на строку. Их значения придут в чат администраторов."
+          >
+            <textarea style={{ ...inputStyle, height: 100, resize: "vertical" }}
+              value={(cfg.variables || []).join("\n")}
+              onChange={e => set("variables", e.target.value.split("\n").map(s => s.trim()).filter(Boolean))}
+              placeholder={"user_name\nuser_phone\nuser_comment"} />
+          </FieldBlock>
+          <FieldBlock
+            label="ID чата администраторов (необязательно)"
+            hint="Оставьте пустым — отчёт придёт в основной чат администраторов бота (настраивается в конструкторе). Или введите другой chat_id."
+          >
+            <input style={inputStyle} value={cfg.admin_chat_id || ""}
+              onChange={e => set("admin_chat_id", e.target.value.replace(/[^\d-]/g, ""))}
+              placeholder="-1001234567890" />
+          </FieldBlock>
+          <div style={{ background: C.elevated, borderRadius: 8, padding: "8px 12px",
+            fontSize: 12, color: C.textMid, marginTop: 4, lineHeight: 1.6 }}>
+            Когда сценарий дойдёт до этого блока, бот отправит выбранные переменные
+            и их значения в чат администраторов.
           </div>
         </>
       )}
@@ -990,6 +1038,7 @@ function FlowEditor({ botId, scenarioId, initData, onBack }) {
           onPaneClick={onPaneClick}
           nodeTypes={nodeTypes}
           fitView
+          proOptions={{ hideAttribution: true }}
           defaultEdgeOptions={{
             markerEnd: { type: MarkerType.ArrowClosed, color: C.borderHi },
             style: { stroke: C.borderHi, strokeWidth: 2 },
