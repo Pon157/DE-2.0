@@ -1,4 +1,3 @@
-
 import re
 from datetime import datetime, timedelta
 from sqlalchemy import select, func
@@ -47,6 +46,19 @@ async def get_or_create_user(session, bot_id: int, tg_user) -> BotUser:
         u.last_active = datetime.utcnow()
         u.is_blocked_bot = False
     return u
+
+
+async def mark_blocked_bot(bot_id: int, user_id: int) -> None:
+    """Помечает пользователя как заблокировавшего бота (is_blocked_bot=True).
+    Вызывается из admin_reply при TelegramForbiddenError — чтобы статистика
+    «заблокировали бота» отражала реальное состояние, а не только случайные
+    попадания в рассылку."""
+    async with Session() as s:
+        u = await s.scalar(select(BotUser).where(
+            BotUser.bot_id == bot_id, BotUser.user_id == user_id))
+        if u:
+            u.is_blocked_bot = True
+            await s.commit()
 
 
 async def _log(bot_id: int, admin_id: int, admin_username: str | None,
@@ -252,5 +264,3 @@ async def admin_stats_text(bot_id: int) -> str:
         lines.append(f"@{name}: {msgs} ответов, 🚫 {a.get('ban', 0)} банов, "
                     f"⚠️ {a.get('warn', 0)} варнов")
     return "\n".join(lines)
-
-
