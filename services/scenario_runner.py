@@ -388,7 +388,7 @@ async def _advance(session: ScenarioSession, bot: Bot,
         if prompt:
             text = _render_template(prompt, variables)
             try:
-                await bot.send_message(session.user_id, text)
+                await bot.send_message(session.user_id, text, parse_mode="HTML")
             except Exception as e:
                 log.warning("scenario_runner input prompt: %s", e)
         async with Session() as s:
@@ -511,7 +511,8 @@ async def _advance(session: ScenarioSession, bot: Bot,
                     has_branch = True
             keyboard = InlineKeyboardMarkup(inline_keyboard=rows)
             try:
-                await bot.send_message(session.user_id, text, reply_markup=keyboard, parse_mode="HTML")
+                await bot.send_message(session.user_id, text, reply_markup=keyboard,
+                                       parse_mode="HTML")
             except Exception as e:
                 log.warning("scenario_runner buttons send: %s", e)
             if has_branch:
@@ -555,12 +556,13 @@ async def _advance(session: ScenarioSession, bot: Bot,
                     if cfg_bot:
                         target_chat = cfg_bot.admin_chat_id
             if target_chat:
+                import html as _html
                 var_names = [v.strip() for v in cfg.get("variables", []) if str(v).strip()]
                 title = cfg.get("title", "📋 Отчёт по сценарию")
-                lines = [f"<b>{_render_template(title, variables)}</b>"]
+                lines = [f"<b>{_html.escape(_render_template(title, variables))}</b>"]
                 for vname in var_names:
-                    val = variables.get(vname, "<не задана>")
-                    lines.append(f"• <b>{vname}</b>: {str(val)[:512]}")
+                    val = variables.get(vname, "—")
+                    lines.append(f"• <b>{_html.escape(str(vname))}</b>: {_html.escape(str(val)[:512])}")
                 if not var_names:
                     lines.append("<i>Переменные не выбраны</i>")
                 report_text = "\n".join(lines)[:4096]
@@ -575,12 +577,13 @@ async def _advance(session: ScenarioSession, bot: Bot,
                 cfg_bot = await s.get(ChildBot, session.bot_id)
             target_chat = cfg_bot.admin_chat_id if cfg_bot else None
             if target_chat:
+                import html as _html
                 var_name = cfg.get("variable_name", "_input")
                 value = variables.get(var_name, "")
                 label = cfg.get("label") or var_name
                 title = cfg.get("title", "")
-                title_rendered = _render_template(title, variables) if title else f"\U0001f4e8 Ответ пользователя ({label})"
-                text = f"<b>{title_rendered}</b>\n{str(value)[:2000]}"
+                title_rendered = _render_template(title, variables) if title else f"\U0001f4e8 Ответ пользователя ({_html.escape(str(label))})"
+                text = f"<b>{_html.escape(title_rendered)}</b>\n{_html.escape(str(value)[:2000])}"
                 await bot.send_message(int(target_chat), text, parse_mode="HTML")
         except Exception as e:
             log.warning("scenario_runner send_to_admin: %s", e)
