@@ -116,7 +116,7 @@ async def _require_pro_owner(bot_id: int, user: dict = Depends(_get_verified_use
 # Pydantic-схемы
 # =========================================================================
 
-_ALLOWED_NODE_TYPES = {"trigger", "message", "input", "condition", "delay", "set_variable", "random_branch", "buttons", "end"}
+_ALLOWED_NODE_TYPES = {"trigger", "message", "input", "condition", "delay", "set_variable", "random_branch", "buttons", "report", "end"}
 # FIX: используем реальные значения enum из модели
 _ALLOWED_TRIGGERS = {t.value for t in ScenarioTrigger}
 
@@ -396,5 +396,3 @@ async def toggle_scenario(bot_id: int, scenario_id: int,
         sc.is_active = not sc.is_active
         await s.commit()
     return {"is_active": sc.is_active}
-
---- END OF FILE: flow_api\main.py ---
