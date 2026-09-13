@@ -1,14 +1,14 @@
 from aiogram import Router, F, Bot
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
-from aiogram.types import Message
+from aiogram.types import Message, CallbackQuery
 from db.base import Session
 from db.models import ChildBot, MessageLog, OpenMode, BotUser
 from sqlalchemy import select
 from services.autoreply import check_and_fire
 from services import moderation as mod
 from services import antispam
-from services.scenario_runner import run_step, find_matching_scenario, trigger_scenario
+from services.scenario_runner import run_step, find_matching_scenario, trigger_scenario, handle_scen_btn_callback
 from child.common import (inject_extras, build_keyboards, send_with_keyboards,
                           handle_keyboard_button, open_ticket, get_cfg,
                           buffer_or_process, relay_to_admin_chat, is_bot_admin,
@@ -54,6 +54,24 @@ def build_feedback_router() -> Router:
     # Триггер-команды, кнопки open_ticket/trg/donate, ответы админов и
     # реакции обрабатываются в child/common.py::build_common_router() — он
     # подключается ко ВСЕМ ботам (и фидбек-, и постинг-).
+
+    @r.callback_query(F.data.startswith("scen_btn:"))
+    async def cb_scen_btn(c: CallbackQuery, bot: Bot, bot_db_id: int):
+        """Обрабатывает нажатие кнопки из узла 'Кнопки' в сценарии."""
+        try:
+            # формат: scen_btn:{session_id}:{btn_index}:{label}
+            parts = c.data.split(":", 3)
+            session_id = int(parts[1])
+            btn_index = int(parts[2])
+            btn_label = parts[3] if len(parts) > 3 else ""
+        except (ValueError, IndexError):
+            await c.answer("Ошибка кнопки сценария.")
+            return
+        handled = await handle_scen_btn_callback(session_id, btn_index, btn_label, bot, bot_db_id)
+        if handled:
+            await c.answer()
+        else:
+            await c.answer("Сессия устарела, начните сначала.", show_alert=True)
 
     @r.message(F.chat.type == "private")
     async def user_message(m: Message, bot: Bot, bot_db_id: int, state: FSMContext):
