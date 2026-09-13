@@ -60,7 +60,7 @@ class DonateSt(StatesGroup):
 
 # Команды, которые нельзя переопределить триггер-командой из конструктора.
 RESERVED_COMMANDS = {"start", "restart", "cancel", "donate", "newpost", "done",
-                     "ads", "ban", "unban", "warn", "unwarn", "ref", "pro"}
+                     "ads", "ban", "unban", "warn", "unwarn", "ref", "pro", "setchat"}
 
 
 async def get_cfg(bot_db_id: int) -> ChildBot | None:
@@ -1259,6 +1259,38 @@ def build_common_router() -> Router:
             # роутере конкретного типа бота).
             raise SkipHandler
         await send_response(m, b.response_text, b.response_photo, bot_db_id=bot_db_id)
+
+    # ---------- /setchat — привязка чата администраторов владельцем ----------
+    @r.message(Command("setchat"), F.chat.type.in_({"group", "supergroup"}))
+    async def cmd_setchat(m: Message, bot: Bot, bot_db_id: int):
+        """Владелец бота пишет /setchat в группе — группа становится чатом админов.
+        Достаточно просто написать команду прямо в нужном чате, никаких ID не нужно.
+        Работает только для владельца бота (не для обычных админов).
+        """
+        async with Session() as s:
+            cfg = await s.get(ChildBot, bot_db_id)
+            if not cfg:
+                return
+            if cfg.owner_id != m.from_user.id:
+                await m.reply("⛔ Только владелец бота может привязать чат.")
+                return
+            chat = m.chat
+            # Проверяем что бот имеет права в этом чате
+            try:
+                member = await bot.get_chat_member(chat.id, (await bot.get_me()).id)
+                if member.status not in ("administrator", "creator"):
+                    await m.reply(
+                        "⚠️ Добавьте бота как администратора чата и повторите команду.")
+                    return
+            except Exception:
+                await m.reply("⚠️ Не удалось проверить права бота в чате.")
+                return
+            cfg.admin_chat_id = chat.id
+            await s.commit()
+        title = m.chat.title or str(m.chat.id)
+        await m.reply(
+            f"\u2705 \u0427\u0430\u0442 \xab{title}\xbb \u043f\u0440\u0438\u0432\u044f\u0437\u0430\u043d \u043a\u0430\u043a \u0447\u0430\u0442 \u0430\u0434\u043c\u0438\u043d\u0438\u0441\u0442\u0440\u0430\u0442\u043e\u0440\u043e\u0432!\n"
+            "\u0422\u0435\u043f\u0435\u0440\u044c \u043e\u0431\u0440\u0430\u0449\u0435\u043d\u0438\u044f \u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b\u0435\u0439 \u0431\u0443\u0434\u0443\u0442 \u043f\u0440\u0438\u0445\u043e\u0434\u0438\u0442\u044c \u0441\u044e\u0434\u0430.")
 
     # ---------- закрытие / переоткрытие обращения ----------
     async def _close_ticket_core(bot: Bot, bot_db_id: int, tid: int,
