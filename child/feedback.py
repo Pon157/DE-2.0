@@ -1,4 +1,3 @@
-
 from aiogram import Router, F, Bot
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
@@ -108,25 +107,26 @@ def build_feedback_router() -> Router:
         # как обычные. Если идёт любой FSM-ввод — тут делать нечего.
         if await state.get_state() is not None:
             return
-        if await handle_keyboard_button(m, bot_db_id):
-            return
 
         # ── Сценарии (Pro) ───────────────────────────────────────────────
         # Порядок важен:
-        # 1. Антиспам УЖЕ отработал выше — капча не обходится сценарием.
-        # 2. FSM-состояние (донат, техн. диалог) УЖЕ проверено выше.
+        # 1. Антиспам УЖЕ отработал выше.
+        # 2. FSM-состояние УЖЕ проверено выше.
         # 3. run_step: если юзер внутри сценария и waiting_input=True —
         #    поглощаем сообщение, дальше не идём.
         if await run_step(m, bot, bot_db_id):
             return
-        # 4. find_matching_scenario: проверяем, запускает ли это сообщение
-        #    новый сценарий (команда / ключевое слово / текст кнопки).
-        #    handle_keyboard_button уже отработал выше — здесь только сценарии.
+        # 4. find_matching_scenario: проверяем ДО handle_keyboard_button,
+        #    иначе сценарии с trigger_type=button и keyword никогда не
+        #    запустятся — кнопка поглощается раньше.
         scenario = await find_matching_scenario(bot_db_id, m.text)
         if scenario:
             await trigger_scenario(bot_db_id, m.from_user.id, scenario.id, bot)
             return
         # ────────────────────────────────────────────────────────────────
+
+        if await handle_keyboard_button(m, bot_db_id):
+            return
 
         # Неизвестные команды не идут в relay
         if m.text and m.text.startswith("/"):
@@ -146,4 +146,3 @@ def build_feedback_router() -> Router:
         await buffer_or_process(m, _process)
 
     return r
-
