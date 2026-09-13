@@ -1231,7 +1231,7 @@ def build_common_router() -> Router:
     # триггер-команды не работали вообще, а сами команды улетали в админ-чат
     # как предложка.
     @r.message(F.chat.type == "private", F.text.startswith("/"))
-    async def custom_command(m: Message, bot_db_id: int):
+    async def custom_command(m: Message, bot: Bot, bot_db_id: int):
         cmd = m.text.split()[0].lstrip("/").split("@")[0].lower()
         if cmd in RESERVED_COMMANDS:
             raise SkipHandler
@@ -1240,6 +1240,15 @@ def build_common_router() -> Router:
         if await mod.is_banned(bot_db_id, m.from_user.id):
             return
         cfg = await get_cfg(bot_db_id)
+
+        # ИСПРАВЛЕНИЕ: проверяем сценарии с типом trigger_type=command ДО
+        # поиска в BotButton — иначе такие сценарии никогда не запускаются.
+        from services.scenario_runner import find_matching_scenario, trigger_scenario
+        scenario = await find_matching_scenario(bot_db_id, m.text)
+        if scenario:
+            await trigger_scenario(bot_db_id, m.from_user.id, scenario.id, bot)
+            return
+
         async with Session() as s:
             b = await s.scalar(select(BotButton).where(
                 BotButton.bot_id == bot_db_id, BotButton.kind == "command",
