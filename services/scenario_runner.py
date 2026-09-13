@@ -726,24 +726,36 @@ async def handle_scen_btn_callback(session_id: int, btn_index: int,
 
 
 async def find_matching_scenario(bot_db_id: int,
-                                 text: str | None) -> Scenario | None:
-    """Найти активный сценарий по тексту сообщения (keyword/command).
-    Используется в user_message перед обычным relay."""
-    if not text:
-        return None
+                                 text: str | None,
+                                 on_start: bool = False) -> Scenario | None:
+    """Найти активный сценарий по тексту сообщения (keyword/command/button)
+    или при старте бота (on_start=True).
+    Используется в user_message перед обычным relay, и в /start хендлере."""
     async with Session() as s:
         scenarios = list((await s.scalars(select(Scenario).where(
             Scenario.bot_id == bot_db_id,
             Scenario.is_active.is_(True)))).all())
+
     for sc in scenarios:
-        if sc.trigger_type.value == "command":
+        ttype = sc.trigger_type.value
+
+        # Триггер «при старте» (/start команда)
+        if ttype == "start" and on_start:
+            return sc
+
+        # Остальные триггеры требуют текста
+        if not text:
+            continue
+
+        if ttype == "command":
             cmd = text.strip().lstrip("/").split("@")[0].lower()
             if sc.trigger_value and cmd == sc.trigger_value.lower():
                 return sc
-        elif sc.trigger_type.value == "keyword":
+        elif ttype == "keyword":
             if sc.trigger_value and sc.trigger_value.lower() in text.lower():
                 return sc
-        elif sc.trigger_type.value == "button":
+        elif ttype == "button":
             if sc.trigger_value and text.strip() == sc.trigger_value:
                 return sc
+
     return None
