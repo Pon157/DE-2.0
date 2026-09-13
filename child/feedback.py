@@ -1,4 +1,4 @@
---- START OF FILE: child\feedback.py ---
+
 from aiogram import Router, F, Bot
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
@@ -147,4 +147,3 @@ def build_feedback_router() -> Router:
 
     return r
 
---- END OF FILE: child\feedback.py ---
