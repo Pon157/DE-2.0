@@ -176,12 +176,34 @@ class ChildBot(Base):
         String(16), nullable=True
     )
 
+    # Настройки posting
+    channel_id: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
+    )
+    accept_suggestions: Mapped[bool] = mapped_column(
+        Boolean, default=True
+    )
+    post_template: Mapped[str] = mapped_column(Text, default="{text}")
+    template_buttons_json: Mapped[str | None] = mapped_column(
+        Text, nullable=True
+    )
+    channel_delivery_mode: Mapped[str] = mapped_column(
+        String(10), default="template"
+    )
+    channel_publish_mode: Mapped[str] = mapped_column(
+        String(10), default="copy"
+    )
+
     # Антиспам
-    antispam_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    antispam_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=True
+    )
     rate_limit_max: Mapped[int] = mapped_column(Integer, default=6)
     rate_limit_window: Mapped[int] = mapped_column(Integer, default=10)
-    captcha_every: Mapped[int | None] = mapped_column(Integer, nullable=True, default=20)
-    antispam_ignore_owner: Mapped[bool] = mapped_column(Boolean, default=True)
+    captcha_every: Mapped[int] = mapped_column(Integer, default=20)
+    antispam_ignore_owner: Mapped[bool] = mapped_column(
+        Boolean, default=True
+    )
 
 
 class BotAdmin(Base):
@@ -189,9 +211,12 @@ class BotAdmin(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     bot_id: Mapped[int] = mapped_column(
-        ForeignKey("child_bots.id", ondelete="CASCADE"), index=True
+        ForeignKey("child_bots.id", ondelete="CASCADE"),
+        index=True,
     )
     user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+
+    __table_args__ = (UniqueConstraint("bot_id", "user_id"),)
 
 
 class BotButton(Base):
@@ -199,36 +224,28 @@ class BotButton(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     bot_id: Mapped[int] = mapped_column(
-        ForeignKey("child_bots.id", ondelete="CASCADE"), index=True
+        ForeignKey("child_bots.id", ondelete="CASCADE"),
+        index=True,
     )
     kind: Mapped[str] = mapped_column(String(32))
     text: Mapped[str] = mapped_column(String(128))
-    response_text: Mapped[str | None] = mapped_column(Text, nullable=True)
-    response_photo: Mapped[str | None] = mapped_column(String(256), nullable=True)
-    url: Mapped[str | None] = mapped_column(String(512), nullable=True)
-    style: Mapped[str | None] = mapped_column(String(16), nullable=True)
-    icon: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     position: Mapped[int] = mapped_column(Integer, default=0)
-    survey_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    disown_text: Mapped[str | None] = mapped_column(Text, nullable=True)
-
-
-class PlatformUser(Base):
-    __tablename__ = "platform_users"
-
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    pro_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    ref_code: Mapped[str | None] = mapped_column(String(32), nullable=True, unique=True)
-    referred_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    accepted_terms: Mapped[bool] = mapped_column(Boolean, default=False)
-    accepted_terms_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    is_banned: Mapped[bool] = mapped_column(Boolean, default=False)
-    ban_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
-    banned_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    total_requests: Mapped[int] = mapped_column(Integer, default=0)
-    captcha_pending: Mapped[bool] = mapped_column(Boolean, default=False)
-    captcha_answer: Mapped[str | None] = mapped_column(String(8), nullable=True)
-    captcha_asked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    response_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    response_photo: Mapped[str | None] = mapped_column(
+        String(256), nullable=True
+    )
+    style: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    icon_emoji_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
+    survey_id: Mapped[int | None] = mapped_column(
+        ForeignKey("surveys.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    disown_text: Mapped[str | None] = mapped_column(
+        Text, nullable=True
+    )
 
 
 class BotUser(Base):
@@ -236,29 +253,60 @@ class BotUser(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     bot_id: Mapped[int] = mapped_column(
-        ForeignKey("child_bots.id", ondelete="CASCADE"), index=True
+        ForeignKey("child_bots.id", ondelete="CASCADE"),
+        index=True,
     )
     user_id: Mapped[int] = mapped_column(BigInteger, index=True)
-    full_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    username: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    last_active: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    is_blocked_bot: Mapped[bool] = mapped_column(Boolean, default=False)
+    username: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    full_name: Mapped[str] = mapped_column(String(256), default="")
+
+    # Поля из обеих версий модели
+    joined_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
+    first_seen: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now()
+    )
+    last_active: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now()
+    )
+    is_blocked_bot: Mapped[bool] = mapped_column(
+        Boolean, default=False
+    )
     is_banned: Mapped[bool] = mapped_column(Boolean, default=False)
-    ban_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    ban_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ban_until: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
+    ban_reason: Mapped[str | None] = mapped_column(
+        Text, nullable=True
+    )
     warns: Mapped[int] = mapped_column(Integer, default=0)
     warnings: Mapped[int] = mapped_column(Integer, default=0)
 
     # Антиспам и статистика
-    req_window_start: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    req_window_start: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
     req_window_count: Mapped[int] = mapped_column(Integer, default=0)
     total_requests: Mapped[int] = mapped_column(Integer, default=0)
-    captcha_pending: Mapped[bool] = mapped_column(Boolean, default=False)
-    captcha_answer: Mapped[str | None] = mapped_column(String(8), nullable=True)
-    captcha_asked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    captcha_pending: Mapped[bool] = mapped_column(
+        Boolean, default=False
+    )
+    captcha_answer: Mapped[str | None] = mapped_column(
+        String(8), nullable=True
+    )
+    captcha_asked_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
     spam_strikes: Mapped[int] = mapped_column(Integer, default=0)
-    throttled_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    incoming_msg_count: Mapped[int] = mapped_column(Integer, default=0)
+    throttled_until: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
+    incoming_msg_count: Mapped[int] = mapped_column(
+        Integer, default=0
+    )
 
     __table_args__ = (UniqueConstraint("bot_id", "user_id"),)
 
@@ -268,29 +316,40 @@ class Ticket(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     bot_id: Mapped[int] = mapped_column(
-        ForeignKey("child_bots.id", ondelete="CASCADE"), index=True
+        ForeignKey("child_bots.id", ondelete="CASCADE"),
+        index=True,
     )
     user_id: Mapped[int] = mapped_column(BigInteger, index=True)
-    topic_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    topic_id: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
+    )
     is_open: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
-    subject: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now()
+    )
+    subject: Mapped[str | None] = mapped_column(
+        String(128), nullable=True
+    )
     last_active_at: Mapped[datetime | None] = mapped_column(
         DateTime, nullable=True, server_default=func.now()
     )
 
 
 class MessageLog(Base):
+    # Оставлено имя таблицы из старой версии.
     __tablename__ = "message_log"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     bot_id: Mapped[int] = mapped_column(
-        ForeignKey("child_bots.id", ondelete="CASCADE"), index=True
+        ForeignKey("child_bots.id", ondelete="CASCADE"),
+        index=True,
     )
     user_id: Mapped[int] = mapped_column(BigInteger)
     direction: Mapped[str] = mapped_column(String(8))
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
-    admin_username: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    admin_username: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), index=True
     )
@@ -301,11 +360,16 @@ class MsgMap(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     bot_id: Mapped[int] = mapped_column(Integer, index=True)
-    admin_chat_msg_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    admin_chat_msg_id: Mapped[int] = mapped_column(
+        BigInteger, index=True
+    )
     user_id: Mapped[int] = mapped_column(BigInteger)
-    user_chat_msg_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    user_chat_msg_id: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
+    )
     ticket_id: Mapped[int | None] = mapped_column(
-        ForeignKey("tickets.id", ondelete="SET NULL"), nullable=True
+        ForeignKey("tickets.id", ondelete="SET NULL"),
+        nullable=True,
     )
 
 
@@ -314,21 +378,44 @@ class Suggestion(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     bot_id: Mapped[int] = mapped_column(
-        ForeignKey("child_bots.id", ondelete="CASCADE"), index=True
+        ForeignKey("child_bots.id", ondelete="CASCADE"),
+        index=True,
     )
     user_id: Mapped[int] = mapped_column(BigInteger)
     html_text: Mapped[str] = mapped_column(Text, default="")
-    media_file_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
-    media_type: Mapped[str | None] = mapped_column(String(16), nullable=True)
-    media_group_json: Mapped[str | None] = mapped_column(Text, nullable=True)
-    origin_chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    origin_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    origin_message_ids: Mapped[str | None] = mapped_column(Text, nullable=True)
-    status: Mapped[str] = mapped_column(String(16), default="pending")
-    decided_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    decided_by_username: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
-    decided_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    media_file_id: Mapped[str | None] = mapped_column(
+        String(256), nullable=True
+    )
+    media_type: Mapped[str | None] = mapped_column(
+        String(16), nullable=True
+    )
+    media_group_json: Mapped[str | None] = mapped_column(
+        Text, nullable=True
+    )
+    origin_chat_id: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
+    )
+    origin_message_id: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
+    )
+    origin_message_ids: Mapped[str | None] = mapped_column(
+        Text, nullable=True
+    )
+    status: Mapped[str] = mapped_column(
+        String(16), default="pending"
+    )
+    decided_by: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
+    )
+    decided_by_username: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now()
+    )
+    decided_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
 
 
 class Post(Base):
@@ -336,21 +423,42 @@ class Post(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     bot_id: Mapped[int] = mapped_column(
-        ForeignKey("child_bots.id", ondelete="CASCADE"), index=True
+        ForeignKey("child_bots.id", ondelete="CASCADE"),
+        index=True,
     )
     author_id: Mapped[int] = mapped_column(BigInteger)
     html_text: Mapped[str] = mapped_column(Text, default="")
-    media_file_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
-    media_type: Mapped[str | None] = mapped_column(String(16), nullable=True)
-    media_group_json: Mapped[str | None] = mapped_column(Text, nullable=True)
-    origin_chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    origin_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    origin_message_ids: Mapped[str | None] = mapped_column(Text, nullable=True)
-    buttons_json: Mapped[str | None] = mapped_column(Text, nullable=True)
-    buttons_mode: Mapped[str] = mapped_column(String(16), default="both")
-    publish_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    media_file_id: Mapped[str | None] = mapped_column(
+        String(256), nullable=True
+    )
+    media_type: Mapped[str | None] = mapped_column(
+        String(16), nullable=True
+    )
+    media_group_json: Mapped[str | None] = mapped_column(
+        Text, nullable=True
+    )
+    origin_chat_id: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
+    )
+    origin_message_id: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
+    )
+    origin_message_ids: Mapped[str | None] = mapped_column(
+        Text, nullable=True
+    )
+    buttons_json: Mapped[str | None] = mapped_column(
+        Text, nullable=True
+    )
+    buttons_mode: Mapped[str] = mapped_column(
+        String(16), default="both"
+    )
+    publish_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True, index=True
+    )
     published: Mapped[bool] = mapped_column(Boolean, default=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now()
+    )
 
 
 class Donation(Base):
@@ -360,11 +468,21 @@ class Donation(Base):
     bot_id: Mapped[int] = mapped_column(Integer, index=True)
     user_id: Mapped[int] = mapped_column(BigInteger)
     stars: Mapped[int] = mapped_column(Integer)
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
-    is_subscription: Mapped[bool] = mapped_column(Boolean, default=False)
-    subscription_state: Mapped[str | None] = mapped_column(String(16), nullable=True)
-    telegram_payment_charge_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    subscription_expiration: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now()
+    )
+    is_subscription: Mapped[bool] = mapped_column(
+        Boolean, default=False
+    )
+    subscription_state: Mapped[str | None] = mapped_column(
+        String(16), nullable=True
+    )
+    telegram_payment_charge_id: Mapped[str | None] = mapped_column(
+        String(128), nullable=True
+    )
+    subscription_expiration: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
 
 
 class AdStatus(str, enum.Enum):
@@ -385,20 +503,56 @@ class Advertisement(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     buyer_id: Mapped[int] = mapped_column(BigInteger, index=True)
-    source_bot_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    kind: Mapped[AdKind] = mapped_column(Enum(AdKind), default=AdKind.impressions)
+    source_bot_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    kind: Mapped[AdKind] = mapped_column(
+        Enum(AdKind), default=AdKind.impressions
+    )
     text: Mapped[str] = mapped_column(String(100))
-    media_file_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
-    media_type: Mapped[str | None] = mapped_column(String(16), nullable=True)
-    target_impressions: Mapped[int] = mapped_column(Integer, default=0)
+    media_file_id: Mapped[str | None] = mapped_column(
+        String(256), nullable=True
+    )
+    media_type: Mapped[str | None] = mapped_column(
+        String(16), nullable=True
+    )
+    target_impressions: Mapped[int] = mapped_column(
+        Integer, default=0
+    )
     shown_count: Mapped[int] = mapped_column(Integer, default=0)
     price_rub: Mapped[int] = mapped_column(Integer, default=0)
-    status: Mapped[AdStatus] = mapped_column(Enum(AdStatus), default=AdStatus.pending)
+    status: Mapped[AdStatus] = mapped_column(
+        Enum(AdStatus), default=AdStatus.pending
+    )
+    reject_reason: Mapped[str | None] = mapped_column(
+        Text, nullable=True
+    )
+    payment_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
     paid: Mapped[bool] = mapped_column(Boolean, default=False)
-    payment_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    extends_ad_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
-    broadcast_cooldown_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now()
+    )
+    decided_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
+    paid_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
+    extends_ad_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+
+
+class AdCooldown(Base):
+    __tablename__ = "ad_cooldowns"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    buyer_id: Mapped[int] = mapped_column(BigInteger, unique=True)
+    last_broadcast_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now()
+    )
 
 
 class ModerationLog(Base):
@@ -407,11 +561,67 @@ class ModerationLog(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     bot_id: Mapped[int] = mapped_column(Integer, index=True)
     admin_id: Mapped[int] = mapped_column(BigInteger)
-    target_user_id: Mapped[int] = mapped_column(BigInteger, index=True)
-    action: Mapped[str] = mapped_column(String(32))
-    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
-    until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    admin_username: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    action: Mapped[str] = mapped_column(String(16))
+    target_user_id: Mapped[int] = mapped_column(BigInteger)
+    reason: Mapped[str | None] = mapped_column(
+        Text, nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), index=True
+    )
+
+
+class PlatformUser(Base):
+    __tablename__ = "platform_users"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    referred_by: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
+    )
+    referral_count: Mapped[int] = mapped_column(Integer, default=0)
+    pro_until: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now()
+    )
+    is_banned: Mapped[bool] = mapped_column(Boolean, default=False)
+    ban_reason: Mapped[str | None] = mapped_column(
+        Text, nullable=True
+    )
+    banned_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
+    total_requests: Mapped[int] = mapped_column(Integer, default=0)
+    captcha_pending: Mapped[bool] = mapped_column(
+        Boolean, default=False
+    )
+    captcha_answer: Mapped[str | None] = mapped_column(
+        String(8), nullable=True
+    )
+    captcha_asked_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
+    accepted_terms: Mapped[bool] = mapped_column(
+        Boolean, default=False
+    )
+    accepted_terms_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
+
+
+class ReferralEvent(Base):
+    __tablename__ = "referral_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    inviter_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    invitee_id: Mapped[int] = mapped_column(BigInteger, unique=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now()
+    )
 
 
 class BotRuntimeLock(Base):
@@ -419,7 +629,9 @@ class BotRuntimeLock(Base):
 
     bot_id: Mapped[int] = mapped_column(Integer, primary_key=True)
     holder: Mapped[str] = mapped_column(String(36))
-    last_seen: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    last_seen: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now()
+    )
 
 
 class Survey(Base):
@@ -427,11 +639,14 @@ class Survey(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     bot_id: Mapped[int] = mapped_column(
-        ForeignKey("child_bots.id", ondelete="CASCADE"), index=True
+        ForeignKey("child_bots.id", ondelete="CASCADE"),
+        index=True,
     )
     name: Mapped[str] = mapped_column(String(128))
     position: Mapped[int] = mapped_column(Integer, default=0)
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now()
+    )
 
 
 class SurveyQuestion(Base):
@@ -439,14 +654,23 @@ class SurveyQuestion(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     survey_id: Mapped[int] = mapped_column(
-        ForeignKey("surveys.id", ondelete="CASCADE"), index=True
+        ForeignKey("surveys.id", ondelete="CASCADE"),
+        index=True,
     )
     position: Mapped[int] = mapped_column(Integer, default=0)
     text: Mapped[str] = mapped_column(Text)
-    qtype: Mapped[str] = mapped_column(String(16), default="text")
-    options_json: Mapped[str | None] = mapped_column(Text, nullable=True)
-    media_file_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
-    media_type: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    qtype: Mapped[str] = mapped_column(
+        String(16), default="text"
+    )
+    options_json: Mapped[str | None] = mapped_column(
+        Text, nullable=True
+    )
+    media_file_id: Mapped[str | None] = mapped_column(
+        String(256), nullable=True
+    )
+    media_type: Mapped[str | None] = mapped_column(
+        String(16), nullable=True
+    )
 
 
 class SurveyResponse(Base):
@@ -454,16 +678,23 @@ class SurveyResponse(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     survey_id: Mapped[int] = mapped_column(
-        ForeignKey("surveys.id", ondelete="CASCADE"), index=True
+        ForeignKey("surveys.id", ondelete="CASCADE"),
+        index=True,
     )
     bot_id: Mapped[int] = mapped_column(Integer, index=True)
     user_id: Mapped[int] = mapped_column(BigInteger, index=True)
     current_index: Mapped[int] = mapped_column(Integer, default=0)
     answers_json: Mapped[str] = mapped_column(Text, default="[]")
     completed: Mapped[bool] = mapped_column(Boolean, default=False)
-    started_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
-    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    topic_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now()
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
+    topic_id: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
+    )
 
 
 class AutoReplyKind(str, enum.Enum):
@@ -477,15 +708,22 @@ class AutoReply(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     bot_id: Mapped[int] = mapped_column(
-        ForeignKey("child_bots.id", ondelete="CASCADE"), index=True
+        ForeignKey("child_bots.id", ondelete="CASCADE"),
+        index=True,
     )
     kind: Mapped[AutoReplyKind] = mapped_column(Enum(AutoReplyKind))
-    param: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    param: Mapped[str | None] = mapped_column(
+        String(256), nullable=True
+    )
     text: Mapped[str] = mapped_column(Text, default="")
-    photo: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    photo: Mapped[str | None] = mapped_column(
+        String(256), nullable=True
+    )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     position: Mapped[int] = mapped_column(Integer, default=0)
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now()
+    )
 
 
 # Сценарии (flow_api / scenario_runner)
@@ -501,15 +739,22 @@ class Scenario(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     bot_id: Mapped[int] = mapped_column(
-        ForeignKey("child_bots.id", ondelete="CASCADE"), index=True
+        ForeignKey("child_bots.id", ondelete="CASCADE"),
+        index=True,
     )
-    name: Mapped[str] = mapped_column(String(128), default="Новый сценарий")
+    name: Mapped[str] = mapped_column(
+        String(128), default="Новый сценарий"
+    )
     trigger_type: Mapped[ScenarioTrigger] = mapped_column(
         Enum(ScenarioTrigger), default=ScenarioTrigger.command
     )
-    trigger_value: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    trigger_value: Mapped[str | None] = mapped_column(
+        String(256), nullable=True
+    )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now()
+    )
 
 
 class ScenarioNode(Base):
@@ -517,11 +762,14 @@ class ScenarioNode(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     scenario_id: Mapped[int] = mapped_column(
-        ForeignKey("scenarios.id", ondelete="CASCADE"), index=True
+        ForeignKey("scenarios.id", ondelete="CASCADE"),
+        index=True,
     )
     node_type: Mapped[str] = mapped_column(String(32))
     config: Mapped[str] = mapped_column(Text, default="{}")
-    label: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    label: Mapped[str | None] = mapped_column(
+        String(128), nullable=True
+    )
     pos_x: Mapped[float | None] = mapped_column(nullable=True)
     pos_y: Mapped[float | None] = mapped_column(nullable=True)
 
@@ -531,15 +779,19 @@ class ScenarioEdge(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     scenario_id: Mapped[int] = mapped_column(
-        ForeignKey("scenarios.id", ondelete="CASCADE"), index=True
+        ForeignKey("scenarios.id", ondelete="CASCADE"),
+        index=True,
     )
     from_node_id: Mapped[int] = mapped_column(
-        ForeignKey("scenario_nodes.id", ondelete="CASCADE"), index=True
+        ForeignKey("scenario_nodes.id", ondelete="CASCADE"),
+        index=True,
     )
     to_node_id: Mapped[int] = mapped_column(
         ForeignKey("scenario_nodes.id", ondelete="CASCADE")
     )
-    label: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    label: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
 
 
 class ScenarioSession(Base):
@@ -551,11 +803,17 @@ class ScenarioSession(Base):
     scenario_id: Mapped[int] = mapped_column(Integer, index=True)
     current_node_id: Mapped[int] = mapped_column(Integer)
     variables_json: Mapped[str] = mapped_column(Text, default="{}")
-    waiting_input: Mapped[bool] = mapped_column(Boolean, default=False)
-    # ИСПРАВЛЕНИЕ: эти два поля использует scenario_runner.py, но в старой
-    # модели их не было — любое исполнение сценария падало с AttributeError.
-    input_variable: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    last_step_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    waiting_input: Mapped[bool] = mapped_column(
+        Boolean, default=False
+    )
+    input_variable: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    last_step_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now()
+    )
 
     __table_args__ = (UniqueConstraint("bot_id", "user_id"),)
