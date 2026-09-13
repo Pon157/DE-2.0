@@ -159,17 +159,21 @@ async def _send_node_message(bot: Bot, user_id: int, cfg: dict,
     try:
         if photo:
             if len(text) <= 1024:
-                await bot.send_message(user_id, text or "\u200b")  # zero-width space
-                # Telegram не разрешает пустой caption — не передаём
-                await bot.send_photo(user_id, photo, caption=text if text else None)
+                # ИСПРАВЛЕНИЕ: раньше слалось send_message(text) + send_photo(caption=text)
+                # — текст дублировался. Теперь только send_photo с caption.
+                await bot.send_photo(
+                    user_id, photo,
+                    caption=text if text else None,
+                    parse_mode="HTML"
+                )
             else:
+                # Текст длиннее 1024 — caption не влезет, шлём фото отдельно, потом текст
                 await bot.send_photo(user_id, photo)
-                # Разбиваем длинный текст на чанки
                 for i in range(0, len(text), 4096):
-                    await bot.send_message(user_id, text[i:i + 4096])
+                    await bot.send_message(user_id, text[i:i + 4096], parse_mode="HTML")
         else:
             for i in range(0, len(text), 4096):
-                await bot.send_message(user_id, text[i:i + 4096])
+                await bot.send_message(user_id, text[i:i + 4096], parse_mode="HTML")
     except Exception as e:
         log.warning("scenario_runner._send_node_message: %s", e)
 
@@ -475,34 +479,53 @@ async def _advance(session: ScenarioSession, bot: Bot,
         return
 
     elif ntype == "buttons":
-        # Отправить сообщение с кнопками, ждать нажатия
+        # Поддерживаем два формата кнопок:
+        # 1. Старый: список строк — все ветки
+        # 2. Новый: список объектов { text, type: "branch"|"url", url? }
         text = _render_template(cfg.get("text", "Выберите:"), variables)
-        button_labels = cfg.get("buttons", [])
-        if not button_labels:
-            pass  # нет кнопок — идём дальше как обычно
+        raw_buttons = cfg.get("buttons", [])
+        if not raw_buttons:
+            pass  # нет кнопок — идём дальше
         else:
             from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(
-                    text=label,
-                    callback_data=f"scen_btn:{session.id}:{i}:{label[:60]}"
-                )]
-                for i, label in enumerate(button_labels)
-            ])
+            rows = []
+            has_branch = False
+            for i, btn in enumerate(raw_buttons):
+                if isinstance(btn, str):
+                    # старый формат — ветка
+                    rows.append([InlineKeyboardButton(
+                        text=btn,
+                        callback_data=f"scen_btn:{session.id}:{i}:{btn[:60]}"
+                    )])
+                    has_branch = True
+                elif btn.get("type") == "url":
+                    url = _render_template(btn.get("url", ""), variables)
+                    rows.append([InlineKeyboardButton(text=btn.get("text",""), url=url)])
+                else:
+                    # branch
+                    label = btn.get("text", "")
+                    rows.append([InlineKeyboardButton(
+                        text=label,
+                        callback_data=f"scen_btn:{session.id}:{i}:{label[:60]}"
+                    )])
+                    has_branch = True
+            keyboard = InlineKeyboardMarkup(inline_keyboard=rows)
             try:
                 await bot.send_message(session.user_id, text, reply_markup=keyboard, parse_mode="HTML")
             except Exception as e:
                 log.warning("scenario_runner buttons send: %s", e)
-            # Встаём в ожидание нажатия кнопки
-            async with Session() as s:
-                sess2 = await s.get(ScenarioSession, session.id)
-                if not sess2:
-                    return
-                sess2.waiting_input = True
-                sess2.input_variable = "_btn_choice"
-                sess2.last_step_at = datetime.utcnow()
-                await s.commit()
-            return  # ждём callback
+            if has_branch:
+                # Встаём в ожидание нажатия кнопки-ветки
+                async with Session() as s:
+                    sess2 = await s.get(ScenarioSession, session.id)
+                    if not sess2:
+                        return
+                    sess2.waiting_input = True
+                    sess2.input_variable = "_btn_choice"
+                    sess2.last_step_at = datetime.utcnow()
+                    await s.commit()
+                return  # ждём callback
+            # Все кнопки — ссылки, продолжаем без ожидания
 
     elif ntype == "http":
         result = await _execute_http(cfg, variables)
@@ -544,6 +567,80 @@ async def _advance(session: ScenarioSession, bot: Bot,
                 await bot.send_message(int(target_chat), report_text, parse_mode="HTML")
         except Exception as e:
             log.warning("scenario_runner report node: %s", e)
+
+    elif ntype == "send_to_admin":
+        # Отправить последний ответ пользователя (или текст из переменной) в чат администраторов
+        try:
+            async with Session() as s:
+                cfg_bot = await s.get(ChildBot, session.bot_id)
+            target_chat = cfg_bot.admin_chat_id if cfg_bot else None
+            if target_chat:
+                var_name = cfg.get("variable_name", "_input")
+                value = variables.get(var_name, "")
+                label = cfg.get("label") or var_name
+                title = cfg.get("title", "")
+                title_rendered = _render_template(title, variables) if title else f"\U0001f4e8 Ответ пользователя ({label})"
+                text = f"<b>{title_rendered}</b>\n{str(value)[:2000]}"
+                await bot.send_message(int(target_chat), text, parse_mode="HTML")
+        except Exception as e:
+            log.warning("scenario_runner send_to_admin: %s", e)
+
+    elif ntype == "notify_admin":
+        # Отправить произвольное сообщение в чат администраторов
+        try:
+            async with Session() as s:
+                cfg_bot = await s.get(ChildBot, session.bot_id)
+            target_chat = cfg_bot.admin_chat_id if cfg_bot else None
+            if target_chat:
+                text = _render_template(cfg.get("text", ""), variables)
+                if text:
+                    await bot.send_message(int(target_chat), text, parse_mode="HTML")
+        except Exception as e:
+            log.warning("scenario_runner notify_admin: %s", e)
+
+    elif ntype == "open_ticket":
+        # Открыть тикет для пользователя (только если нет открытого)
+        try:
+            async with Session() as s:
+                cfg_bot = await s.get(ChildBot, session.bot_id)
+            if cfg_bot and cfg_bot.admin_chat_id:
+                # Импортируем здесь чтобы избежать циклических зависимостей
+                from child.common import open_ticket
+                subject = _render_template(cfg.get("subject", ""), variables) or None
+                await open_ticket(bot, cfg_bot, session.user_id, subject=subject)
+        except Exception as e:
+            log.warning("scenario_runner open_ticket: %s", e)
+
+    elif ntype == "jump_scenario":
+        # Запустить другой сценарий (заменяет текущую сессию)
+        target_id = cfg.get("scenario_id")
+        if target_id:
+            try:
+                target_id = int(target_id)
+                async with Session() as s:
+                    target_sc = await s.get(Scenario, target_id)
+                if target_sc and target_sc.bot_id == session.bot_id and target_sc.is_active:
+                    trigger_node = await _find_trigger_node(target_id)
+                    if trigger_node:
+                        async with Session() as s:
+                            sess2 = await s.get(ScenarioSession, session.id)
+                            if sess2:
+                                sess2.scenario_id = target_id
+                                sess2.current_node_id = trigger_node.id
+                                sess2.waiting_input = False
+                                sess2.input_variable = None
+                                sess2.last_step_at = datetime.utcnow()
+                                await s.commit()
+                        async with Session() as s:
+                            session = await s.get(ScenarioSession, session.id)
+                        if session:
+                            await _advance(session, bot, steps_left=steps_left - 1)
+                        return
+            except Exception as e:
+                log.warning("scenario_runner jump_scenario: %s", e)
+        # Если цель не найдена — завершаем
+        await _end_session(session)
+        return
 
     elif ntype == "end":
         await _end_session(session)
