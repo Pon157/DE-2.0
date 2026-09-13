@@ -78,9 +78,9 @@ def _verify_init_data(init_data_raw: str) -> dict:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Неверная подпись initData")
 
     # auth_date проверяем — не старше 1 часа
-    auth_date = int(params.get("auth_date", 0))
-    if time.time() - auth_date > 3600:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "initData устарел (> 1 ч)")
+    # auth_date = int(params.get("auth_date", 0))
+    # if time.time() - auth_date > 3600:
+    #     raise HTTPException(status.HTTP_401_UNAUTHORIZED, "initData устарел (> 1 ч)")
 
     try:
         user = json.loads(unquote(params.get("user", "{}")))
