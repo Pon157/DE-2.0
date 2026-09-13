@@ -400,11 +400,18 @@ function NodeSummary({ type, config }) {
     </span>
   );
   if (type === "report") return (
-    <span style={{ color: "#67e8f9", fontSize: 12 }}>
-      {config.variables?.length
-        ? `${config.variables.length} перем. → чат администраторов`
-        : <em style={{ color: C.textDim }}>Настройте переменные</em>}
-    </span>
+    <div style={{ fontSize: 12 }}>
+      {config.title && (
+        <div style={{ color: C.textMid, marginBottom: 2 }}>
+          {truncate(config.title.replace(/<[^>]+>/g, ""), 32)}
+        </div>
+      )}
+      <span style={{ color: "#67e8f9" }}>
+        {config.variables?.length
+          ? `${config.variables.length} перем. → чат администраторов`
+          : <em style={{ color: C.textDim }}>Настройте переменные</em>}
+      </span>
+    </div>
   );
   if (type === "send_to_admin") return (
     <span style={{ color: "#4ade80", fontSize: 12 }}>
@@ -415,7 +422,9 @@ function NodeSummary({ type, config }) {
   );
   if (type === "notify_admin") return (
     <span style={{ color: "#2dd4bf", fontSize: 12 }}>
-      {config.text ? truncate(config.text, 28) : <em style={{ color: C.textDim }}>Введите текст</em>}
+      {config.text
+        ? truncate(config.text.replace(/<[^>]+>/g, ""), 28)
+        : <em style={{ color: C.textDim }}>Введите текст</em>}
     </span>
   );
   if (type === "open_ticket") return (
@@ -664,13 +673,16 @@ function ConfigPanel({ node, onChange, onClose, onDelete, isMobile, allNodes }) 
   const { nodeType: type, config = {}, label } = node.data;
   const meta = NODE_TYPES_META[type] || {};
 
-  // Собираем переменные из всех узлов типа "input" в сценарии
-  const allVars = useMemo(() =>
-    (allNodes || [])
-      .filter(n => n.data?.nodeType === "input" && n.data?.config?.variable_name)
-      .map(n => n.data.config.variable_name),
-    [allNodes]
-  );
+  // Собираем переменные из узлов типа "input" и "set_variable" в сценарии
+  const allVars = useMemo(() => {
+    const vars = new Set();
+    for (const n of (allNodes || [])) {
+      const t = n.data?.nodeType;
+      const v = n.data?.config?.variable_name;
+      if ((t === "input" || t === "set_variable") && v) vars.add(v);
+    }
+    return [...vars];
+  }, [allNodes]);
 
   // Список сценариев для jump_scenario
   const [scenarios, setScenarios] = useState([]);
@@ -870,11 +882,22 @@ function ConfigPanel({ node, onChange, onClose, onDelete, isMobile, allNodes }) 
 
       {/* ── ОТЧЁТ ── */}
       {type === "report" && (<>
-        <FieldBlock label="Переменные для отправки" hint="Будут отправлены в чат администраторов.">
-          <VariablePicker
-            allVars={allVars}
-            selectedVars={config.variables || []}
-            onChange={v => set("variables", v)} />
+        <FieldBlock label="Заголовок отчёта (необязательно)" hint="Поддерживает {{переменные}}.">
+          <input style={inputStyle} value={config.title || ""}
+            onChange={e => set("title", e.target.value)}
+            placeholder="📋 Отчёт по сценарию" />
+        </FieldBlock>
+        <FieldBlock label="Переменные для отправки" hint="Отмеченные переменные будут отправлены в чат администраторов.">
+          {allVars.length === 0 ? (
+            <div style={{ color: C.textDim, fontSize: 12, lineHeight: 1.5 }}>
+              Добавьте узлы «Ввод» или «Задать перем.» чтобы появились переменные для выбора.
+            </div>
+          ) : (
+            <VariablePicker
+              allVars={allVars}
+              selectedVars={config.variables || []}
+              onChange={v => set("variables", v)} />
+          )}
         </FieldBlock>
       </>)}
 
@@ -893,9 +916,9 @@ function ConfigPanel({ node, onChange, onClose, onDelete, isMobile, allNodes }) 
               placeholder="имя_переменной" />
           )}
         </FieldBlock>
-        <FieldBlock label="Заголовок сообщения (необязательно)">
-          <input style={inputStyle} value={config.title || ""}
-            onChange={e => set("title", e.target.value)}
+        <FieldBlock label="Заголовок сообщения (необязательно)" hint="ПКМ — форматирование. Поддерживает {{переменные}}.">
+          <RichTextArea style={{ ...taStyle, minHeight: 50 }} value={config.title || ""}
+            onChange={v => set("title", v)}
             placeholder="Ответ пользователя:" />
         </FieldBlock>
       </>)}
