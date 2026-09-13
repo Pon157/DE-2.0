@@ -606,11 +606,25 @@ async def _advance(session: ScenarioSession, bot: Bot,
         try:
             async with Session() as s:
                 cfg_bot = await s.get(ChildBot, session.bot_id)
-            if cfg_bot and cfg_bot.admin_chat_id:
+            if cfg_bot:
+                # ФИКС: раньше стояло условие `cfg_bot.admin_chat_id` —
+                # если чат ещё не назначен, узел тихо пропускался и тикет
+                # не открывался. open_ticket() сам обрабатывает отсутствие
+                # admin_chat_id (создаёт тикет без топика), поэтому проверять
+                # здесь не нужно.
                 # Импортируем здесь чтобы избежать циклических зависимостей
                 from child.common import open_ticket
                 subject = _render_template(cfg.get("subject", ""), variables) or None
-                await open_ticket(bot, cfg_bot, session.user_id, subject=subject)
+                ticket, created, conflict = await open_ticket(
+                    bot, cfg_bot, session.user_id, subject=subject)
+                if conflict:
+                    log.debug(
+                        "scenario open_ticket: у user=%s уже открыт тикет по другой теме",
+                        session.user_id)
+                elif not created:
+                    log.debug(
+                        "scenario open_ticket: тикет уже открыт для user=%s, переиспользуем",
+                        session.user_id)
         except Exception as e:
             log.warning("scenario_runner open_ticket: %s", e)
 
