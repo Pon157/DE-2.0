@@ -1528,7 +1528,11 @@ def build_common_router() -> Router:
         if cfg.bot_type == BotType.survey and not cfg.survey_dialog_enabled:
             return
         if m.text and m.text.startswith("/"):
-            return  # команды модерации обработаны выше; неизвестные — игнорим
+            # ФИКС: раньше стоял return — aiogram останавливал обработку на этом
+            # хендлере и следующие хендлеры (cmd_del, cmd_close и т.п.) никогда
+            # не получали управление, т.к. admin_reply зарегистрирован раньше них
+            # без фильтра на команды. raise SkipHandler передаёт апдейт дальше.
+            raise SkipHandler
         target_uid = None
         reply_params = None
         if cfg.use_topics and m.message_thread_id:
