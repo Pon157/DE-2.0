@@ -1,3 +1,4 @@
+--- START OF FILE: child\feedback.py ---
 from aiogram import Router, F, Bot
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
@@ -32,6 +33,15 @@ def build_feedback_router() -> Router:
             await s.commit()
         if await mod.is_banned(bot_db_id, m.from_user.id):
             return
+
+        # ИСПРАВЛЕНИЕ: запускаем сценарий с trigger_type=start если он есть.
+        # Сценарий полностью заменяет стандартное приветствие — это позволяет
+        # владельцу настроить онбординг через редактор сценариев.
+        start_scenario = await find_matching_scenario(bot_db_id, None, on_start=True)
+        if start_scenario:
+            await trigger_scenario(bot_db_id, m.from_user.id, start_scenario.id, bot)
+            return
+
         ikb, rkb = await build_keyboards(bot_db_id, cfg)
         welcome = await inject_extras(bot_db_id, cfg.welcome_text)
         await send_with_keyboards(m, welcome, ikb, rkb, photo=cfg.welcome_photo,
@@ -136,3 +146,5 @@ def build_feedback_router() -> Router:
         await buffer_or_process(m, _process)
 
     return r
+
+--- END OF FILE: child\feedback.py ---
