@@ -116,7 +116,14 @@ async def _require_pro_owner(bot_id: int, user: dict = Depends(_get_verified_use
 # Pydantic-схемы
 # =========================================================================
 
-_ALLOWED_NODE_TYPES = {"trigger", "message", "input", "condition", "delay", "set_variable", "random_branch", "buttons", "report", "end"}
+_ALLOWED_NODE_TYPES = {
+    "trigger", "message", "input", "condition", "delay",
+    "set_variable", "random_branch", "buttons", "report", "end",
+    # admin nodes
+    "send_to_admin", "notify_admin", "open_ticket", "jump_scenario",
+    # http
+    "http",
+}
 # FIX: используем реальные значения enum из модели
 _ALLOWED_TRIGGERS = {t.value for t in ScenarioTrigger}
 
@@ -229,6 +236,31 @@ async def list_scenarios(bot_id: int,
     return [{"id": sc.id, "name": sc.name, "trigger_type": sc.trigger_type,
              "trigger_value": sc.trigger_value, "is_active": sc.is_active}
             for sc in items]
+
+
+@app.get("/scenarios_list")
+async def scenarios_list_for_jump(
+    x_bot_id: str = Header(..., alias="X-Bot-Id"),
+    user: dict = Depends(_get_verified_user),
+):
+    """Список сценариев для узла jump_scenario.
+    Фронт передаёт X-Bot-Id в заголовке (не в URL).
+    Возвращает только id+name — достаточно для выпадающего списка.
+    """
+    try:
+        bot_id = int(x_bot_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Некорректный X-Bot-Id")
+    async with Session() as s:
+        cfg = await s.get(ChildBot, bot_id)
+    if not cfg or cfg.owner_id != user["id"]:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Нет доступа к этому боту")
+    async with Session() as s:
+        items = list((await s.scalars(select(Scenario).where(
+            Scenario.bot_id == bot_id,
+            Scenario.is_active.is_(True),
+        ).order_by(Scenario.id))).all())
+    return [{"id": sc.id, "name": sc.name} for sc in items]
 
 
 @app.get("/bots/{bot_id}/scenarios/{scenario_id}")
