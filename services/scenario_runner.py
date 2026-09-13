@@ -483,8 +483,11 @@ async def _advance(session: ScenarioSession, bot: Bot,
         else:
             from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text=label, callback_data=f"scen_btn:{session.id}:{label}")]
-                for label in button_labels
+                [InlineKeyboardButton(
+                    text=label,
+                    callback_data=f"scen_btn:{session.id}:{i}:{label[:60]}"
+                )]
+                for i, label in enumerate(button_labels)
             ])
             try:
                 await bot.send_message(session.user_id, text, reply_markup=keyboard, parse_mode="HTML")
@@ -518,6 +521,29 @@ async def _advance(session: ScenarioSession, bot: Bot,
             session = await s.get(ScenarioSession, session.id)
         if not session:
             return
+
+    elif ntype == "report":
+        # Отправить отчёт с переменными в чат администраторов
+        try:
+            target_chat = cfg.get("admin_chat_id") or None
+            if not target_chat:
+                async with Session() as s:
+                    cfg_bot = await s.get(ChildBot, session.bot_id)
+                    if cfg_bot:
+                        target_chat = cfg_bot.admin_chat_id
+            if target_chat:
+                var_names = [v.strip() for v in cfg.get("variables", []) if str(v).strip()]
+                title = cfg.get("title", "📋 Отчёт по сценарию")
+                lines = [f"<b>{_render_template(title, variables)}</b>"]
+                for vname in var_names:
+                    val = variables.get(vname, "<не задана>")
+                    lines.append(f"• <b>{vname}</b>: {str(val)[:512]}")
+                if not var_names:
+                    lines.append("<i>Переменные не выбраны</i>")
+                report_text = "\n".join(lines)[:4096]
+                await bot.send_message(int(target_chat), report_text, parse_mode="HTML")
+        except Exception as e:
+            log.warning("scenario_runner report node: %s", e)
 
     elif ntype == "end":
         await _end_session(session)
@@ -640,6 +666,62 @@ async def trigger_scenario(bot_db_id: int, user_id: int,
         await _advance(sess, bot)
     except Exception:
         log.exception("trigger_scenario: необработанная ошибка session=%s", sess.id)
+    return True
+
+
+async def handle_scen_btn_callback(session_id: int, btn_index: int,
+                                   btn_label: str, bot: Bot,
+                                   bot_db_id: int) -> bool:
+    """Обрабатывает нажатие инлайн-кнопки из узла типа 'buttons'.
+    Вызывается из callback-хендлера scen_btn: в child/common.py.
+    Возвращает True если callback был поглощён сценарием.
+    """
+    async with Session() as s:
+        session = await s.get(ScenarioSession, session_id)
+    if not session or session.bot_id != bot_db_id:
+        return False
+    if not session.waiting_input or session.input_variable != "_btn_choice":
+        return False
+
+    node = await _get_node(session.current_node_id)
+    if not node or node.node_type != "buttons":
+        return False
+
+    variables = json.loads(session.variables_json or "{}")
+    if len(variables) < _MAX_VARIABLES:
+        variables["_btn_choice"] = btn_label
+
+    # Маршрутизируем по ребру с label = f"btn_{btn_index}"
+    edges = await _next_edges(node.id, session.scenario_id)
+    target_edge = None
+    for edge in edges:
+        if edge.label == f"btn_{btn_index}":
+            target_edge = edge
+            break
+    if target_edge is None and edges:
+        target_edge = edges[0]  # fallback — первое ребро
+
+    if not target_edge:
+        await _end_session(session)
+        return True
+
+    async with Session() as s:
+        sess2 = await s.get(ScenarioSession, session.id)
+        if not sess2:
+            return True
+        sess2.variables_json = json.dumps(variables, ensure_ascii=False)
+        sess2.waiting_input = False
+        sess2.input_variable = None
+        sess2.current_node_id = target_edge.to_node_id
+        sess2.last_step_at = datetime.utcnow()
+        await s.commit()
+    async with Session() as s:
+        session = await s.get(ScenarioSession, session.id)
+    if session:
+        try:
+            await _advance(session, bot)
+        except Exception:
+            log.exception("handle_scen_btn_callback: ошибка session=%s", session.id)
     return True
 
 
