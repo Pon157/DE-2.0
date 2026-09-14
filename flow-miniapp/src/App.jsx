@@ -130,11 +130,6 @@ const Icons = {
       <path d="M11 12h2M12 11v2" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/>
     </svg>
   ),
-  plus: () => (
-    <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
-      <path d="M7 2v10M2 7h10" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/>
-    </svg>
-  ),
   send_to_admin: () => (
     <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
       <path d="M2 2h12a1 1 0 011 1v8a1 1 0 01-1 1H5l-3 2V3a1 1 0 011-1z" stroke="currentColor" strokeWidth="1.4" fill="none"/>
@@ -191,11 +186,6 @@ const NODE_TYPES_META = {
   buttons:      { label: "Кнопки",         color: "#a855f7", Icon: Icons.buttons,      hint: "Отправляет сообщение с инлайн-кнопками. Пользователь выбирает ветку." },
   report:       { label: "Отчёт",          color: "#0891b2", Icon: Icons.report,      hint: "Отправляет отчёт с переменными в чат администраторов." },
   end:          { label: "Конец",          color: "#374151", Icon: Icons.end,          hint: "Завершает сценарий." },
-  plus: () => (
-    <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
-      <path d="M7 2v10M2 7h10" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/>
-    </svg>
-  ),
   send_to_admin:{ label: "Ввод → Админ",   color: "#16a34a", Icon: Icons.send_to_admin, hint: "Отправляет значение переменной (ответ пользователя) в чат администраторов." },
   notify_admin: { label: "Уведомить адм.", color: "#0d9488", Icon: Icons.notify_admin,  hint: "Отправляет произвольное сообщение в чат администраторов." },
   open_ticket:  { label: "Открыть тикет", color: "#ca8a04", Icon: Icons.open_ticket,   hint: "Открывает обращение пользователя в чате администраторов (в конце сценария)." },
@@ -1644,4 +1634,4 @@ function btnStyle(bg, color = "#cde8d8", disabled = false) {
     opacity: disabled ? 0.6 : 1,
     whiteSpace: "nowrap",
   };
-}
+                          }
