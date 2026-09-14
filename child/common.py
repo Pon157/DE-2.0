@@ -92,7 +92,11 @@ async def is_bot_admin(bot_db_id: int, user_id: int, bot: Bot | None = None) -> 
     if bot is not None and admin_chat_id:
         try:
             member = await bot.get_chat_member(admin_chat_id, user_id)
-            return member.status in ("administrator", "creator", "member")
+            # БАГ: раньше "member" тоже считался админом — из-за этого
+            # любой участник группы admin_chat_id проходил как администратор
+            # и, например, автомут за маты его не трогал. Только
+            # administrator и creator имеют реальные права в чате.
+            return member.status in ("administrator", "creator")
         except Exception:
             return False
     return False
@@ -1554,11 +1558,29 @@ def build_common_router() -> Router:
                     MsgMap.admin_chat_msg_id == m.reply_to_message.message_id
                 ).order_by(MsgMap.id.desc()))
             if mp:
-                target_uid = target_uid or mp.user_id
-                # reply-контекст в обратную сторону: юзер видит, на какое его
-                # сообщение ответил админ.
-                if mp.user_chat_msg_id and mp.user_id == target_uid:
-                    reply_params = ReplyParameters(message_id=mp.user_chat_msg_id)
+                # БАГ (по запросу): сообщения-шапки (хедеры), которые бот
+                # отправляет в админ-чат сам, тоже попадают в MsgMap, но с
+                # user_chat_msg_id=None (у них нет «оригинала» у юзера).
+                # Раньше ответ на такую шапку всё равно приводил к тому, что
+                # target_uid устанавливался и сообщение улетало пользователю,
+                # хотя админ явно отвечал на системное сообщение бота, а не
+                # на реплику пользователя.
+                # Теперь: если mp.user_chat_msg_id is None — это шапка или
+                # служебная запись; target_uid по ней НЕ ставим (оставляем
+                # None) чтобы сообщение НЕ доставлялось пользователю.
+                # Исключение: топик-режим, когда target_uid уже установлен
+                # через message_thread_id — тогда reply_params всё равно не
+                # добавляем (нет user_chat_msg_id), но deliver разрешаем.
+                if mp.user_chat_msg_id is not None:
+                    target_uid = target_uid or mp.user_id
+                    # reply-контекст в обратную сторону: юзер видит, на какое
+                    # его сообщение ответил админ.
+                    if mp.user_id == target_uid:
+                        reply_params = ReplyParameters(message_id=mp.user_chat_msg_id)
+                elif not target_uid:
+                    # шапка без user_chat_msg_id, топик тоже не дал uid —
+                    # ничего пользователю не отправляем
+                    pass  # target_uid остаётся None → return ниже
         if not target_uid:
             return
         try:
@@ -1827,3 +1849,4 @@ def build_common_router() -> Router:
         await m.answer(text)
 
     return r
+
