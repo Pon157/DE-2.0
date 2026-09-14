@@ -42,6 +42,13 @@ def build_feedback_router() -> Router:
             return
 
         ikb, rkb = await build_keyboards(bot_db_id, cfg)
+        # Стартовый стикер — отправляется ДО текстового приветствия, если задан
+        ws = getattr(cfg, "welcome_sticker", None)
+        if ws:
+            try:
+                await bot.send_sticker(m.chat.id, ws)
+            except Exception:
+                pass  # стикер мог устареть — игнорируем, текст всё равно отправим
         welcome = await inject_extras(bot_db_id, cfg.welcome_text)
         await send_with_keyboards(m, welcome, ikb, rkb, photo=cfg.welcome_photo,
                                    **await welcome_pro_kwargs(cfg))
@@ -87,12 +94,30 @@ def build_feedback_router() -> Router:
         cfg = await _cfg(bot_db_id)
         if await mod.is_banned(bot_db_id, m.from_user.id):
             return
+        # Проверка мута (автомут за маты или ручной /mute)
+        if await mod.is_muted(bot_db_id, m.from_user.id):
+            await m.answer("🔇 Вы временно не можете отправлять сообщения.")
+            return
         async with Session() as s:
             u = await mod.get_or_create_user(s, bot_db_id, m.from_user)
             s.add(MessageLog(bot_id=bot_db_id, user_id=m.from_user.id, direction="in"))
             # Инкремент для автоответов every_n / first_message
             u.incoming_msg_count = (u.incoming_msg_count or 0) + 1
             await s.commit()
+        # Автомут за маты: если режим включён — проверяем текст сообщения.
+        # Администраторов не мутим (is_bot_admin).
+        if (getattr(cfg, "profanity_mute_enabled", False)
+                and m.text
+                and not await is_bot_admin(bot_db_id, m.from_user.id, bot)):
+            extra = getattr(cfg, "profanity_extra_words", None)
+            if mod.has_profanity(m.text, extra):
+                dur = getattr(cfg, "profanity_mute_duration", "1h") or "1h"
+                await mod.mute_user(bot_db_id, m.from_user.id, dur)
+                await m.answer(
+                    f"🔇 Ваше сообщение содержало нецензурную лексику. "
+                    f"Вы замьючены на {dur}."
+                )
+                return
         # Антиспам (rate-limit/капча/прогрессирующий тайм-аут) — обычных
         # админов не трогает, владельца — в зависимости от тоггла
         # cfg.antispam_ignore_owner (см. child/common.py::should_apply_antispam).
