@@ -437,3 +437,27 @@ async def reupload_media_for_bot(source_bot: Bot, bot_id: int, file_id: str,
         log.warning("reupload_media_for_bot: не удалось перенести file_id (%s) для бота %s: %s",
                     media_type, bot_id, e)
         return None
+
+
+async def reupload_sticker_for_bot(source_bot: Bot, bot_id: int, file_id: str,
+                                   target_chat_id: int) -> str | None:
+    """Перезаливает стикер через дочернего бота, чтобы получить валидный для него file_id.
+    Аналог reupload_photo_for_bot, но для стикеров (send_sticker)."""
+    child_bot = manager.bots.get(bot_id)
+    if not child_bot:
+        return None
+    try:
+        from aiogram.types import BufferedInputFile
+        tg_file = await source_bot.get_file(file_id)
+        buf = await source_bot.download_file(tg_file.file_path)
+        input_file = BufferedInputFile(buf.read(), filename="sticker.webp")
+        sent = await child_bot.send_sticker(target_chat_id, input_file)
+        try:
+            await child_bot.delete_message(target_chat_id, sent.message_id)
+        except Exception:
+            pass
+        return sent.sticker.file_id
+    except Exception as e:
+        log.warning("reupload_sticker_for_bot: не удалось перенести стикер для бота %s: %s",
+                    bot_id, e)
+        return None
