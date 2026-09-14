@@ -12,8 +12,7 @@ from db.models import (ChildBot, BotAdmin, BotButton, BotType, OpenMode, Forward
                        Advertisement, AdKind, AdStatus, PlatformUser, BotUser,
                        Survey, SurveyQuestion, Donation, AutoReply, AutoReplyKind)
 from services.bot_manager import (manager, reupload_photo_for_bot as manager_reupload,
-                                  reupload_media_for_bot as manager_reupload_media,
-                                  reupload_sticker_for_bot as manager_reupload_sticker)
+                                  reupload_media_for_bot as manager_reupload_media)
 from services.broadcast import run_broadcast
 from services.stats_image import build_stats_image
 from services import ads as ads_service
@@ -796,6 +795,7 @@ CYCLES = {
     "cyc_antispam": ("antispam_enabled", [True, False]),
     "cyc_aspown": ("antispam_ignore_owner", [True, False]),
     "cyc_surveydialog": ("survey_dialog_enabled", [False, True]),
+    "cyc_profmute": ("profanity_mute_enabled", [False, True]),
 }
 
 
@@ -913,16 +913,12 @@ async def welcome_sticker_save(m: Message, state: FSMContext):
     async with Session() as s:
         obj = await s.get(ChildBot, bot_id)
         if m.sticker:
-            # Стикер нужно перезалить через дочернего бота, как и фото приветствия
-            sticker_id = await manager_reupload_sticker(m.bot, bot_id, m.sticker.file_id, m.from_user.id)
-            if sticker_id is None:
-                await m.answer(
-                    f"{em('warn')} Не удалось прикрепить стикер (напишите что-нибудь "
-                    "дочернему боту и попробуйте снова)."
-                )
-                await state.clear()
-                return
-            obj.welcome_sticker = sticker_id
+            # Сохраняем file_id стикера напрямую — без перезалива.
+            # Перезалив (скачать + загрузить заново через BufferedInputFile) ломает
+            # анимированные (TGS) и видео-стикеры (WebM): Telegram перекодирует их
+            # в статичный WebP, теряя анимацию. file_id стикера в Telegram глобален
+            # и действителен для любого бота, поэтому перезалив не нужен.
+            obj.welcome_sticker = m.sticker.file_id
             await s.commit()
         elif m.text and m.text.strip().lower() in ("удалить", "убрать", "delete", "remove", "-"):
             obj.welcome_sticker = None
@@ -934,21 +930,6 @@ async def welcome_sticker_save(m: Message, state: FSMContext):
     await m.answer(f"{em('check')} Стартовый стикер сохранён!", reply_markup=nav_kb(bot_id))
 
 
-@router.callback_query(F.data.startswith("cyc_profmute:"))
-async def cyc_profmute(c: CallbackQuery):
-    """Переключатель автомута за маты (вкл/выкл)."""
-    bot_id = int(c.data.split(":")[1])
-    cb, is_owner = await _access(bot_id, c.from_user.id)
-    if not cb or not is_owner:
-        await c.answer("Только владелец", show_alert=True); return
-    async with Session() as s:
-        obj = await s.get(ChildBot, bot_id)
-        obj.profanity_mute_enabled = not getattr(obj, "profanity_mute_enabled", False)
-        await s.commit()
-    await c.answer(
-        f"Автомут за маты: {'включён' if obj.profanity_mute_enabled else 'выключен'}"
-    )
-    await show_bot_settings(c, bot_id)
 
 
 @router.callback_query(F.data.startswith("profmutedur:"))
