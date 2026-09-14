@@ -12,7 +12,8 @@ from db.models import (ChildBot, BotAdmin, BotButton, BotType, OpenMode, Forward
                        Advertisement, AdKind, AdStatus, PlatformUser, BotUser,
                        Survey, SurveyQuestion, Donation, AutoReply, AutoReplyKind)
 from services.bot_manager import (manager, reupload_photo_for_bot as manager_reupload,
-                                  reupload_media_for_bot as manager_reupload_media)
+                                  reupload_media_for_bot as manager_reupload_media,
+                                  reupload_sticker_for_bot as manager_reupload_sticker)
 from services.broadcast import run_broadcast
 from services.stats_image import build_stats_image
 from services import ads as ads_service
@@ -179,6 +180,9 @@ class St(StatesGroup):
     set_template = State()
     set_topic_name = State()
     set_welcome_effect = State()
+    set_welcome_sticker = State()
+    set_profanity_words = State()
+    set_profanity_duration = State()
     add_admin = State()
     btn_kind = State()
     btn_text = State()
@@ -682,7 +686,8 @@ async def cfg_menu(c: CallbackQuery):
               f"cyc_pinfirst:{bot_id}")],
             [("👋 Приветствие", f"welcome:{bot_id}"),
              ("🏷 Шаблон шапки", f"header:{bot_id}")],
-            [("🎆 Эффект приветствия", f"welcomefx:{bot_id}")],
+            [("🎆 Эффект приветствия", f"welcomefx:{bot_id}"),
+             ("🎭 Стартовый стикер", f"welcomesticker:{bot_id}")],
             [(f"🏷 Шапка: {header_label}", f"cyc_header:{bot_id}")],
             [("🏠 Чат админов", f"admchat:{bot_id}"),
              (f"⚠️ Лимит варнов: {cb.warn_limit}", f"warnlim:{bot_id}")],
@@ -698,6 +703,11 @@ async def cfg_menu(c: CallbackQuery):
              ("🛡 Пороги", f"antispamcfg:{bot_id}")],
             [(f"🛡 Антиспам трогает владельца: {'нет' if cb.antispam_ignore_owner else 'да'}",
               f"cyc_aspown:{bot_id}")],
+            [(f"🔇 Автомут за маты: {'вкл' if getattr(cb, 'profanity_mute_enabled', False) else 'выкл'}",
+              f"cyc_profmute:{bot_id}"),
+             (f"⏱ Время мута: {getattr(cb, 'profanity_mute_duration', '1h') or '1h'}",
+              f"profmutedur:{bot_id}")],
+            [("📝 Доп. слова для мута", f"profmutewords:{bot_id}")],
             [("🔒 Текст закрытия обращения", f"closenotify:{bot_id}")],
             [(f"👍 Реакция на ответ админа: {cb.admin_reply_reaction or 'выкл'}",
               f"adminreaction:{bot_id}")],
@@ -706,7 +716,8 @@ async def cfg_menu(c: CallbackQuery):
     elif cb.bot_type == BotType.survey:
         rows = [
             [("👋 Приветствие", f"welcome:{bot_id}"),
-             ("🎆 Эффект приветствия", f"welcomefx:{bot_id}")],
+             ("🎆 Эффект приветствия", f"welcomefx:{bot_id}"),
+             ("🎭 Стартовый стикер", f"welcomesticker:{bot_id}")],
             [("📋 Анкеты (вопросы)", f"surveys:{bot_id}")],
             [("✅ Текст после заполнения анкеты", f"surveyfinish:{bot_id}")],
             [("🏠 Чат админов (куда приходят заполненные анкеты)", f"admchat:{bot_id}")],
@@ -730,7 +741,8 @@ async def cfg_menu(c: CallbackQuery):
             [("📮 Предложка: " + ("вкл" if cb.accept_suggestions else "выкл"),
               f"cyc_sugg:{bot_id}")],
             [("👋 Приветствие", f"welcome:{bot_id}"),
-             ("🎆 Эффект приветствия", f"welcomefx:{bot_id}")],
+             ("🎆 Эффект приветствия", f"welcomefx:{bot_id}"),
+             ("🎭 Стартовый стикер", f"welcomesticker:{bot_id}")],
             [("🎨 Шаблон поста", f"template:{bot_id}"), ("🔘 Кнопки шаблона", f"tplbtn:{bot_id}")],
             [("📡 Канал", f"channel:{bot_id}"), ("🏠 Чат админов", f"admchat:{bot_id}")],
             [(f"📨 Пересылка предложки в чат админов: {cb.forward_mode.value}", f"cyc_fwd:{bot_id}")],
@@ -873,6 +885,144 @@ TOPIC_COLORS = [
     ("🔴 Красный",  0xFB6F5F),
     ("🟠 Оранжевый", 0xFFB347),
 ]
+
+
+@router.callback_query(F.data.startswith("welcomesticker:"))
+async def welcomesticker(c: CallbackQuery, state: FSMContext):
+    """Настройка стартового стикера — владелец присылает стикер, бот его сохраняет."""
+    bot_id = int(c.data.split(":")[1])
+    cb, is_owner = await _access(bot_id, c.from_user.id)
+    if not cb or not is_owner:
+        await c.answer("Только владелец", show_alert=True); return
+    await state.set_state(St.set_welcome_sticker)
+    await state.update_data(bot_id=bot_id, last_msg_id=c.message.message_id)
+    current = getattr(cb, "welcome_sticker", None)
+    hint = " (сейчас задан)" if current else " (не задан)"
+    await c.message.edit_text(
+        f"{em('pencil')} Пришлите стикер{hint}, который бот будет отправлять при /start.\n"
+        "Чтобы <b>убрать</b> стикер — отправьте текст <code>удалить</code>."
+    )
+    await c.answer()
+
+
+@router.message(St.set_welcome_sticker)
+async def welcome_sticker_save(m: Message, state: FSMContext):
+    data = await state.get_data()
+    await delete_previous(m, state)
+    bot_id = data["bot_id"]
+    async with Session() as s:
+        obj = await s.get(ChildBot, bot_id)
+        if m.sticker:
+            # Стикер нужно перезалить через дочернего бота, как и фото приветствия
+            sticker_id = await manager_reupload_sticker(m.bot, bot_id, m.sticker.file_id, m.from_user.id)
+            if sticker_id is None:
+                await m.answer(
+                    f"{em('warn')} Не удалось прикрепить стикер (напишите что-нибудь "
+                    "дочернему боту и попробуйте снова)."
+                )
+                await state.clear()
+                return
+            obj.welcome_sticker = sticker_id
+            await s.commit()
+        elif m.text and m.text.strip().lower() in ("удалить", "убрать", "delete", "remove", "-"):
+            obj.welcome_sticker = None
+            await s.commit()
+        else:
+            await m.answer(f"{em('warn')} Пришлите стикер или напишите «удалить».")
+            return
+    await state.clear()
+    await m.answer(f"{em('check')} Стартовый стикер сохранён!", reply_markup=nav_kb(bot_id))
+
+
+@router.callback_query(F.data.startswith("cyc_profmute:"))
+async def cyc_profmute(c: CallbackQuery):
+    """Переключатель автомута за маты (вкл/выкл)."""
+    bot_id = int(c.data.split(":")[1])
+    cb, is_owner = await _access(bot_id, c.from_user.id)
+    if not cb or not is_owner:
+        await c.answer("Только владелец", show_alert=True); return
+    async with Session() as s:
+        obj = await s.get(ChildBot, bot_id)
+        obj.profanity_mute_enabled = not getattr(obj, "profanity_mute_enabled", False)
+        await s.commit()
+    await c.answer(
+        f"Автомут за маты: {'включён' if obj.profanity_mute_enabled else 'выключен'}"
+    )
+    await show_bot_settings(c, bot_id)
+
+
+@router.callback_query(F.data.startswith("profmutedur:"))
+async def profmutedur(c: CallbackQuery, state: FSMContext):
+    """Установить длительность автомута за маты."""
+    bot_id = int(c.data.split(":")[1])
+    cb, is_owner = await _access(bot_id, c.from_user.id)
+    if not cb or not is_owner:
+        await c.answer("Только владелец", show_alert=True); return
+    await state.set_state(St.set_profanity_duration)
+    await state.update_data(bot_id=bot_id, last_msg_id=c.message.message_id)
+    cur = getattr(cb, "profanity_mute_duration", "1h") or "1h"
+    await c.message.edit_text(
+        f"{em('pencil')} Введите время мута за маты (сейчас: <code>{cur}</code>).\n"
+        "Форматы: <code>30m</code> — 30 минут, <code>2h</code> — 2 часа, "
+        "<code>7d</code> — 7 дней, <code>perm</code> — навсегда."
+    )
+    await c.answer()
+
+
+@router.message(St.set_profanity_duration)
+async def profmutedur_save(m: Message, state: FSMContext):
+    from services.moderation import DURATION_RE
+    data = await state.get_data()
+    await delete_previous(m, state)
+    bot_id = data["bot_id"]
+    val = (m.text or "").strip()
+    if not DURATION_RE.match(val):
+        await m.answer(
+            f"{em('warn')} Неверный формат. Примеры: <code>30m</code>, <code>2h</code>, "
+            "<code>7d</code>, <code>perm</code>."
+        )
+        return
+    async with Session() as s:
+        obj = await s.get(ChildBot, bot_id)
+        obj.profanity_mute_duration = val
+        await s.commit()
+    await state.clear()
+    await m.answer(f"{em('check')} Время мута за маты: <code>{val}</code>.", reply_markup=nav_kb(bot_id))
+
+
+@router.callback_query(F.data.startswith("profmutewords:"))
+async def profmutewords(c: CallbackQuery, state: FSMContext):
+    """Задать дополнительные слова для автомута."""
+    bot_id = int(c.data.split(":")[1])
+    cb, is_owner = await _access(bot_id, c.from_user.id)
+    if not cb or not is_owner:
+        await c.answer("Только владелец", show_alert=True); return
+    await state.set_state(St.set_profanity_words)
+    await state.update_data(bot_id=bot_id, last_msg_id=c.message.message_id)
+    cur = getattr(cb, "profanity_extra_words", None) or "не заданы"
+    await c.message.edit_text(
+        f"{em('pencil')} Введите дополнительные слова для автомута (сейчас: <code>{cur}</code>).\n"
+        "Перечислите через запятую или с новой строки. Бот уже знает базовые русские маты.\n"
+        "Чтобы очистить список — отправьте <code>удалить</code>."
+    )
+    await c.answer()
+
+
+@router.message(St.set_profanity_words)
+async def profmutewords_save(m: Message, state: FSMContext):
+    data = await state.get_data()
+    await delete_previous(m, state)
+    bot_id = data["bot_id"]
+    val = (m.text or "").strip()
+    if val.lower() in ("удалить", "убрать", "delete", "remove", "-"):
+        val = None
+    async with Session() as s:
+        obj = await s.get(ChildBot, bot_id)
+        obj.profanity_extra_words = val
+        await s.commit()
+    await state.clear()
+    msg = "очищен" if val is None else f"сохранён: <code>{val}</code>"
+    await m.answer(f"{em('check')} Список доп. слов {msg}.", reply_markup=nav_kb(bot_id))
 
 
 @router.callback_query(F.data.startswith("welcomefx:"))
