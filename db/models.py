@@ -95,6 +95,7 @@ class ChildBot(Base):
         Text, default="Привет! Напишите ваше сообщение."
     )
     welcome_photo: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    welcome_sticker: Mapped[str | None] = mapped_column(String(256), nullable=True)
     welcome_effect_id: Mapped[str | None] = mapped_column(
         String(32), nullable=True
     )
@@ -205,6 +206,11 @@ class ChildBot(Base):
         Boolean, default=True
     )
 
+    # Автомут за маты в личных сообщениях
+    profanity_mute_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    profanity_mute_duration: Mapped[str] = mapped_column(String(16), default="1h")
+    profanity_extra_words: Mapped[str | None] = mapped_column(Text, nullable=True)
+
 
 class BotAdmin(Base):
     __tablename__ = "bot_admins"
@@ -284,6 +290,8 @@ class BotUser(Base):
     )
     warns: Mapped[int] = mapped_column(Integer, default=0)
     warnings: Mapped[int] = mapped_column(Integer, default=0)
+    is_muted: Mapped[bool] = mapped_column(Boolean, default=False)
+    muted_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     # Антиспам и статистика
     req_window_start: Mapped[datetime | None] = mapped_column(
