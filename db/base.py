@@ -246,6 +246,15 @@ async def init_db():
         # без них любой исполняемый сценарий падал с AttributeError.
         "ALTER TABLE scenario_sessions ADD COLUMN IF NOT EXISTS input_variable VARCHAR(128)",
         "ALTER TABLE scenario_sessions ADD COLUMN IF NOT EXISTS last_step_at TIMESTAMP",
+        # Автомут за маты в личных сообщениях
+        "ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS is_muted BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS muted_until TIMESTAMP",
+        # Стартовый стикер
+        "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS welcome_sticker VARCHAR(256)",
+        # Настройки автомута за маты
+        "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS profanity_mute_enabled BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS profanity_mute_duration VARCHAR(16) DEFAULT '1h'",
+        "ALTER TABLE child_bots ADD COLUMN IF NOT EXISTS profanity_extra_words TEXT",
     ):
         await _exec(stmt)
 
