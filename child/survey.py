@@ -311,6 +311,12 @@ def build_survey_router() -> Router:
         if await mod.is_banned(bot_db_id, m.from_user.id):
             return
         ikb, rkb = await build_keyboards(bot_db_id, cfg)
+        ws = getattr(cfg, "welcome_sticker", None)
+        if ws:
+            try:
+                await bot.send_sticker(m.chat.id, ws)
+            except Exception:
+                pass
         welcome = await inject_extras(bot_db_id, cfg.welcome_text)
         await send_with_keyboards(m, welcome, ikb, rkb, photo=cfg.welcome_photo,
                                    **await welcome_pro_kwargs(cfg))
