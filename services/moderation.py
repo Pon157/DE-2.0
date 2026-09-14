@@ -264,3 +264,97 @@ async def admin_stats_text(bot_id: int) -> str:
         lines.append(f"@{name}: {msgs} ответов, 🚫 {a.get('ban', 0)} банов, "
                     f"⚠️ {a.get('warn', 0)} варнов")
     return "\n".join(lines)
+
+
+# ─── Автомут за маты ───────────────────────────────────────────────────────
+
+# Базовый список матов (русский + транслит)
+_BASE_PROFANITY = [
+    "блядь", "бляд", "блять", "бля",
+    "пизда", "пизд", "пиздец", "пиздят", "пиздит", "пиздёж",
+    "хуй", "хуя", "хуе", "хуёв", "хуёвый", "хуев", "нахуй", "похуй", "ахуе",
+    "ёб", "еб", "ебать", "ебал", "ебло", "ёбаный", "ёбана", "ёбан",
+    "сука", "суки", "суку",
+    "мудак", "мудила", "мудила",
+    "пидор", "пидар", "пидр",
+    "залупа", "залуп",
+    "шлюха", "шлюхи",
+    "ублюдок", "ублюд",
+    "выблядок", "выблядок",
+    "долбоёб", "долбоеб",
+    "ёбнутый", "ёбнут",
+    "блядский", "блядск",
+    "пиздабол", "пиздобол",
+    # транслит
+    "blyad", "pizda", "pizdec", "khuy", "khuj", "yobat", "ebat",
+    "suka", "mudak", "pidor",
+]
+
+
+def _profanity_pattern(extra_words: str | None) -> re.Pattern:
+    """Составляет регулярку из базового списка матов + кастомных слов владельца."""
+    words = list(_BASE_PROFANITY)
+    if extra_words:
+        for w in re.split(r"[,;\n]+", extra_words):
+            w = w.strip().lower()
+            if w:
+                words.append(re.escape(w))
+    pattern = "|".join(re.escape(w) for w in words)
+    return re.compile(pattern, re.IGNORECASE)
+
+
+def has_profanity(text: str, extra_words: str | None = None) -> bool:
+    """Возвращает True если текст содержит маты."""
+    if not text:
+        return False
+    pat = _profanity_pattern(extra_words)
+    return bool(pat.search(text))
+
+
+async def mute_user(bot_id: int, user_id: int, duration: str,
+                    admin_id: int = 0, admin_username: str | None = None) -> str:
+    """Мутит пользователя на duration (например '1h', '30m', '7d', 'perm').
+    Замолчанный пользователь не может отправлять сообщения в бот,
+    но бот продолжает работать как обычно для остальных."""
+    muted_until = parse_duration(duration)
+    async with Session() as s:
+        u = await s.scalar(select(BotUser).where(
+            BotUser.bot_id == bot_id, BotUser.user_id == user_id))
+        if not u:
+            u = BotUser(bot_id=bot_id, user_id=user_id)
+            s.add(u)
+        u.is_muted = True
+        u.muted_until = muted_until
+        await s.commit()
+        until_str = muted_until.strftime("%d.%m.%Y %H:%M") if muted_until else "навсегда"
+    await _log(bot_id, admin_id, admin_username, "mute", user_id, f"Автомут за маты ({duration})")
+    return f"Пользователь <code>{user_id}</code> замьючен ({until_str})."
+
+
+async def unmute_user(bot_id: int, user_id: int,
+                      admin_id: int = 0, admin_username: str | None = None) -> str:
+    """Снимает мут с пользователя."""
+    async with Session() as s:
+        u = await s.scalar(select(BotUser).where(
+            BotUser.bot_id == bot_id, BotUser.user_id == user_id))
+        if u:
+            u.is_muted = False
+            u.muted_until = None
+            await s.commit()
+    await _log(bot_id, admin_id, admin_username, "unmute", user_id)
+    return f"Пользователь <code>{user_id}</code> размьючен."
+
+
+async def is_muted(bot_id: int, user_id: int) -> bool:
+    """Проверяет, замьючен ли пользователь. Автоматически снимает истёкший мут."""
+    async with Session() as s:
+        u = await s.scalar(select(BotUser).where(
+            BotUser.bot_id == bot_id, BotUser.user_id == user_id))
+        if not u or not u.is_muted:
+            return False
+        if u.muted_until and u.muted_until < datetime.utcnow():
+            u.is_muted = False
+            u.muted_until = None
+            await s.commit()
+            return False
+        return True
