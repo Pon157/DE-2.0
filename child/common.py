@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import html
 import logging
 import re
 import time as _time
@@ -207,9 +208,14 @@ def anon_id_for(bot_id: int, user_id: int) -> str:
 
 
 def _tpl_vars(bot_id: int, user_id: int, full_name: str | None, username: str | None) -> dict:
+    # ФИКС: ники и имена со спецсимволами HTML (<, >, &) и другими
+    # специальными символами (скобки, вертикальная черта и т.п.) ломали
+    # отправку шапки в админ-чат, поскольку Telegram парсил строку как HTML
+    # и получал невалидную разметку. Теперь name и username экранируются
+    # через html.escape() перед подстановкой в шаблон.
     return {
-        "name": full_name or str(user_id),
-        "username": username or "—",
+        "name": html.escape(full_name or str(user_id)),
+        "username": html.escape(username or "—"),
         "id": user_id,
         "anon_id": anon_id_for(bot_id, user_id),
     }
@@ -228,10 +234,10 @@ def build_header(cfg: ChildBot, user, subject: str | None = None) -> str:
     try:
         header = cfg.copy_header.format(**_tpl_vars(cfg.id, user.id, user.full_name, user.username))
     except Exception:
-        header = (f"{user.full_name} | @{user.username or '—'} | <code>{user.id}</code> "
-                 f"· {anon_id_for(cfg.id, user.id)}")
+        header = (f"{html.escape(user.full_name or '')} | @{html.escape(user.username or '—')} | "
+                  f"<code>{user.id}</code> · {anon_id_for(cfg.id, user.id)}")
     if subject:
-        header = f"🏷 {subject}\n{header}"
+        header = f"🏷 {html.escape(subject)}\n{header}"
     return header
 
 
@@ -1721,7 +1727,7 @@ def build_common_router() -> Router:
         # from_user=None — раньше m.from_user.id падал с AttributeError и
         # /del просто не работал. Анонимных пропускаем как доверенных
         # (они уже прошли проверку Telegram на уровне прав в чате).
-        if m.from_user is not None and not await is_bot_admin(m.from_user.id, bot_db_id, bot, cfg):
+        if m.from_user is not None and not await is_bot_admin(bot_db_id, m.from_user.id, bot):
             return
         if _mod_cmd_already_handled(bot_db_id, m.message_id):
             return
@@ -1766,5 +1772,58 @@ def build_common_router() -> Router:
                 await m.answer(f"{em('warn')} Не удалось удалить (сообщение старше 48 ч или уже удалено).")
             except Exception:
                 pass
+
+    # ---------- /mute и /unmute — ручное управление мутом ----------
+    @r.message(Command("mute"))
+    async def cmd_mute(m: Message, command: CommandObject, bot_db_id: int, bot: Bot):
+        """/mute [ID или реплай] [длительность] — замьютить пользователя.
+        Примеры: /mute 123456 2h  /mute 30m (реплаем)  /mute perm"""
+        if not await is_bot_admin(bot_db_id, m.from_user.id):
+            return
+        if _mod_cmd_already_handled(bot_db_id, m.message_id):
+            return
+        reply_uid = await _target_from_reply(bot_db_id, m)
+        args = command.args or ""
+        parts = args.split()
+        if reply_uid is not None:
+            uid = reply_uid
+            dur = parts[0] if parts and mod.DURATION_RE.match(parts[0]) else "1h"
+        else:
+            if not parts or not parts[0].lstrip("-").isdigit():
+                await m.answer(
+                    f"{em('warn')} Формат: <code>/mute 123456 2h</code> "
+                    "или реплаем на сообщение пользователя."
+                )
+                return
+            uid = int(parts[0])
+            dur = parts[1] if len(parts) > 1 and mod.DURATION_RE.match(parts[1]) else "1h"
+        text = await mod.mute_user(bot_db_id, uid, dur,
+                                   admin_id=m.from_user.id,
+                                   admin_username=m.from_user.username)
+        await m.answer(text)
+
+    @r.message(Command("unmute"))
+    async def cmd_unmute(m: Message, command: CommandObject, bot_db_id: int, bot: Bot):
+        """/unmute [ID или реплай] — снять мут с пользователя."""
+        if not await is_bot_admin(bot_db_id, m.from_user.id):
+            return
+        if _mod_cmd_already_handled(bot_db_id, m.message_id):
+            return
+        reply_uid = await _target_from_reply(bot_db_id, m)
+        if reply_uid is not None:
+            uid = reply_uid
+        else:
+            args = (command.args or "").strip()
+            if not args or not args.lstrip("-").isdigit():
+                await m.answer(
+                    f"{em('warn')} Формат: <code>/unmute 123456</code> "
+                    "или реплаем на сообщение пользователя."
+                )
+                return
+            uid = int(args)
+        text = await mod.unmute_user(bot_db_id, uid,
+                                     admin_id=m.from_user.id,
+                                     admin_username=m.from_user.username)
+        await m.answer(text)
 
     return r
