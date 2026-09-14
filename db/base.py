@@ -258,6 +258,17 @@ async def init_db():
     ):
         await _exec(stmt)
 
+    # Бэкфилл NULL-значений для строк, существовавших ДО добавления колонок.
+    # ALTER TABLE ADD COLUMN DEFAULT заполняет DEFAULT только при создании колонки,
+    # а в уже существующих строках Postgres оставляет NULL — SQLAlchemy возвращает
+    # None вместо False/default-значения, что ломает проверки вида bool(cfg.profanity_mute_enabled).
+    for stmt in (
+        "UPDATE bot_users SET is_muted = FALSE WHERE is_muted IS NULL",
+        "UPDATE child_bots SET profanity_mute_enabled = FALSE WHERE profanity_mute_enabled IS NULL",
+        "UPDATE child_bots SET profanity_mute_duration = '1h' WHERE profanity_mute_duration IS NULL",
+    ):
+        await _exec(stmt)
+
     # Перешифровка ещё не зашифрованных (старых, открытых) токенов + бэкфилл
     # token_fingerprint — см. докстринг функции. Идёт ПОСЛЕ ALTER-ов выше
     # (нужна расширенная колонка) и ДО попытки навесить UNIQUE-индекс ниже
