@@ -1,4 +1,3 @@
-
 import copy
 import json
 from datetime import datetime
@@ -485,6 +484,12 @@ def build_posting_router() -> Router:
                 f"{'вкл' if cfg.accept_suggestions else 'выкл'}", ikb, rkb)
         elif cfg.accept_suggestions or cfg.admin_chat_id:
             ikb, rkb = await build_keyboards(bot_db_id, cfg)
+            ws = getattr(cfg, "welcome_sticker", None)
+            if ws:
+                try:
+                    await m.bot.send_sticker(m.chat.id, ws)
+                except Exception:
+                    pass
             welcome = await inject_extras(bot_db_id, cfg.welcome_text)
             await send_with_keyboards(m, welcome, ikb, rkb, photo=cfg.welcome_photo,
                                    **await welcome_pro_kwargs(cfg))
@@ -919,5 +924,3 @@ def build_posting_router() -> Router:
         await c.answer("✅ Готово")
 
     return r
-
-
