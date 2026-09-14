@@ -106,12 +106,13 @@ def build_feedback_router() -> Router:
             await s.commit()
         # Автомут за маты: если режим включён — проверяем текст сообщения.
         # Администраторов не мутим (is_bot_admin).
-        if (getattr(cfg, "profanity_mute_enabled", False)
-                and m.text
-                and not await is_bot_admin(bot_db_id, m.from_user.id, bot)):
+        # Используем bool() для защиты от NULL в БД (SQLAlchemy отдаёт None вместо False
+        # если миграция добавила колонку с DEFAULT но запись была создана раньше).
+        profanity_enabled = bool(getattr(cfg, "profanity_mute_enabled", None))
+        if profanity_enabled and m.text and not await is_bot_admin(bot_db_id, m.from_user.id, bot):
             extra = getattr(cfg, "profanity_extra_words", None)
             if mod.has_profanity(m.text, extra):
-                dur = getattr(cfg, "profanity_mute_duration", "1h") or "1h"
+                dur = getattr(cfg, "profanity_mute_duration", None) or "1h"
                 await mod.mute_user(bot_db_id, m.from_user.id, dur)
                 await m.answer(
                     f"🔇 Ваше сообщение содержало нецензурную лексику. "
