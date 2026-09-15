@@ -29,6 +29,9 @@ def _media(m: Message):
 _group_from_messages = group_from_messages
 _text_from_messages = text_from_messages
 
+# Временное хранилище для сообщений ожидающих выбора анонимности: user_id -> (messages[], bot_db_id)
+_pending_anon_msgs: dict[int, tuple[list[Message], int]] = {}
+
 
 def _buttons_markup(*sources: str | None) -> InlineKeyboardMarkup | None:
     rows = []
@@ -368,12 +371,11 @@ async def _publish_reconstructed(bot: Bot, cfg: ChildBot, *, text: str,
 
 
 class PostSt(StatesGroup):
-    composing = State()      # /newpost: ждём содержимое поста
-    editing = State()        # /newpost: ждём кнопку "текст|url" или /done
-    scheduling = State()     # /newpost: ждём дату-время
-    btn_style = State()      # /newpost: выбор цвета для кнопки поста
-    btn_icon = State()       # /newpost: premium-эмодзи для кнопки поста
-    anon_choice = State()    # предложка: ждём выбор анонимно/нет
+    composing = State()    # /newpost: ждём содержимое поста
+    editing = State()      # /newpost: ждём кнопку "текст|url" или /done
+    scheduling = State()   # /newpost: ждём дату-время
+    btn_style = State()    # /newpost: выбор цвета для кнопки поста
+    btn_icon = State()     # /newpost: premium-эмодзи для кнопки поста
 
 
 BTN_STYLES = [
@@ -816,19 +818,21 @@ def build_posting_router() -> Router:
         if not cfg.admin_chat_id:
             return
 
-        # Если включена анонимная предложка — сначала спрашиваем
+        # Если включена анонимная предложка — сохраняем сообщение и спрашиваем
         anon_enabled = getattr(cfg, "anon_suggestion_enabled", False)
         if anon_enabled and cfg.accept_suggestions:
+            # Сохраняем сообщение для последующей обработки
+            _pending_anon_msgs[m.from_user.id] = ([m], bot_db_id)
+            
             ask_text = getattr(cfg, "anon_suggestion_ask_text", "Как хотите отправить предложку?")
-            yes_text = getattr(cfg, "anon_suggestion_yes_text", "🕵️ Анонимно")
-            no_text = getattr(cfg, "anon_suggestion_no_text", "👤 От моего имени")
-            await state.set_state(PostSt.anon_choice)
-            await state.update_data(pending_msg_id=m.message_id)
+            yes_btn = getattr(cfg, "anon_yes_button_text", None) or "🕵️ Анонимно"
+            no_btn = getattr(cfg, "anon_no_button_text", None) or "👤 От моего имени"
+            
             await m.answer(
                 ask_text,
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                    InlineKeyboardButton(text=yes_text, callback_data="anon_yes"),
-                    InlineKeyboardButton(text=no_text, callback_data="anon_no"),
+                    styled_button(yes_btn, callback_data=f"anon_yes:{m.from_user.id}"),
+                    styled_button(no_btn, callback_data=f"anon_no:{m.from_user.id}"),
                 ]])
             )
             return
@@ -838,44 +842,37 @@ def build_posting_router() -> Router:
 
         await buffer_or_process(m, _process)
 
-    # -------- Выбор анонимности --------
-    @r.callback_query(PostSt.anon_choice, F.data.in_({"anon_yes", "anon_no"}))
-    async def anon_choice_cb(c: CallbackQuery, bot: Bot, bot_db_id: int, state: FSMContext):
+    # -------- Выбор анонимности (новая логика) --------
+    @r.callback_query(F.data.startswith(("anon_yes:", "anon_no:")))
+    async def anon_choice_cb(c: CallbackQuery, bot: Bot):
+        is_anon = c.data.startswith("anon_yes:")
+        user_id = int(c.data.split(":")[-1])
+        
+        # Проверяем что это тот же пользователь
+        if c.from_user.id != user_id:
+            await c.answer("Не ваша кнопка", show_alert=True)
+            return
+        
+        # Берём сохранённые сообщения
+        if user_id not in _pending_anon_msgs:
+            await c.answer("Сообщение истекло, пришлите ещё раз", show_alert=True)
+            return
+        
+        msgs, bot_db_id = _pending_anon_msgs.pop(user_id)
         cfg = await _cfg(bot_db_id)
-        is_anon = c.data == "anon_yes"
-        await state.clear()
+        
         try:
             await c.message.edit_reply_markup(reply_markup=None)
         except Exception:
             pass
+        
         await c.answer()
-
-        # Просим прислать само сообщение предложки
-        await c.message.answer(
-            f"{em('pencil')} {'Анонимно. ' if is_anon else ''}Пришлите ваше сообщение для предложки:"
-        )
-
-        # Сохраняем выбор анонимности в state для следующего шага
-        await state.set_state(PostSt.anon_choice)
-        await state.update_data(anon_ready=True, is_anon=is_anon)
-
-    @r.message(PostSt.anon_choice, F.chat.type == "private")
-    async def anon_suggestion_content(m: Message, bot: Bot, bot_db_id: int, state: FSMContext):
-        data = await state.get_data()
-        if not data.get("anon_ready"):
-            # Ещё не выбрали анонимность — игнорируем
-            return
-        is_anon = data.get("is_anon", False)
-        await state.clear()
-        cfg = await _cfg(bot_db_id)
-
-        if m.text and m.text.startswith("/"):
-            return
-
-        async def _process(msgs: list[Message]):
-            await _relay_to_admins(msgs, bot, cfg, bot_db_id, is_anon=is_anon)
-
-        await buffer_or_process(m, _process)
+        
+        # Релеим с флагом анонимности
+        async def _process(msgs_list: list[Message]):
+            await _relay_to_admins(msgs_list, bot, cfg, bot_db_id, is_anon=is_anon)
+        
+        await buffer_or_process(msgs[0], _process)
 
     async def _relay_to_admins(msgs: list[Message], bot: Bot, cfg: ChildBot, bot_db_id: int,
                                is_anon: bool = False):
