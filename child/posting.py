@@ -368,11 +368,12 @@ async def _publish_reconstructed(bot: Bot, cfg: ChildBot, *, text: str,
 
 
 class PostSt(StatesGroup):
-    composing = State()    # /newpost: ждём содержимое поста
-    editing = State()      # /newpost: ждём кнопку "текст|url" или /done
-    scheduling = State()   # /newpost: ждём дату-время
-    btn_style = State()    # /newpost: выбор цвета для кнопки поста
-    btn_icon = State()     # /newpost: premium-эмодзи для кнопки поста
+    composing = State()      # /newpost: ждём содержимое поста
+    editing = State()        # /newpost: ждём кнопку "текст|url" или /done
+    scheduling = State()     # /newpost: ждём дату-время
+    btn_style = State()      # /newpost: выбор цвета для кнопки поста
+    btn_icon = State()       # /newpost: premium-эмодзи для кнопки поста
+    anon_choice = State()    # предложка: ждём выбор анонимно/нет
 
 
 BTN_STYLES = [
@@ -815,12 +816,69 @@ def build_posting_router() -> Router:
         if not cfg.admin_chat_id:
             return
 
+        # Если включена анонимная предложка — сначала спрашиваем
+        anon_enabled = getattr(cfg, "anon_suggestion_enabled", False)
+        if anon_enabled and cfg.accept_suggestions:
+            ask_text = getattr(cfg, "anon_suggestion_ask_text", "Как хотите отправить предложку?")
+            yes_text = getattr(cfg, "anon_suggestion_yes_text", "🕵️ Анонимно")
+            no_text = getattr(cfg, "anon_suggestion_no_text", "👤 От моего имени")
+            await state.set_state(PostSt.anon_choice)
+            await state.update_data(pending_msg_id=m.message_id)
+            await m.answer(
+                ask_text,
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text=yes_text, callback_data="anon_yes"),
+                    InlineKeyboardButton(text=no_text, callback_data="anon_no"),
+                ]])
+            )
+            return
+
         async def _process(msgs: list[Message]):
-            await _relay_to_admins(msgs, bot, cfg, bot_db_id)
+            await _relay_to_admins(msgs, bot, cfg, bot_db_id, is_anon=False)
 
         await buffer_or_process(m, _process)
 
-    async def _relay_to_admins(msgs: list[Message], bot: Bot, cfg: ChildBot, bot_db_id: int):
+    # -------- Выбор анонимности --------
+    @r.callback_query(PostSt.anon_choice, F.data.in_({"anon_yes", "anon_no"}))
+    async def anon_choice_cb(c: CallbackQuery, bot: Bot, bot_db_id: int, state: FSMContext):
+        cfg = await _cfg(bot_db_id)
+        is_anon = c.data == "anon_yes"
+        await state.clear()
+        try:
+            await c.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await c.answer()
+
+        # Просим прислать само сообщение предложки
+        await c.message.answer(
+            f"{em('pencil')} {'Анонимно. ' if is_anon else ''}Пришлите ваше сообщение для предложки:"
+        )
+
+        # Сохраняем выбор анонимности в state для следующего шага
+        await state.set_state(PostSt.anon_choice)
+        await state.update_data(anon_ready=True, is_anon=is_anon)
+
+    @r.message(PostSt.anon_choice, F.chat.type == "private")
+    async def anon_suggestion_content(m: Message, bot: Bot, bot_db_id: int, state: FSMContext):
+        data = await state.get_data()
+        if not data.get("anon_ready"):
+            # Ещё не выбрали анонимность — игнорируем
+            return
+        is_anon = data.get("is_anon", False)
+        await state.clear()
+        cfg = await _cfg(bot_db_id)
+
+        if m.text and m.text.startswith("/"):
+            return
+
+        async def _process(msgs: list[Message]):
+            await _relay_to_admins(msgs, bot, cfg, bot_db_id, is_anon=is_anon)
+
+        await buffer_or_process(m, _process)
+
+    async def _relay_to_admins(msgs: list[Message], bot: Bot, cfg: ChildBot, bot_db_id: int,
+                               is_anon: bool = False):
         user = msgs[0].from_user
         sugg_kb = None
         if cfg.accept_suggestions:
@@ -839,7 +897,8 @@ def build_posting_router() -> Router:
                                 media_group_json=json.dumps(group) if group else None,
                                 origin_chat_id=msgs[0].chat.id,
                                 origin_message_id=msgs[0].message_id if not is_album else None,
-                                origin_message_ids=origin_ids)
+                                origin_message_ids=origin_ids,
+                                is_anonymous=is_anon)
                 s.add(sg)
                 await s.commit()
                 await s.refresh(sg)
@@ -848,7 +907,8 @@ def build_posting_router() -> Router:
                 styled_button("❌ Отклонить", callback_data=f"sg_no:{sg.id}")]])
         # Сам релей (шапка/топики/reply-контекст/маппинг/кнопка закрытия) —
         # общий с фидбек-ботами, см. child/common.py::relay_to_admin_chat.
-        await relay_to_admin_chat(msgs, bot, cfg, extra_kb=sugg_kb)
+        await relay_to_admin_chat(msgs, bot, cfg, extra_kb=sugg_kb,
+                                  force_anonymous=is_anon)
 
     # ================= модерация предложки =================
     @r.callback_query(F.data.startswith(("sg_ok:", "sg_no:")))
@@ -901,13 +961,15 @@ def build_posting_router() -> Router:
                 await c.message.answer(f"{em('cross')} Не удалось опубликовать: {e}")
                 await c.answer()
                 return
+            approved_text = getattr(cfg, "suggestion_approved_text", None) or f"{em('party')} Ваш пост опубликован!"
             try:
-                await bot.send_message(sg.user_id, f"{em('party')} Ваш пост опубликован!")
+                await bot.send_message(sg.user_id, approved_text)
             except Exception:
                 pass
         else:
+            rejected_text = getattr(cfg, "suggestion_rejected_text", None) or f"{em('cross')} Ваш пост отклонён."
             try:
-                await bot.send_message(sg.user_id, f"{em('cross')} Ваш пост отклонён.")
+                await bot.send_message(sg.user_id, rejected_text)
             except Exception:
                 pass
         uname = c.from_user.username
