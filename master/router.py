@@ -234,9 +234,14 @@ class St(StatesGroup):
     anon_ask_text = State()
     anon_yes_text = State()
     anon_no_text = State()
-    # тексты уведомлений предложки
-    sugg_approved_text = State()
-    sugg_rejected_text = State()
+    # анонимная предложка - кнопки
+    anon_yes_btn_text = State()
+    anon_yes_btn_style = State()
+    anon_yes_btn_icon = State()
+    anon_no_btn_text = State()
+    anon_no_btn_style = State()
+    anon_no_btn_icon = State()
+    # кнопка закрыть обращение (для posting ботов тоже)
 
 
 HEADER_MODE_LABELS = {
@@ -779,7 +784,8 @@ async def cfg_menu(c: CallbackQuery):
               f"cyc_infoaccess:{bot_id}")],
             [(f"🕵️ Анонимная предложка: {'вкл' if getattr(cb, 'anon_suggestion_enabled', False) else 'выкл'}",
               f"cyc_anonsugg:{bot_id}")],
-            [("🕵️ Настройка анонимной предложки", f"anonsuggcfg:{bot_id}")],
+            [("🕵️ Кнопки анонимной предложки (текст/цвет/эмодзи)", f"anonsuggbtn:{bot_id}")],
+            [(f"❌ Кнопка «Закрыть обращение» (текст/цвет/эмодзи/удаление)", f"closebtn:{bot_id}")],
             [("✅ Текст при одобрении предложки", f"suggapprovedtext:{bot_id}")],
             [("❌ Текст при отклонении предложки", f"suggrejectedtext:{bot_id}")],
         ]
@@ -1158,97 +1164,167 @@ async def closenotify_save(m: Message, state: FSMContext):
 
 
 # ======= Настройка анонимной предложки =======
-@router.callback_query(F.data.startswith("anonsuggcfg:"))
-async def anonsuggcfg(c: CallbackQuery):
+# ======= Настройка кнопок анонимной предложки (как closebtn) =======
+@router.callback_query(F.data.startswith("anonsuggbtn:"))
+async def anonsuggbtn_start(c: CallbackQuery):
     bot_id = int(c.data.split(":")[1])
     cb, is_owner = await _access(bot_id, c.from_user.id)
     if not cb or not is_owner:
         await c.answer("Только владелец", show_alert=True); return
-    ask = getattr(cb, "anon_suggestion_ask_text", "Как хотите отправить предложку?")
-    yes = getattr(cb, "anon_suggestion_yes_text", "🕵️ Анонимно")
-    no = getattr(cb, "anon_suggestion_no_text", "👤 От моего имени")
-    await c.message.edit_text(
-        f"🕵️ <b>Настройка анонимной предложки</b>\n\n"
-        f"Текст вопроса: <i>{ask}</i>\n"
-        f"Кнопка «да» (анонимно): <i>{yes}</i>\n"
-        f"Кнопка «нет» (не анонимно): <i>{no}</i>",
-        reply_markup=kb([
-            [("✏️ Вопрос пользователю", f"anonsugg_ask:{bot_id}")],
-            [("✏️ Кнопка «Анонимно»", f"anonsugg_yes:{bot_id}"),
-             ("✏️ Кнопка «Не анонимно»", f"anonsugg_no:{bot_id}")],
-            [("⬅️ Назад", f"cfg:{bot_id}")],
-        ])
-    )
+    
+    yes_txt = cb.anon_yes_button_text or "🕵️ Анонимно"
+    no_txt = cb.anon_no_button_text or "👤 От моего имени"
+    ask_txt = cb.anon_suggestion_ask_text or "Как хотите отправить предложку?"
+    
+    rows = [
+        [("Вопрос пользователю", f"anonsugg_ask_edit:{bot_id}")],
+        [("✏️ Кнопка «Анонимно»", f"anonsugg_yes_edit:{bot_id}"),
+         ("✏️ Кнопка «Не анонимно»", f"anonsugg_no_edit:{bot_id}")],
+        [("⬅️ Назад", f"cfg:{bot_id}")],
+    ]
+    
+    text = (f"{em('eyes')} <b>Кнопки анонимной предложки</b>\n\n"
+            f"Вопрос: <i>{ask_txt}</i>\n"
+            f"«Да»: <i>{yes_txt}</i>\n"
+            f"«Нет»: <i>{no_txt}</i>")
+    
+    await c.message.edit_text(text, reply_markup=kb(rows))
     await c.answer()
 
 
-@router.callback_query(F.data.startswith("anonsugg_ask:"))
-async def anonsugg_ask_start(c: CallbackQuery, state: FSMContext):
+@router.callback_query(F.data.startswith("anonsugg_ask_edit:"))
+async def anonsugg_ask_edit(c: CallbackQuery, state: FSMContext):
     bot_id = int(c.data.split(":")[1])
     cb, is_owner = await _access(bot_id, c.from_user.id)
     if not cb or not is_owner:
         await c.answer("Только владелец", show_alert=True); return
-    await state.update_data(bot_id=bot_id)
     await state.set_state(St.anon_ask_text)
-    await c.message.answer("Пришлите новый текст вопроса (например: «Как хотите отправить предложку?»). Отмена: /cancel")
+    await state.update_data(bot_id=bot_id, last_msg_id=c.message.message_id)
+    cur = cb.anon_suggestion_ask_text or "Как хотите отправить предложку?"
+    await c.message.edit_text(f"Текущий текст: <i>{cur}</i>\n\nПришлите новый:")
     await c.answer()
 
 
 @router.message(St.anon_ask_text)
-async def anonsugg_ask_save(m: Message, state: FSMContext):
+async def anonsugg_ask_edit_save(m: Message, state: FSMContext):
+    await delete_previous(m, state)
+    if not m.text or not m.text.strip():
+        msg = await m.answer("Нужен текст. Попробуйте ещё раз.")
+        await state.update_data(last_msg_id=msg.message_id)
+        return
     data = await state.get_data()
     async with Session() as s:
         obj = await s.get(ChildBot, data["bot_id"])
-        obj.anon_suggestion_ask_text = m.text or m.html_text
+        obj.anon_suggestion_ask_text = m.text.strip()
         await s.commit()
     await state.clear()
-    await m.answer(f"{em('check')} Текст вопроса сохранён!", reply_markup=nav_kb(data["bot_id"], f"anonsuggcfg:{data['bot_id']}"))
+    await m.answer(f"{em('check')} Сохранено!", reply_markup=nav_kb(data["bot_id"], f"anonsuggbtn:{data['bot_id']}"))
 
 
-@router.callback_query(F.data.startswith("anonsugg_yes:"))
-async def anonsugg_yes_start(c: CallbackQuery, state: FSMContext):
+@router.callback_query(F.data.startswith("anonsugg_yes_edit:"))
+async def anonsugg_yes_edit(c: CallbackQuery, state: FSMContext):
     bot_id = int(c.data.split(":")[1])
     cb, is_owner = await _access(bot_id, c.from_user.id)
     if not cb or not is_owner:
         await c.answer("Только владелец", show_alert=True); return
-    await state.update_data(bot_id=bot_id)
-    await state.set_state(St.anon_yes_text)
-    await c.message.answer("Пришлите текст кнопки «Анонимно» (например: «🕵️ Анонимно»). Отмена: /cancel")
+    await state.set_state(St.anon_yes_btn_text)
+    await state.update_data(bot_id=bot_id, last_msg_id=c.message.message_id)
+    cur = cb.anon_yes_button_text or "🕵️ Анонимно"
+    await c.message.edit_text(f"Текущий текст: <i>{cur}</i>\n\nПришлите новый:")
     await c.answer()
 
 
-@router.message(St.anon_yes_text)
-async def anonsugg_yes_save(m: Message, state: FSMContext):
+@router.message(St.anon_yes_btn_text)
+async def anonsugg_yes_text_save(m: Message, state: FSMContext):
+    await delete_previous(m, state)
+    if not m.text or not m.text.strip():
+        msg = await m.answer("Нужен текст. Попробуйте ещё раз.")
+        await state.update_data(last_msg_id=msg.message_id)
+        return
+    await state.update_data(text=m.text.strip()[:64])
+    await state.set_state(St.anon_yes_btn_style)
+    await m.answer("Выберите стиль кнопки:", reply_markup=kb([
+        [("🔴 Красный (danger)", "danger"), ("🟢 Зелёный (success)", "success")],
+        [("⚪ Обычный (default)", "primary"), ("⬅️ Пропустить", "skip_style")]
+    ]))
+
+
+@router.callback_query(St.anon_yes_btn_style, F.data.in_({"danger", "success", "primary", "skip_style"}))
+async def anonsugg_yes_style_cb(c: CallbackQuery, state: FSMContext):
+    if c.data != "skip_style":
+        await state.update_data(style=c.data)
+    await state.set_state(St.anon_yes_btn_icon)
+    await c.message.edit_text("Пришлите эмодзи для кнопки (первый символ будет использован):")
+    await c.answer()
+
+
+@router.message(St.anon_yes_btn_icon)
+async def anonsugg_yes_icon_save(m: Message, state: FSMContext):
     data = await state.get_data()
+    icon = None
+    if m.text:
+        text, icon = strip_icon(m.text)
+    await state.clear()
     async with Session() as s:
         obj = await s.get(ChildBot, data["bot_id"])
-        obj.anon_suggestion_yes_text = (m.text or "")[:64]
+        obj.anon_yes_button_text = data.get("text", "🕵️ Анонимно")
+        obj.anon_yes_button_style = data.get("style")
+        obj.anon_yes_button_icon = icon
         await s.commit()
-    await state.clear()
-    await m.answer(f"{em('check')} Текст кнопки сохранён!", reply_markup=nav_kb(data["bot_id"], f"anonsuggcfg:{data['bot_id']}"))
+    await m.answer(f"{em('check')} Кнопка сохранена!", reply_markup=nav_kb(data["bot_id"], f"anonsuggbtn:{data['bot_id']}"))
 
 
-@router.callback_query(F.data.startswith("anonsugg_no:"))
-async def anonsugg_no_start(c: CallbackQuery, state: FSMContext):
+@router.callback_query(F.data.startswith("anonsugg_no_edit:"))
+async def anonsugg_no_edit(c: CallbackQuery, state: FSMContext):
     bot_id = int(c.data.split(":")[1])
     cb, is_owner = await _access(bot_id, c.from_user.id)
     if not cb or not is_owner:
         await c.answer("Только владелец", show_alert=True); return
-    await state.update_data(bot_id=bot_id)
-    await state.set_state(St.anon_no_text)
-    await c.message.answer("Пришлите текст кнопки «Не анонимно» (например: «👤 От моего имени»). Отмена: /cancel")
+    await state.set_state(St.anon_no_btn_text)
+    await state.update_data(bot_id=bot_id, last_msg_id=c.message.message_id)
+    cur = cb.anon_no_button_text or "👤 От моего имени"
+    await c.message.edit_text(f"Текущий текст: <i>{cur}</i>\n\nПришлите новый:")
     await c.answer()
 
 
-@router.message(St.anon_no_text)
-async def anonsugg_no_save(m: Message, state: FSMContext):
+@router.message(St.anon_no_btn_text)
+async def anonsugg_no_text_save(m: Message, state: FSMContext):
+    await delete_previous(m, state)
+    if not m.text or not m.text.strip():
+        msg = await m.answer("Нужен текст. Попробуйте ещё раз.")
+        await state.update_data(last_msg_id=msg.message_id)
+        return
+    await state.update_data(text=m.text.strip()[:64])
+    await state.set_state(St.anon_no_btn_style)
+    await m.answer("Выберите стиль кнопки:", reply_markup=kb([
+        [("🔴 Красный (danger)", "danger"), ("🟢 Зелёный (success)", "success")],
+        [("⚪ Обычный (default)", "primary"), ("⬅️ Пропустить", "skip_style")]
+    ]))
+
+
+@router.callback_query(St.anon_no_btn_style, F.data.in_({"danger", "success", "primary", "skip_style"}))
+async def anonsugg_no_style_cb(c: CallbackQuery, state: FSMContext):
+    if c.data != "skip_style":
+        await state.update_data(style=c.data)
+    await state.set_state(St.anon_no_btn_icon)
+    await c.message.edit_text("Пришлите эмодзи для кнопки (первый символ будет использован):")
+    await c.answer()
+
+
+@router.message(St.anon_no_btn_icon)
+async def anonsugg_no_icon_save(m: Message, state: FSMContext):
     data = await state.get_data()
+    icon = None
+    if m.text:
+        text, icon = strip_icon(m.text)
+    await state.clear()
     async with Session() as s:
         obj = await s.get(ChildBot, data["bot_id"])
-        obj.anon_suggestion_no_text = (m.text or "")[:64]
+        obj.anon_no_button_text = data.get("text", "👤 От моего имени")
+        obj.anon_no_button_style = data.get("style")
+        obj.anon_no_button_icon = icon
         await s.commit()
-    await state.clear()
-    await m.answer(f"{em('check')} Текст кнопки сохранён!", reply_markup=nav_kb(data["bot_id"], f"anonsuggcfg:{data['bot_id']}"))
+    await m.answer(f"{em('check')} Кнопка сохранена!", reply_markup=nav_kb(data["bot_id"], f"anonsuggbtn:{data['bot_id']}"))
 
 
 # ======= Тексты уведомлений предложки =======
