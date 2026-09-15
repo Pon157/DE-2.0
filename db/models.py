@@ -211,6 +211,33 @@ class ChildBot(Base):
     profanity_mute_duration: Mapped[str] = mapped_column(String(16), default="1h")
     profanity_extra_words: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # Подтверждение бана (переспрашивает админа перед баном)
+    ban_confirm_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    # Доступ к команде /info в дочернем боте
+    # "admins" — только владельцы и администраторы, "all" — все участники
+    info_access: Mapped[str] = mapped_column(String(16), default="admins")
+
+    # Анонимная предложка (только для posting-ботов)
+    anon_suggestion_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    anon_suggestion_ask_text: Mapped[str] = mapped_column(
+        Text, default="Как хотите отправить предложку?"
+    )
+    anon_suggestion_yes_text: Mapped[str] = mapped_column(
+        String(64), default="🕵️ Анонимно"
+    )
+    anon_suggestion_no_text: Mapped[str] = mapped_column(
+        String(64), default="👤 От моего имени"
+    )
+
+    # Тексты уведомлений пользователю об одобрении/отклонении предложки
+    suggestion_approved_text: Mapped[str] = mapped_column(
+        Text, default="🎉 Ваш пост опубликован!"
+    )
+    suggestion_rejected_text: Mapped[str] = mapped_column(
+        Text, default="❌ Ваш пост отклонён."
+    )
+
 
 class BotAdmin(Base):
     __tablename__ = "bot_admins"
@@ -412,6 +439,7 @@ class Suggestion(Base):
     status: Mapped[str] = mapped_column(
         String(16), default="pending"
     )
+    is_anonymous: Mapped[bool] = mapped_column(Boolean, default=False)
     decided_by: Mapped[int | None] = mapped_column(
         BigInteger, nullable=True
     )
