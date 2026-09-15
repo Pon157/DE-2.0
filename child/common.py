@@ -2,6 +2,8 @@ import asyncio
 import hashlib
 import html
 import logging
+# Временное хранилище причин бана до подтверждения: (bot_db_id, uid, admin_id) -> reason
+_ban_pending: dict[tuple[int, int, int], str] = {}
 import re
 import time as _time
 from datetime import datetime
@@ -61,7 +63,7 @@ class DonateSt(StatesGroup):
 
 # Команды, которые нельзя переопределить триггер-командой из конструктора.
 RESERVED_COMMANDS = {"start", "restart", "cancel", "donate", "newpost", "done",
-                     "ads", "ban", "unban", "warn", "unwarn", "ref", "pro", "setchat"}
+                     "ads", "ban", "unban", "warn", "unwarn", "ref", "pro", "setchat", "info"}
 
 
 async def get_cfg(bot_db_id: int) -> ChildBot | None:
@@ -725,16 +727,23 @@ async def _maybe_pin_first_message(bot: Bot, cfg: ChildBot, created: bool,
 
 
 async def relay_to_admin_chat(msgs: list[Message], bot: Bot, cfg: ChildBot,
-                              extra_kb: InlineKeyboardMarkup | None = None):
+                              extra_kb: InlineKeyboardMarkup | None = None,
+                              force_anonymous: bool = False):
     """Пересылает сообщения пользователя в админ-чат.
 
     extra_kb — доп. кнопки (например "Принять/Отклонить" предложки). Кнопка
     "🔒 Закрыть обращение" вешается на первое сообщение нового тикета.
+    force_anonymous — при True скрывает данные пользователя в шапке (для анонимной предложки).
     """
     user = msgs[0].from_user
     ticket, created, _conflict = await open_ticket(bot, cfg, user.id)
     thread = ticket.topic_id if cfg.use_topics else None
-    header = build_header(cfg, user, subject=ticket.subject)
+    if force_anonymous:
+        # В анонимной предложке не раскрываем личность
+        aid = anon_id_for(cfg.id, user.id)
+        header = f"🕵️ Анонимная предложка · <code>{aid}</code>"
+    else:
+        header = build_header(cfg, user, subject=ticket.subject)
     header_mode = getattr(cfg, "header_mode", "separate") or "separate"
     is_album = len(msgs) > 1
     first = msgs[0]
@@ -955,12 +964,152 @@ def build_common_router() -> Router:
                                "админ-чате командой <code>/ban Причина 7d</code> без ID.")
                 return
             uid, reason, dur = parsed
+
+        cfg = await get_cfg(bot_db_id)
+        # Если включено подтверждение бана — переспрашиваем
+        if cfg and getattr(cfg, "ban_confirm_enabled", False):
+            until_label = "навсегда" if dur == "perm" else dur
+            confirm_kb = InlineKeyboardMarkup(inline_keyboard=[[
+                styled_button(f"✅ Да, забанить ({until_label})",
+                              callback_data=f"ban_confirm:{bot_db_id}:{uid}:{dur}:{m.from_user.id}:{m.from_user.username or ''}"),
+                styled_button("❌ Отмена", callback_data="ban_cancel"),
+            ]])
+            await m.answer(
+                f"⚠️ Подтвердите бан пользователя <code>{uid}</code>\n"
+                f"Причина: {reason}\nСрок: {until_label}",
+                reply_markup=confirm_kb)
+            # Сохраняем reason отдельно через FSM — используем временный ключ в памяти
+            _ban_pending[(bot_db_id, uid, m.from_user.id)] = reason
+            return
+
         text = await mod.ban_user(bot_db_id, uid, reason, dur,
                                   m.from_user.id, m.from_user.username)
         await m.answer(f"{em('no_entry')} " + text)
         until = "навсегда" if dur == "perm" else dur
         await _notify_user(bot, bot_db_id, uid, f"{em('no_entry')} Вы забанены в этом боте "
                            f"({until}).\nПричина: {reason}")
+
+    # -------- Подтверждение бана (callback) --------
+    # Ключ: (bot_db_id, target_uid, admin_id) -> reason
+    @r.callback_query(F.data.startswith("ban_confirm:"))
+    async def ban_confirm_cb(c: CallbackQuery, bot: Bot, bot_db_id: int):
+        if not await is_bot_admin(bot_db_id, c.from_user.id):
+            await c.answer("Нет доступа", show_alert=True)
+            return
+        parts = c.data.split(":")
+        # ban_confirm:{bot_db_id}:{uid}:{dur}:{admin_id}:{admin_username}
+        _, _bid, uid_s, dur, admin_id_s, admin_uname = parts[0], parts[1], parts[2], parts[3], parts[4], parts[5]
+        uid = int(uid_s)
+        reason = _ban_pending.pop((int(_bid), uid, int(admin_id_s)), "Не указана")
+        text = await mod.ban_user(bot_db_id, uid, reason, dur,
+                                  c.from_user.id, c.from_user.username)
+        try:
+            await c.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await c.message.answer(f"{em('no_entry')} " + text)
+        until = "навсегда" if dur == "perm" else dur
+        await _notify_user(bot, bot_db_id, uid, f"{em('no_entry')} Вы забанены в этом боте "
+                           f"({until}).\nПричина: {reason}")
+        await c.answer()
+
+    @r.callback_query(F.data == "ban_cancel")
+    async def ban_cancel_cb(c: CallbackQuery):
+        try:
+            await c.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await c.message.answer(f"{em('check')} Бан отменён.")
+        await c.answer()
+
+    # -------- /info — информация о пользователе --------
+    @r.message(Command("info"), F.chat.type == "private")
+    @r.message(Command("info"))
+    async def cmd_info(m: Message, command: CommandObject, bot_db_id: int, bot: Bot):
+        cfg = await get_cfg(bot_db_id)
+        if not cfg:
+            return
+        # Проверяем доступ
+        info_access = getattr(cfg, "info_access", "admins")
+        is_admin = await is_bot_admin(bot_db_id, m.from_user.id)
+        if info_access == "admins" and not is_admin:
+            return
+
+        # Определяем цель: реплай, анон_id, или числовой ID
+        target_uid: int | None = None
+        anon_id_str: str | None = None
+
+        reply_uid = await _target_from_reply(bot_db_id, m)
+        if reply_uid is not None:
+            target_uid = reply_uid
+        elif command.args:
+            arg = command.args.strip()
+            if arg.lstrip("-").isdigit():
+                target_uid = int(arg)
+            else:
+                # Считаем что это anon_id
+                anon_id_str = arg
+
+        if target_uid is None and anon_id_str is None:
+            await m.answer(
+                f"{em('info')} Использование:\n"
+                "• Реплаем на сообщение пользователя\n"
+                "• <code>/info 123456</code> — по Telegram ID\n"
+                "• <code>/info ANON_ID</code> — по анонимному ID"
+            )
+            return
+
+        async with Session() as s:
+            if target_uid is not None:
+                user = await s.scalar(select(BotUser).where(
+                    BotUser.bot_id == bot_db_id, BotUser.user_id == target_uid))
+            else:
+                # Ищем по anon_id — перебираем через функцию
+                all_users = (await s.scalars(
+                    select(BotUser).where(BotUser.bot_id == bot_db_id))).all()
+                user = next(
+                    (u for u in all_users
+                     if anon_id_for(bot_db_id, u.user_id) == anon_id_str), None)
+                if user:
+                    target_uid = user.user_id
+
+        if not user:
+            await m.answer(f"{em('warn')} Пользователь не найден в базе этого бота.")
+            return
+
+        aid = anon_id_for(bot_db_id, user.user_id)
+        uname = f"@{user.username}" if user.username else "—"
+        ban_info = ""
+        if user.is_banned:
+            until_str = user.ban_until.strftime("%d.%m.%Y %H:%M") if user.ban_until else "навсегда"
+            ban_info = f"\n🚫 Забанен ({until_str}). Причина: {user.ban_reason or '—'}"
+        mute_info = ""
+        if user.is_muted:
+            until_str = user.muted_until.strftime("%d.%m.%Y %H:%M") if user.muted_until else "навсегда"
+            mute_info = f"\n🔇 Замьючен ({until_str})"
+        first_seen = user.first_seen.strftime("%d.%m.%Y") if user.first_seen else "—"
+        last_active = user.last_active.strftime("%d.%m.%Y %H:%M") if user.last_active else "—"
+
+        text = (
+            f"👤 <b>Информация о пользователе</b>\n\n"
+            f"🆔 Telegram ID: <code>{user.user_id}</code>\n"
+            f"🕵️ Anon ID: <code>{aid}</code>\n"
+            f"📛 Имя: {html.escape(user.full_name or '—')}\n"
+            f"🔗 Username: {uname}\n"
+            f"📨 Сообщений: {user.total_requests}\n"
+            f"⚠️ Варнов: {user.warns}\n"
+            f"📅 Первое сообщение: {first_seen}\n"
+            f"🕐 Последняя активность: {last_active}"
+            f"{ban_info}{mute_info}"
+        )
+        # Отправляем через дочерний бот в ЛС запросившему
+        try:
+            await bot.send_message(m.from_user.id, text)
+            if m.chat.id != m.from_user.id:
+                await m.answer(f"{em('check')} Информация отправлена вам в ЛС.")
+        except Exception:
+            # Если нет ЛС (не начинал диалог с ботом) — шлём прямо в чат
+            await m.answer(text)
 
     @r.message(Command("unban"))
     async def cmd_unban(m: Message, command: CommandObject, bot_db_id: int, bot: Bot):
@@ -1849,4 +1998,3 @@ def build_common_router() -> Router:
         await m.answer(text)
 
     return r
-
