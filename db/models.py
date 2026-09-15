@@ -223,12 +223,12 @@ class ChildBot(Base):
     anon_suggestion_ask_text: Mapped[str] = mapped_column(
         Text, default="Как хотите отправить предложку?"
     )
-    anon_suggestion_yes_text: Mapped[str] = mapped_column(
-        String(64), default="🕵️ Анонимно"
-    )
-    anon_suggestion_no_text: Mapped[str] = mapped_column(
-        String(64), default="👤 От моего имени"
-    )
+    anon_yes_button_text: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    anon_yes_button_style: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    anon_yes_button_icon: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    anon_no_button_text: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    anon_no_button_style: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    anon_no_button_icon: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     # Тексты уведомлений пользователю об одобрении/отклонении предложки
     suggestion_approved_text: Mapped[str] = mapped_column(
