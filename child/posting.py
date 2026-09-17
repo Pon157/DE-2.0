@@ -29,6 +29,9 @@ def _media(m: Message):
 _group_from_messages = group_from_messages
 _text_from_messages = text_from_messages
 
+# Временное хранилище для сообщений ожидающих выбора анонимности: user_id -> (messages[], bot_db_id)
+_pending_anon_msgs: dict[int, tuple[list[Message], int]] = {}
+
 
 def _buttons_markup(*sources: str | None) -> InlineKeyboardMarkup | None:
     rows = []
@@ -368,12 +371,11 @@ async def _publish_reconstructed(bot: Bot, cfg: ChildBot, *, text: str,
 
 
 class PostSt(StatesGroup):
-    composing = State()        # /newpost: ждём содержимое поста
-    editing = State()          # /newpost: ждём кнопку "текст|url" или /done
-    scheduling = State()       # /newpost: ждём дату-время
-    btn_style = State()        # /newpost: выбор цвета для кнопки поста
-    btn_icon = State()         # /newpost: premium-эмодзи для кнопки поста
-    collecting_sugg = State()  # предложка: накапливаем сообщения до /close
+    composing = State()    # /newpost: ждём содержимое поста
+    editing = State()      # /newpost: ждём кнопку "текст|url" или /done
+    scheduling = State()   # /newpost: ждём дату-время
+    btn_style = State()    # /newpost: выбор цвета для кнопки поста
+    btn_icon = State()     # /newpost: premium-эмодзи для кнопки поста
 
 
 BTN_STYLES = [
@@ -502,24 +504,6 @@ def build_posting_router() -> Router:
         if await state.get_state() is not None or (await state.get_data()):
             await state.clear()
             await m.answer(f"{em('check')} Отменено.")
-
-    # ── /newsugg — составная предложка из нескольких сообщений ───────────────
-    @r.message(Command("newsugg"), F.chat.type == "private")
-    async def newsugg_cmd(m: Message, bot_db_id: int, state: FSMContext):
-        cfg = await _cfg(bot_db_id)
-        if not cfg or not cfg.accept_suggestions:
-            await m.answer(f"{em('warn')} Предложка в этом боте не включена.")
-            return
-        if await mod.is_banned(bot_db_id, m.from_user.id):
-            return
-        await state.clear()
-        await state.set_state(PostSt.collecting_sugg)
-        await state.update_data(sugg_msg_ids=[], sugg_chat_id=m.chat.id)
-        await m.answer(
-            f"{em('pencil')} Режим составной предложки.\n"
-            f"Присылайте сообщения по одному. Когда закончите — /close.\n"
-            f"Отмена: /cancel"
-        )
 
     # ================= /newpost — единственный способ опубликовать пост =================
     @r.message(Command("newpost"), F.chat.type == "private")
@@ -834,205 +818,94 @@ def build_posting_router() -> Router:
         if not cfg.admin_chat_id:
             return
 
-        # ── режим предложки ──────────────────────────────────────────────────
-        if cfg.accept_suggestions:
-            async def _start_suggestion(msgs: list[Message]):
-                """Первое сообщение предложки — спрашиваем анон/нет."""
-                msg_ids = [mm.message_id for mm in msgs]
-                chat_id = msgs[0].chat.id
-                # Переводим в сессию предложки: анон-вопрос задаётся ОДИН РАЗ
-                # при создании. Дальше пользователь может слать ещё сообщения.
-                await state.set_state(PostSt.collecting_sugg)
-                await state.update_data(
-                    sugg_msg_ids=msg_ids,
-                    sugg_chat_id=chat_id,
-                    sugg_bot_db_id=bot_db_id,
-                    sugg_is_anon=None,   # None = ещё не выбрано
-                )
-                await _propose_anon(msgs[-1], from_user=m.from_user,
-                                    bot=bot, cfg=cfg, bot_db_id=bot_db_id)
-
-            await buffer_or_process(m, _start_suggestion)
+        # Если включена анонимная предложка — сохраняем сообщение и спрашиваем
+        anon_enabled = getattr(cfg, "anon_suggestion_enabled", False)
+        if anon_enabled and cfg.accept_suggestions:
+            # Сохраняем сообщение для последующей обработки
+            _pending_anon_msgs[m.from_user.id] = ([m], bot_db_id)
+            
+            ask_text = getattr(cfg, "anon_suggestion_ask_text", "Как хотите отправить предложку?")
+            yes_btn = getattr(cfg, "anon_yes_button_text", None) or "🕵️ Анонимно"
+            no_btn = getattr(cfg, "anon_no_button_text", None) or "👤 От моего имени"
+            
+            await m.answer(
+                ask_text,
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    styled_button(yes_btn, callback_data=f"anon_yes:{m.from_user.id}"),
+                    styled_button(no_btn, callback_data=f"anon_no:{m.from_user.id}"),
+                ]])
+            )
             return
 
-        # ── режим обычного фидбека (нет accept_suggestions) ──────────────────
         async def _process(msgs: list[Message]):
             await _relay_to_admins(msgs, bot, cfg, bot_db_id, is_anon=False)
 
         await buffer_or_process(m, _process)
 
-    # ── Дополнительные сообщения в открытую сессию предложки ─────────────────
-    @r.message(PostSt.collecting_sugg, F.chat.type == "private")
-    async def sugg_collect_more(m: Message, state: FSMContext, bot_db_id: int, bot: Bot):
-        if m.text and m.text.startswith("/"):
-            return
-        data = await state.get_data()
-        # Если анон ещё не выбран — игнорируем (ждём коллбэк)
-        if data.get("sugg_is_anon") is None:
-            return
-        # Добавляем к существующей предложке
-        collected: list[int] = data.get("sugg_msg_ids", [])
-        collected.append(m.message_id)
-        await state.update_data(sugg_msg_ids=collected)
-
-        # Копируем сообщение в чат админов сразу (как в тикете)
-        sg_id = data.get("sugg_id")
-        cfg = await _cfg(bot_db_id)
-        if cfg and cfg.admin_chat_id and sg_id:
-            try:
-                await bot.copy_message(
-                    chat_id=cfg.admin_chat_id,
-                    from_chat_id=m.chat.id,
-                    message_id=m.message_id,
-                )
-            except Exception:
-                pass
-
-    # ── /close — завершить сессию предложки ──────────────────────────────────
-    @r.message(PostSt.collecting_sugg, Command("close"), F.chat.type == "private")
-    async def sugg_close_cmd(m: Message, state: FSMContext, bot_db_id: int, bot: Bot):
-        data = await state.get_data()
-        if data.get("sugg_is_anon") is None:
-            # Ещё не выбрали анон/нет — нельзя закрыть
-            await m.answer(f"{em('warn')} Сначала выберите тип отправки (анонимно/нет).")
-            return
-        await state.clear()
-        cfg = await _cfg(bot_db_id)
-        if cfg and cfg.admin_chat_id and data.get("sugg_id"):
-            await bot.send_message(
-                cfg.admin_chat_id,
-                f"{em('check')} Пользователь завершил предложку.",
-            )
-        await m.answer(f"{em('check')} Предложка закрыта. Следующее сообщение создаст новую.")
-
-    @r.message(Command("close"), F.chat.type == "private")
-    async def close_cmd_noop(m: Message):
-        # В posting-боте /close вне сессии — молча игнорируем
-        pass
-
-    async def _propose_anon(reply_to: Message, from_user, bot: Bot,
-                            cfg: ChildBot, bot_db_id: int):
-        """Спрашивает анон/нет (если включено) или сразу отправляет."""
-        anon_enabled = getattr(cfg, "anon_suggestion_enabled", False)
-
-        if not anon_enabled:
-            # Анонимность выключена — сразу фиксируем is_anon=False и шлём
-            await _do_create_suggestion(from_user, bot, cfg, bot_db_id, is_anon=False)
-            await reply_to.answer(
-                f"{em('check')} Предложка создана! Можете добавить ещё сообщения или /close."
-            )
-            return
-
-        yes_btn   = getattr(cfg, "anon_yes_button_text",  None) or "🕵️ Анонимно"
-        no_btn    = getattr(cfg, "anon_no_button_text",   None) or "👤 От моего имени"
-        yes_style = getattr(cfg, "anon_yes_button_style", None)
-        no_style  = getattr(cfg, "anon_no_button_style",  None)
-        yes_icon  = getattr(cfg, "anon_yes_button_icon",  None)
-        no_icon   = getattr(cfg, "anon_no_button_icon",   None)
-        ask_text  = getattr(cfg, "anon_suggestion_ask_text", "Как хотите отправить предложку?")
-
-        from aiogram.types import InlineKeyboardButton as IKB
-        yes_ib = IKB(text=yes_btn, callback_data=f"anon_yes:{from_user.id}",
-                     style=yes_style, icon_custom_emoji_id=yes_icon)
-        no_ib  = IKB(text=no_btn,  callback_data=f"anon_no:{from_user.id}",
-                     style=no_style, icon_custom_emoji_id=no_icon)
-        await reply_to.answer(
-            ask_text,
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[yes_ib, no_ib]])
-        )
-
-    # ── Коллбэк выбора анон/нет ──────────────────────────────────────────────
-    @r.callback_query(PostSt.collecting_sugg, F.data.startswith(("anon_yes:", "anon_no:")))
-    async def anon_choice_cb(c: CallbackQuery, bot: Bot, bot_db_id: int, state: FSMContext):
+    # -------- Выбор анонимности (новая логика) --------
+    @r.callback_query(F.data.startswith(("anon_yes:", "anon_no:")))
+    async def anon_choice_cb(c: CallbackQuery, bot: Bot):
         is_anon = c.data.startswith("anon_yes:")
         user_id = int(c.data.split(":")[-1])
-
+        
+        # Проверяем что это тот же пользователь
         if c.from_user.id != user_id:
             await c.answer("Не ваша кнопка", show_alert=True)
             return
-
-        data = await state.get_data()
+        
+        # Берём сохранённые сообщения
+        if user_id not in _pending_anon_msgs:
+            await c.answer("Сообщение истекло, пришлите ещё раз", show_alert=True)
+            return
+        
+        msgs, bot_db_id = _pending_anon_msgs.pop(user_id)
         cfg = await _cfg(bot_db_id)
-
+        
         try:
             await c.message.edit_reply_markup(reply_markup=None)
         except Exception:
             pass
-
-        # Создаём предложку в БД и шлём в чат админов
-        sg_id = await _do_create_suggestion(c.from_user, bot, cfg, bot_db_id, is_anon=is_anon,
-                                            state=state)
-
-        # Фиксируем выбор в FSM — сессия остаётся открытой
-        await state.update_data(sugg_is_anon=is_anon, sugg_id=sg_id)
-
+        
         await c.answer()
-        await c.message.answer(
-            f"{em('check')} Предложка создана! "
-            f"Можете добавить ещё сообщения к ней или /close для завершения."
-        )
+        
+        # Релеим с флагом анонимности
+        async def _process(msgs_list: list[Message]):
+            await _relay_to_admins(msgs_list, bot, cfg, bot_db_id, is_anon=is_anon)
+        
+        await buffer_or_process(msgs[0], _process)
 
-    async def _do_create_suggestion(from_user, bot: Bot, cfg: ChildBot,
-                                    bot_db_id: int, is_anon: bool, state: FSMContext = None) -> int:
-        """Создаёт запись Suggestion в БД и копирует накопленные сообщения в чат админов."""
-        import html as _html
-        from child.common import anon_id_for
-
-        data = await state.get_data() if state else {}
-        msg_ids: list[int] = data.get("sugg_msg_ids", [])
-        chat_id: int        = data.get("sugg_chat_id", 0)
-
-        if is_anon:
-            aid = anon_id_for(bot_db_id, from_user.id)
-            header = f"{em('eyes')} <b>Анонимная предложка</b> · <code>{aid}</code>"
-        else:
-            uname  = f"@{from_user.username}" if from_user.username else ""
-            name   = _html.escape(from_user.full_name or "")
-            header = f"{em('pencil')} <b>Предложка</b> от {name} {uname} · <code>{from_user.id}</code>"
-
-        async with Session() as s:
-            sg = Suggestion(
-                bot_id=bot_db_id, user_id=from_user.id,
-                html_text="",
-                origin_chat_id=chat_id,
-                origin_message_id=msg_ids[0] if len(msg_ids) == 1 else None,
-                origin_message_ids=",".join(map(str, msg_ids)) if len(msg_ids) > 1 else None,
-                is_anonymous=is_anon,
-            )
-            s.add(sg)
-            await s.commit()
-            await s.refresh(sg)
-            sg_id = sg.id
-
-        sugg_kb = InlineKeyboardMarkup(inline_keyboard=[[
-            styled_button("✅ Принять", callback_data=f"sg_ok:{sg_id}"),
-            styled_button("❌ Отклонить", callback_data=f"sg_no:{sg_id}"),
-        ]])
-
-        # Шапка
-        if cfg.admin_chat_id:
-            await bot.send_message(cfg.admin_chat_id, header)
-            # Первые сообщения
-            for i, mid in enumerate(msg_ids):
-                kb = sugg_kb if i == len(msg_ids) - 1 else None
-                try:
-                    await bot.copy_message(
-                        chat_id=cfg.admin_chat_id,
-                        from_chat_id=chat_id,
-                        message_id=mid,
-                        reply_markup=kb,
-                    )
-                except Exception as e:
-                    await bot.send_message(cfg.admin_chat_id,
-                                           f"⚠️ Не удалось скопировать сообщение {mid}: {e}")
-
-        return sg_id
-
-    async def _relay_to_admins(msgs: list[Message], bot: Bot, cfg: ChildBot,
-                               bot_db_id: int, is_anon: bool = False):
-        """Relay для обычного фидбека (без accept_suggestions) — использует open_ticket."""
-        from child.common import relay_to_admin_chat as _relay
-        await _relay(msgs, bot, cfg, force_anonymous=is_anon)
+    async def _relay_to_admins(msgs: list[Message], bot: Bot, cfg: ChildBot, bot_db_id: int,
+                               is_anon: bool = False):
+        user = msgs[0].from_user
+        sugg_kb = None
+        if cfg.accept_suggestions:
+            # создаём заявку на публикацию сразу, кнопки решения вешаем на
+            # релей в чат админов
+            is_album = len(msgs) > 1
+            group = _group_from_messages(msgs)
+            file_id = media_type = None
+            if not group:
+                file_id, media_type = _media(msgs[0])
+            origin_ids = ",".join(str(mm.message_id) for mm in msgs) if is_album else None
+            async with Session() as s:
+                sg = Suggestion(bot_id=bot_db_id, user_id=user.id,
+                                html_text=_text_from_messages(msgs),
+                                media_file_id=file_id, media_type=media_type,
+                                media_group_json=json.dumps(group) if group else None,
+                                origin_chat_id=msgs[0].chat.id,
+                                origin_message_id=msgs[0].message_id if not is_album else None,
+                                origin_message_ids=origin_ids,
+                                is_anonymous=is_anon)
+                s.add(sg)
+                await s.commit()
+                await s.refresh(sg)
+            sugg_kb = InlineKeyboardMarkup(inline_keyboard=[[
+                styled_button("✅ Принять", callback_data=f"sg_ok:{sg.id}"),
+                styled_button("❌ Отклонить", callback_data=f"sg_no:{sg.id}")]])
+        # Сам релей (шапка/топики/reply-контекст/маппинг/кнопка закрытия) —
+        # общий с фидбек-ботами, см. child/common.py::relay_to_admin_chat.
+        await relay_to_admin_chat(msgs, bot, cfg, extra_kb=sugg_kb,
+                                  force_anonymous=is_anon)
 
     # ================= модерация предложки =================
     @r.callback_query(F.data.startswith(("sg_ok:", "sg_no:")))
