@@ -1701,51 +1701,35 @@ def build_common_router() -> Router:
                 ).order_by(Ticket.id.desc()))
                 target_uid = t.user_id if t else None
         if m.reply_to_message:
-            rt = m.reply_to_message
-            # ФИКС: если реплай адресован сообщению от живого человека
-            # (from_user есть и не бот) — это ответ на сообщение другого
-            # админа, а не на пересланное сообщение пользователя.
-            # Сообщения пользователей в админ-чате всегда отправлены ботом
-            # через copy_message (from_user.is_bot == True), поэтому
-            # реплай на человека — никогда не должен долетать до пользователя.
-            # Без этой проверки: когда Витечек отвечал реплаем на своё же
-            # предыдущее сообщение (оно лежит в MsgMap с заполненным
-            # user_chat_msg_id), бот находил запись и пересылал текст
-            # пользователю, хотя разговор шёл внутри команды.
-            if rt.from_user is not None and not rt.from_user.is_bot:
-                # реплай на сообщение человека-админа → не доставляем юзеру,
-                # но не мешаем топик-режиму если target_uid уже установлен
-                pass  # target_uid остаётся None (или уже задан топиком)
-            else:
-                async with Session() as s:
-                    mp = await s.scalar(select(MsgMap).where(
-                        MsgMap.bot_id == bot_db_id,
-                        MsgMap.admin_chat_msg_id == rt.message_id
-                    ).order_by(MsgMap.id.desc()))
-                if mp:
-                    # БАГ (по запросу): сообщения-шапки (хедеры), которые бот
-                    # отправляет в админ-чат сам, тоже попадают в MsgMap, но с
-                    # user_chat_msg_id=None (у них нет «оригинала» у юзера).
-                    # Раньше ответ на такую шапку всё равно приводил к тому, что
-                    # target_uid устанавливался и сообщение улетало пользователю,
-                    # хотя админ явно отвечал на системное сообщение бота, а не
-                    # на реплику пользователя.
-                    # Теперь: если mp.user_chat_msg_id is None — это шапка или
-                    # служебная запись; target_uid по ней НЕ ставим (оставляем
-                    # None) чтобы сообщение НЕ доставлялось пользователю.
-                    # Исключение: топик-режим, когда target_uid уже установлен
-                    # через message_thread_id — тогда reply_params всё равно не
-                    # добавляем (нет user_chat_msg_id), но deliver разрешаем.
-                    if mp.user_chat_msg_id is not None:
-                        target_uid = target_uid or mp.user_id
-                        # reply-контекст в обратную сторону: юзер видит, на какое
-                        # его сообщение ответил админ.
-                        if mp.user_id == target_uid:
-                            reply_params = ReplyParameters(message_id=mp.user_chat_msg_id)
-                    elif not target_uid:
-                        # шапка без user_chat_msg_id, топик тоже не дал uid —
-                        # ничего пользователю не отправляем
-                        pass  # target_uid остаётся None → return ниже
+            async with Session() as s:
+                mp = await s.scalar(select(MsgMap).where(
+                    MsgMap.bot_id == bot_db_id,
+                    MsgMap.admin_chat_msg_id == m.reply_to_message.message_id
+                ).order_by(MsgMap.id.desc()))
+            if mp:
+                # БАГ (по запросу): сообщения-шапки (хедеры), которые бот
+                # отправляет в админ-чат сам, тоже попадают в MsgMap, но с
+                # user_chat_msg_id=None (у них нет «оригинала» у юзера).
+                # Раньше ответ на такую шапку всё равно приводил к тому, что
+                # target_uid устанавливался и сообщение улетало пользователю,
+                # хотя админ явно отвечал на системное сообщение бота, а не
+                # на реплику пользователя.
+                # Теперь: если mp.user_chat_msg_id is None — это шапка или
+                # служебная запись; target_uid по ней НЕ ставим (оставляем
+                # None) чтобы сообщение НЕ доставлялось пользователю.
+                # Исключение: топик-режим, когда target_uid уже установлен
+                # через message_thread_id — тогда reply_params всё равно не
+                # добавляем (нет user_chat_msg_id), но deliver разрешаем.
+                if mp.user_chat_msg_id is not None:
+                    target_uid = target_uid or mp.user_id
+                    # reply-контекст в обратную сторону: юзер видит, на какое
+                    # его сообщение ответил админ.
+                    if mp.user_id == target_uid:
+                        reply_params = ReplyParameters(message_id=mp.user_chat_msg_id)
+                elif not target_uid:
+                    # шапка без user_chat_msg_id, топик тоже не дал uid —
+                    # ничего пользователю не отправляем
+                    pass  # target_uid остаётся None → return ниже
         if not target_uid:
             return
         try:
@@ -2014,3 +1998,4 @@ def build_common_router() -> Router:
         await m.answer(text)
 
     return r
+
