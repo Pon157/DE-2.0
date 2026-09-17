@@ -241,7 +241,9 @@ class St(StatesGroup):
     anon_no_btn_text = State()
     anon_no_btn_style = State()
     anon_no_btn_icon = State()
-    # кнопка закрыть обращение (для posting ботов тоже)
+    # тексты уведомлений предложки
+    sugg_approved_text = State()
+    sugg_rejected_text = State()
 
 
 HEADER_MODE_LABELS = {
