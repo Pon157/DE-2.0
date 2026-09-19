@@ -821,20 +821,23 @@ def build_posting_router() -> Router:
         # Если включена анонимная предложка — сохраняем сообщение и спрашиваем
         anon_enabled = getattr(cfg, "anon_suggestion_enabled", False)
         if anon_enabled and cfg.accept_suggestions:
-            # Сохраняем сообщение для последующей обработки
-            _pending_anon_msgs[m.from_user.id] = ([m], bot_db_id)
-            
-            ask_text = getattr(cfg, "anon_suggestion_ask_text", "Как хотите отправить предложку?")
-            yes_btn = getattr(cfg, "anon_yes_button_text", None) or "🕵️ Анонимно"
-            no_btn = getattr(cfg, "anon_no_button_text", None) or "👤 От моего имени"
-            
-            await m.answer(
-                ask_text,
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                    styled_button(yes_btn, callback_data=f"anon_yes:{m.from_user.id}"),
-                    styled_button(no_btn, callback_data=f"anon_no:{m.from_user.id}"),
-                ]])
-            )
+            # ФИКС: buffer_or_process сначала собирает весь альбом, затем
+            # сохраняет полный список в _pending_anon_msgs и задаёт вопрос.
+            # Раньше сохранялся только [m] — альбомы из нескольких фото/видео
+            # терялись, в админ-чат приходило только первое вложение.
+            async def _ask_anon(msgs: list[Message]):
+                _pending_anon_msgs[m.from_user.id] = (msgs, bot_db_id)
+                ask_text = getattr(cfg, "anon_suggestion_ask_text", None)                     or "Как хотите отправить предложку?"
+                yes_btn = getattr(cfg, "anon_yes_button_text", None) or "🕵️ Анонимно"
+                no_btn = getattr(cfg, "anon_no_button_text", None) or "👤 От моего имени"
+                await m.answer(
+                    ask_text,
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                        styled_button(yes_btn, callback_data=f"anon_yes:{m.from_user.id}"),
+                        styled_button(no_btn, callback_data=f"anon_no:{m.from_user.id}"),
+                    ]])
+                )
+            await buffer_or_process(m, _ask_anon)
             return
 
         async def _process(msgs: list[Message]):
@@ -842,37 +845,34 @@ def build_posting_router() -> Router:
 
         await buffer_or_process(m, _process)
 
-    # -------- Выбор анонимности (новая логика) --------
+    # -------- Выбор анонимности --------
     @r.callback_query(F.data.startswith(("anon_yes:", "anon_no:")))
     async def anon_choice_cb(c: CallbackQuery, bot: Bot):
         is_anon = c.data.startswith("anon_yes:")
         user_id = int(c.data.split(":")[-1])
-        
-        # Проверяем что это тот же пользователь
+
         if c.from_user.id != user_id:
             await c.answer("Не ваша кнопка", show_alert=True)
             return
-        
-        # Берём сохранённые сообщения
+
         if user_id not in _pending_anon_msgs:
             await c.answer("Сообщение истекло, пришлите ещё раз", show_alert=True)
             return
-        
+
         msgs, bot_db_id = _pending_anon_msgs.pop(user_id)
         cfg = await _cfg(bot_db_id)
-        
+
         try:
             await c.message.edit_reply_markup(reply_markup=None)
         except Exception:
             pass
-        
+
         await c.answer()
-        
-        # Релеим с флагом анонимности
-        async def _process(msgs_list: list[Message]):
-            await _relay_to_admins(msgs_list, bot, cfg, bot_db_id, is_anon=is_anon)
-        
-        await buffer_or_process(msgs[0], _process)
+
+        # ФИКС: msgs уже полностью собраны buffer_or_process в incoming(),
+        # повторный вызов buffer_or_process(msgs[0], ...) пересобирал бы буфер
+        # из одного сообщения и снова терял альбом. Передаём напрямую.
+        await _relay_to_admins(msgs, bot, cfg, bot_db_id, is_anon=is_anon)
 
     async def _relay_to_admins(msgs: list[Message], bot: Bot, cfg: ChildBot, bot_db_id: int,
                                is_anon: bool = False):
