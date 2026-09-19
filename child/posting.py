@@ -818,30 +818,47 @@ def build_posting_router() -> Router:
         if not cfg.admin_chat_id:
             return
 
-        # ФИКС (баг 2а): если у пользователя открыт тикет через кнопку обращения —
-        # его сообщения должны идти как обычные тикет-сообщения, а не как предложка.
-        # Раньше проверки тикета не было: при anon_enabled=True любое сообщение
-        # после нажатия кнопки обращения вызывало вопрос «анонимно/не анонимно».
+        # Смотрим есть ли у пользователя открытый тикет и какого типа он.
+        # subject != None  → тикет открыт кнопкой обращения → обычный тикет
+        # subject == None  → тикет открыт предложкой       → продолжение предложки
+        # тикета нет       → первое сообщение               → спрашиваем анон/не анон
         async with Session() as s:
-            open_ticket = await s.scalar(
+            existing_ticket = await s.scalar(
                 select(Ticket).where(
                     Ticket.bot_id == bot_db_id,
                     Ticket.user_id == m.from_user.id,
                     Ticket.is_open
                 )
             )
-        has_open_ticket = open_ticket is not None
 
-        # Если у пользователя есть открытый тикет — релеим как обычное тикет-сообщение,
-        # анон-предложка не применяется.
-        if has_open_ticket:
+        if existing_ticket is not None and existing_ticket.subject is not None:
+            # Тикет открыт кнопкой обращения — сообщения идут как обычный тикет,
+            # без анон-вопроса и без кнопок принять/отклонить.
             async def _process_ticket(msgs: list[Message]):
                 await relay_to_admin_chat(msgs, bot, cfg)
             await buffer_or_process(m, _process_ticket)
             return
 
-        # ФИКС (баг 2б): пропускаем анон-блок для самих админов бота.
-        # Раньше проверки не было — владелец/админ получал вопрос анон/не анон.
+        if existing_ticket is not None and existing_ticket.subject is None:
+            # Тикет открыт предложкой — следующие сообщения тоже предложки,
+            # каждое приходит в админку с кнопками принять/отклонить.
+            # Анон-вопрос не задаём: анонимность наследуем из последнего Suggestion.
+            async with Session() as s:
+                last_sg = await s.scalar(
+                    select(Suggestion)
+                    .where(Suggestion.bot_id == bot_db_id,
+                           Suggestion.user_id == m.from_user.id)
+                    .order_by(Suggestion.id.desc())
+                    .limit(1)
+                )
+            inherited_anon = last_sg.is_anonymous if last_sg else False
+            async def _process_sugg(msgs: list[Message]):
+                await _relay_to_admins(msgs, bot, cfg, bot_db_id, is_anon=inherited_anon)
+            await buffer_or_process(m, _process_sugg)
+            return
+
+        # Тикета нет — это первое сообщение. Если анон-предложка включена и
+        # пользователь не админ — спрашиваем анон/не анон.
         anon_enabled = getattr(cfg, "anon_suggestion_enabled", False)
         user_is_admin = await is_bot_admin(bot_db_id, m.from_user.id)
         if anon_enabled and cfg.accept_suggestions and not user_is_admin:
@@ -860,6 +877,7 @@ def build_posting_router() -> Router:
             await buffer_or_process(m, _ask_anon)
             return
 
+        # Анон-предложка выключена или пользователь — админ: релеим напрямую.
         async def _process(msgs: list[Message]):
             await _relay_to_admins(msgs, bot, cfg, bot_db_id, is_anon=False)
 
