@@ -265,17 +265,19 @@ def kb(rows):
     return InlineKeyboardMarkup(inline_keyboard=[[_btn(item) for item in row] for row in rows])
 
 
-def nav_kb(bot_id: int, back_data: str | None = None):
+def nav_kb(bot_id: int, back_data: str | None = None, section: str | None = None):
     """Клавиатура ПОСЛЕ сохранения настройки.
-
-    БАГ UX: раньше после каждого «Сохранено!» не было ни одной кнопки —
-    чтобы продолжить настройку, приходилось заново заходить в меню бота с
-    самого начала. Теперь после каждого сохранения есть быстрый возврат.
+    back_data — кнопка «Назад» в конкретный под-экран (напр. anonsuggbtn:42).
+    section   — если задан, кнопка «📂 К разделу» ведёт в cfg_s:{bot_id}:{section}.
     """
     rows = []
     if back_data:
         rows.append([("⬅️ Назад", back_data)])
-    rows.append([("⚙️ Настройки", f"cfg:{bot_id}")])
+    if section:
+        rows.append([("📂 К разделу", f"cfg_s:{bot_id}:{section}"),
+                     ("⚙️ Все разделы", f"cfg:{bot_id}")])
+    else:
+        rows.append([("⚙️ Настройки", f"cfg:{bot_id}")])
     rows.append([("🤖 Меню бота", f"bot:{bot_id}")])
     return kb(rows)
 
@@ -686,118 +688,45 @@ async def cfg_menu(c: CallbackQuery):
     bot_id = int(c.data.split(":")[1])
     cb, is_owner = await _access(bot_id, c.from_user.id)
     if not cb or not is_owner:
-        await c.answer("Только владелец", show_alert=True); return
+        await c.answer("Только владелец", show_alert=True)
+        return
     owner_is_pro = await referrals.is_pro(cb.owner_id)
-    header_label = HEADER_MODE_LABELS.get(cb.header_mode or "separate", "отдельным сообщением")
+
     if cb.bot_type == BotType.feedback:
         rows = [
-            [("✉️ Открытие обращений: " + cb.open_mode.value, f"cyc_open:{bot_id}")],
-            [(f"📨 Пересылка сообщений в чат админов: {cb.forward_mode.value}", f"cyc_fwd:{bot_id}")],
-            [("🧵 Топики: " + ("вкл" if cb.use_topics else "выкл"), f"cyc_topics:{bot_id}"),
-             ("🧵 Имя топика", f"topicname:{bot_id}"), ("Цвет топика", f"topicicon:{bot_id}")],
-            [(f"📌 Закреп 1-го сообщения (без топиков): {'вкл' if cb.pin_first_message else 'выкл'}",
-              f"cyc_pinfirst:{bot_id}")],
-            [("👋 Приветствие", f"welcome:{bot_id}"),
-             ("🏷 Шаблон шапки", f"header:{bot_id}")],
-            [("🎆 Эффект приветствия", f"welcomefx:{bot_id}"),
-             ("🎭 Стартовый стикер", f"welcomesticker:{bot_id}")],
-            [(f"🏷 Шапка: {header_label}", f"cyc_header:{bot_id}")],
-            [("🏠 Чат админов", f"admchat:{bot_id}"),
-             (f"⚠️ Лимит варнов: {cb.warn_limit}", f"warnlim:{bot_id}")],
-            [("⭐️ Донат: " + ("вкл" if cb.donate_enabled else "выкл"), f"cyc_donate:{bot_id}")],
-            [("⭐️ Тип кнопки доната: " + cb.donate_button_type, f"cyc_donbtn:{bot_id}")],
-            [("✉️ Кнопка обращения", f"ticketbtn:{bot_id}")],
-            [("❌ Кнопка «Закрыть обращение» (текст/цвет/эмодзи/удаление)", f"closebtn:{bot_id}")],
-            [("🔒 Кнопка закрытия в admin-чате (inline)", f"admin_closebtn:{bot_id}")],
-            [("⭐️ Текст/цвет/эмодзи кнопки доната", f"donatebtn:{bot_id}")],
-            [("🔄 Restart/кнопка: " + ("новый тикет" if cb.always_new_ticket else "тот же тикет"),
-              f"cyc_newticket:{bot_id}")],
-            [(f"🛡 Антиспам: {'вкл' if cb.antispam_enabled else 'выкл'}", f"cyc_antispam:{bot_id}"),
-             ("🛡 Пороги", f"antispamcfg:{bot_id}")],
-            [(f"🛡 Антиспам трогает владельца: {'нет' if cb.antispam_ignore_owner else 'да'}",
-              f"cyc_aspown:{bot_id}")],
-            [(f"🔇 Автомут за маты: {'вкл' if getattr(cb, 'profanity_mute_enabled', False) else 'выкл'}",
-              f"cyc_profmute:{bot_id}"),
-             (f"⏱ Время мута: {getattr(cb, 'profanity_mute_duration', '1h') or '1h'}",
-              f"profmutedur:{bot_id}")],
-            [("📝 Доп. слова для мута", f"profmutewords:{bot_id}")],
-            [("🔒 Текст закрытия обращения", f"closenotify:{bot_id}")],
-            [(f"👍 Реакция на ответ админа: {cb.admin_reply_reaction or 'выкл'}",
-              f"adminreaction:{bot_id}")],
-            [("💬 Автоответы", f"ar_list:{bot_id}")],
-            [(f"🔨 Подтверждать бан: {'вкл' if getattr(cb, 'ban_confirm_enabled', False) else 'выкл'}",
-              f"cyc_banconfirm:{bot_id}")],
-            [(f"ℹ️ /info доступна: {'всем' if getattr(cb, 'info_access', 'admins') == 'all' else 'только админам'}",
-              f"cyc_infoaccess:{bot_id}")],
+            [("✉️ Обращения",           f"cfg_s:{bot_id}:tickets"),
+             ("👋 Приветствие",          f"cfg_s:{bot_id}:welcome")],
+            [("🛡 Антиспам / модерация", f"cfg_s:{bot_id}:antispam"),
+             ("⭐️ Донат",                f"cfg_s:{bot_id}:donate")],
+            [("🧵 Топики и чат",         f"cfg_s:{bot_id}:topics"),
+             ("💬 Автоответы",            f"ar_list:{bot_id}")],
         ]
     elif cb.bot_type == BotType.survey:
         rows = [
-            [("👋 Приветствие", f"welcome:{bot_id}"),
-             ("🎆 Эффект приветствия", f"welcomefx:{bot_id}"),
-             ("🎭 Стартовый стикер", f"welcomesticker:{bot_id}")],
-            [("📋 Анкеты (вопросы)", f"surveys:{bot_id}")],
-            [("✅ Текст после заполнения анкеты", f"surveyfinish:{bot_id}")],
-            [("🏠 Чат админов (куда приходят заполненные анкеты)", f"admchat:{bot_id}")],
-            # НОВОЕ (по запросу): в ботах-анкетницах теперь можно ответить
-            # тому, кто прислал анкету — реплаем на его анкету в чате
-            # админов, как в фидбек-ботах (см. child/survey.py::admin_reply).
-            [(f"💬 Диалог с респондентами: {'вкл' if cb.survey_dialog_enabled else 'выкл'}",
-              f"cyc_surveydialog:{bot_id}")],
-            [("🧵 Топики: " + ("вкл" if cb.use_topics else "выкл"), f"cyc_topics:{bot_id}"),
-             ("🧵 Имя топика", f"topicname:{bot_id}"), ("🧵 Иконка топика", f"topicicon:{bot_id}")],
-            [(f"⚠️ Лимит варнов: {cb.warn_limit}", f"warnlim:{bot_id}")],
-            [(f"🛡 Антиспам: {'вкл' if cb.antispam_enabled else 'выкл'}", f"cyc_antispam:{bot_id}"),
-             ("🛡 Пороги", f"antispamcfg:{bot_id}")],
-            [(f"🛡 Антиспам трогает владельца: {'нет' if cb.antispam_ignore_owner else 'да'}",
-              f"cyc_aspown:{bot_id}")],
-            [(f"👍 Реакция на ответ админа: {cb.admin_reply_reaction or 'выкл'}",
-              f"adminreaction:{bot_id}")],
-            [(f"🔨 Подтверждать бан: {'вкл' if getattr(cb, 'ban_confirm_enabled', False) else 'выкл'}",
-              f"cyc_banconfirm:{bot_id}")],
-            [(f"ℹ️ /info доступна: {'всем' if getattr(cb, 'info_access', 'admins') == 'all' else 'только админам'}",
-              f"cyc_infoaccess:{bot_id}")],
+            [("👋 Приветствие",          f"cfg_s:{bot_id}:welcome"),
+             ("📋 Анкеты",               f"surveys:{bot_id}")],
+            [("🧵 Топики и чат",         f"cfg_s:{bot_id}:topics"),
+             ("🛡 Антиспам / модерация", f"cfg_s:{bot_id}:antispam")],
         ]
-    else:
+    else:  # posting
         rows = [
-            [("📮 Предложка: " + ("вкл" if cb.accept_suggestions else "выкл"),
-              f"cyc_sugg:{bot_id}")],
-            [("👋 Приветствие", f"welcome:{bot_id}"),
-             ("🎆 Эффект приветствия", f"welcomefx:{bot_id}"),
-             ("🎭 Стартовый стикер", f"welcomesticker:{bot_id}")],
-            [("🎨 Шаблон поста", f"template:{bot_id}"), ("🔘 Кнопки шаблона", f"tplbtn:{bot_id}")],
-            [("📡 Канал", f"channel:{bot_id}"), ("🏠 Чат админов", f"admchat:{bot_id}")],
-            [(f"📨 Пересылка предложки в чат админов: {cb.forward_mode.value}", f"cyc_fwd:{bot_id}")],
-            [(f"🏷 Шапка: {header_label}", f"cyc_header:{bot_id}"),
-             ("🏷 Шаблон шапки", f"header:{bot_id}")],
-            [("🧵 Топики в чате админов: " + ("вкл" if cb.use_topics else "выкл"),
-              f"cyc_topics:{bot_id}"), ("🧵 Имя топика", f"topicname:{bot_id}"), ("🧵 Иконка топика", f"topicicon:{bot_id}")],
-            [("📬 Контент поста: " + ("по шаблону" if cb.channel_delivery_mode == "template" else "оригинал"),
-              f"cyc_delivery:{bot_id}")],
-            [(f"📤 ПУБЛИКАЦИЯ В КАНАЛ: {'пересылка (Forwarded from)' if cb.channel_publish_mode == 'forward' else 'копия (без пометки)'}",
-              f"cyc_pubmode:{bot_id}")],
-            [(f"⚠️ Лимит варнов: {cb.warn_limit}", f"warnlim:{bot_id}")],
-            [(f"🛡 Антиспам: {'вкл' if cb.antispam_enabled else 'выкл'}", f"cyc_antispam:{bot_id}"),
-             ("🛡 Пороги", f"antispamcfg:{bot_id}")],
-            [(f"🛡 Антиспам трогает владельца: {'нет' if cb.antispam_ignore_owner else 'да'}",
-              f"cyc_aspown:{bot_id}")],
-            [(f"🔨 Подтверждать бан: {'вкл' if getattr(cb, 'ban_confirm_enabled', False) else 'выкл'}",
-              f"cyc_banconfirm:{bot_id}")],
-            [(f"ℹ️ /info доступна: {'всем' if getattr(cb, 'info_access', 'admins') == 'all' else 'только админам'}",
-              f"cyc_infoaccess:{bot_id}")],
-            [(f"🕵️ Анонимная предложка: {'вкл' if getattr(cb, 'anon_suggestion_enabled', False) else 'выкл'}",
-              f"cyc_anonsugg:{bot_id}")],
-            [("🕵️ Кнопки анонимной предложки (текст/цвет/эмодзи)", f"anonsuggbtn:{bot_id}")],
-            [(f"❌ Кнопка «Закрыть обращение» (текст/цвет/эмодзи/удаление)", f"closebtn:{bot_id}")],
-            [("✅ Текст при одобрении предложки", f"suggapprovedtext:{bot_id}")],
-            [("❌ Текст при отклонении предложки", f"suggrejectedtext:{bot_id}")],
+            [("📮 Предложка",            f"cfg_s:{bot_id}:suggestions"),
+             ("👋 Приветствие",          f"cfg_s:{bot_id}:welcome")],
+            [("📡 Канал и публикация",   f"cfg_s:{bot_id}:channel"),
+             ("🧵 Топики и чат",         f"cfg_s:{bot_id}:topics")],
+            [("🛡 Антиспам",             f"cfg_s:{bot_id}:antispam")],
         ]
+
     if owner_is_pro:
         flow_url = f"{FLOW_MINIAPP_URL}?bot_id={bot_id}"
         rows.append([("⚡ Сценарии (Pro)", "web_app", flow_url)])
     else:
         rows.append([("⚡ Сценарии (только Pro)", f"scenarios_nopro:{bot_id}")])
     rows.append([("⬅️ Назад", f"bot:{bot_id}")])
-    await c.message.edit_text(f"⚙️ Настройки @{cb.username}", reply_markup=kb(rows))
+
+    await c.message.edit_text(
+        f"⚙️ Настройки @{cb.username} — выберите раздел:",
+        reply_markup=kb(rows))
     await c.answer()
 
 
@@ -808,6 +737,140 @@ async def scenarios_nopro(c: CallbackQuery):
         "Оформите Pro в главном меню чтобы получить доступ к визуальному редактору флоу.",
         show_alert=True,
     )
+
+
+@router.callback_query(F.data.startswith("cfg_s:"))
+async def cfg_section(c: CallbackQuery):
+    parts = c.data.split(":", 2)
+    bot_id = int(parts[1])
+    section = parts[2]
+    cb, is_owner = await _access(bot_id, c.from_user.id)
+    if not cb or not is_owner:
+        await c.answer("Только владелец", show_alert=True)
+        return
+    owner_is_pro = await referrals.is_pro(cb.owner_id)
+    header_label = HEADER_MODE_LABELS.get(cb.header_mode or "separate", "отдельным сообщением")
+    back = [("⬅️ К разделам", f"cfg:{bot_id}")]
+
+    if section == "tickets":
+        rows = [
+            [("✉️ Открытие: " + cb.open_mode.value,           f"cyc_open:{bot_id}")],
+            [("📨 Пересылка в чат: " + cb.forward_mode.value,  f"cyc_fwd:{bot_id}")],
+            [("📌 Закреп 1-го сообщ.: " + ("вкл" if cb.pin_first_message else "выкл"),
+              f"cyc_pinfirst:{bot_id}")],
+            [("🔄 По /restart: " + ("новый тикет" if cb.always_new_ticket else "тот же"),
+              f"cyc_newticket:{bot_id}")],
+            [("✉️ Кнопка обращения",        f"ticketbtn:{bot_id}"),
+             ("❌ Кнопка закрытия",          f"closebtn:{bot_id}")],
+            [("🔒 Кнопка закрытия в чате",  f"admin_closebtn:{bot_id}")],
+            [("🔒 Текст закрытия",           f"closenotify:{bot_id}")],
+            [("👍 Реакция на ответ: " + (cb.admin_reply_reaction or "выкл"),
+              f"adminreaction:{bot_id}")],
+            [("ℹ️ /info: " + ("всем" if getattr(cb, "info_access", "admins") == "all"
+               else "только админам"), f"cyc_infoaccess:{bot_id}")],
+            back,
+        ]
+
+    elif section == "welcome":
+        rows = [
+            [("👋 Текст приветствия",  f"welcome:{bot_id}"),
+             ("🎭 Стартовый стикер",   f"welcomesticker:{bot_id}")],
+            [("🎆 Эффект приветствия", f"welcomefx:{bot_id}")],
+        ]
+        if cb.bot_type != BotType.survey:
+            rows.append([("🏷 Шапка: " + header_label, f"cyc_header:{bot_id}"),
+                         ("🏷 Шаблон шапки",            f"header:{bot_id}")])
+        rows.append(back)
+
+    elif section == "antispam":
+        rows = [
+            [(f"🛡 Антиспам: {'вкл' if cb.antispam_enabled else 'выкл'}",
+              f"cyc_antispam:{bot_id}"),
+             ("🛡 Пороги", f"antispamcfg:{bot_id}")],
+            [(f"🛡 Трогает владельца: {'нет' if cb.antispam_ignore_owner else 'да'}",
+              f"cyc_aspown:{bot_id}")],
+            [(f"⚠️ Лимит варнов: {cb.warn_limit}", f"warnlim:{bot_id}")],
+        ]
+        if cb.bot_type == BotType.feedback:
+            rows += [
+                [(f"🔇 Автомут за маты: {'вкл' if getattr(cb, 'profanity_mute_enabled', False) else 'выкл'}",
+                  f"cyc_profmute:{bot_id}"),
+                 (f"⏱ Мут: {getattr(cb, 'profanity_mute_duration', '1h') or '1h'}",
+                  f"profmutedur:{bot_id}")],
+                [("📝 Доп. слова для мута", f"profmutewords:{bot_id}")],
+                [(f"🔨 Подтверждать бан: {'вкл' if getattr(cb, 'ban_confirm_enabled', False) else 'выкл'}",
+                  f"cyc_banconfirm:{bot_id}")],
+            ]
+        rows.append(back)
+
+    elif section == "donate":
+        rows = [
+            [("⭐️ Донат: " + ("вкл" if cb.donate_enabled else "выкл"),
+              f"cyc_donate:{bot_id}")],
+            [("⭐️ Тип кнопки: " + cb.donate_button_type, f"cyc_donbtn:{bot_id}")],
+            [("⭐️ Текст / цвет / эмодзи кнопки", f"donatebtn:{bot_id}")],
+            back,
+        ]
+
+    elif section == "topics":
+        rows = [
+            [("🏠 Чат админов", f"admchat:{bot_id}")],
+            [("🧵 Топики: " + ("вкл" if cb.use_topics else "выкл"), f"cyc_topics:{bot_id}"),
+             ("🧵 Имя топика", f"topicname:{bot_id}")],
+            [("🧵 Иконка / цвет топика" + ("" if owner_is_pro else " (Pro)"),
+              f"topicicon:{bot_id}")],
+        ]
+        if cb.bot_type == BotType.survey:
+            rows.append([(f"💬 Диалог с респондентами: {'вкл' if cb.survey_dialog_enabled else 'выкл'}",
+                          f"cyc_surveydialog:{bot_id}")])
+        rows.append(back)
+
+    elif section == "suggestions":
+        rows = [
+            [("📮 Предложка: " + ("вкл" if cb.accept_suggestions else "выкл"),
+              f"cyc_sugg:{bot_id}")],
+            [("📨 Пересылка в чат: " + cb.forward_mode.value, f"cyc_fwd:{bot_id}")],
+            [(f"🕵️ Анонимная: {'вкл' if getattr(cb, 'anon_suggestion_enabled', False) else 'выкл'}",
+              f"cyc_anonsugg:{bot_id}"),
+             ("🕵️ Кнопки анон-предложки", f"anonsuggbtn:{bot_id}")],
+            [("✅ Текст при одобрении",  f"suggapprovedtext:{bot_id}"),
+             ("❌ Текст при отклонении", f"suggrejectedtext:{bot_id}")],
+            back,
+        ]
+
+    elif section == "channel":
+        rows = [
+            [("📡 Канал", f"channel:{bot_id}")],
+            [("🎨 Шаблон поста", f"template:{bot_id}"),
+             ("🔘 Кнопки шаблона", f"tplbtn:{bot_id}")],
+            [("🏷 Шапка: " + header_label, f"cyc_header:{bot_id}"),
+             ("🏷 Шаблон шапки",           f"header:{bot_id}")],
+            [("📬 Контент: " + ("по шаблону" if cb.channel_delivery_mode == "template" else "оригинал"),
+              f"cyc_delivery:{bot_id}")],
+            [("📤 Публикация: " + ("пересылка" if cb.channel_publish_mode == "forward" else "копия"),
+              f"cyc_pubmode:{bot_id}")],
+            [("❌ Кнопка закрытия", f"closebtn:{bot_id}")],
+            back,
+        ]
+
+    else:
+        await c.answer("Неизвестный раздел", show_alert=True)
+        return
+
+    TITLES = {
+        "tickets":     "✉️ Обращения",
+        "welcome":     "👋 Приветствие",
+        "antispam":    "🛡 Антиспам и модерация",
+        "donate":      "⭐️ Донат",
+        "topics":      "🧵 Топики и чат",
+        "suggestions": "📮 Предложка",
+        "channel":     "📡 Канал и публикация",
+    }
+    title = TITLES.get(section, section)
+    await c.message.edit_text(
+        f"⚙️ @{cb.username} → {title}",
+        reply_markup=kb(rows))
+    await c.answer()
 
 
 # --- циклические переключатели ---
@@ -834,6 +897,27 @@ CYCLES = {
 }
 
 
+_CYCLE_SECTION: dict[str, str] = {
+    "cyc_open":         "tickets",
+    "cyc_pinfirst":     "tickets",
+    "cyc_newticket":    "tickets",
+    "cyc_infoaccess":   "tickets",
+    "cyc_donate":       "donate",
+    "cyc_donbtn":       "donate",
+    "cyc_sugg":         "suggestions",
+    "cyc_anonsugg":     "suggestions",
+    "cyc_delivery":     "channel",
+    "cyc_pubmode":      "channel",
+    "cyc_header":       "welcome",
+    "cyc_topics":       "topics",
+    "cyc_surveydialog": "topics",
+    "cyc_antispam":     "antispam",
+    "cyc_aspown":       "antispam",
+    "cyc_profmute":     "antispam",
+    "cyc_banconfirm":   "antispam",
+}
+
+
 @router.callback_query(F.data.regexp(r"^cyc_\w+:\d+$"))
 async def cycle(c: CallbackQuery):
     key, bot_id = c.data.split(":")
@@ -849,9 +933,17 @@ async def cycle(c: CallbackQuery):
                 if cur in values else values[0])
         await s.commit()
 
-    # Копируем модель, чтобы избежать ошибки Frozen Instance
-    c_new = c.model_copy(update={"data": f"cfg:{bot_id}"})
-    await cfg_menu(c_new)
+    if key == "cyc_fwd":
+        section = "suggestions" if cb.bot_type == BotType.posting else "tickets"
+    else:
+        section = _CYCLE_SECTION.get(key)
+
+    if section:
+        c_new = c.model_copy(update={"data": f"cfg_s:{bot_id}:{section}"})
+        await cfg_section(c_new)
+    else:
+        c_new = c.model_copy(update={"data": f"cfg:{bot_id}"})
+        await cfg_menu(c_new)
 
 
 # --- приветствие (с фото и премиум-эмодзи!) ---
@@ -899,7 +991,7 @@ async def welcome_save(m: Message, state: FSMContext):
         obj.welcome_photo = welcome_photo
         await s.commit()
     await state.clear()
-    await m.answer(f"{em('check')} Приветствие сохранено!", reply_markup=nav_kb(bot_id))
+    await m.answer(f"{em('check')} Приветствие сохранено!", reply_markup=nav_kb(bot_id, section="welcome"))
 
 
 # --- НОВОЕ: эффект на приветственном сообщении (message_effect_id, Bot API,
@@ -962,7 +1054,7 @@ async def welcome_sticker_save(m: Message, state: FSMContext):
             await m.answer(f"{em('warn')} Пришлите стикер или напишите «удалить».")
             return
     await state.clear()
-    await m.answer(f"{em('check')} Стартовый стикер сохранён!", reply_markup=nav_kb(bot_id))
+    await m.answer(f"{em('check')} Стартовый стикер сохранён!", reply_markup=nav_kb(bot_id, section="welcome"))
 
 
 
@@ -1003,7 +1095,7 @@ async def profmutedur_save(m: Message, state: FSMContext):
         obj.profanity_mute_duration = val
         await s.commit()
     await state.clear()
-    await m.answer(f"{em('check')} Время мута за маты: <code>{val}</code>.", reply_markup=nav_kb(bot_id))
+    await m.answer(f"{em('check')} Время мута за маты: <code>{val}</code>.", reply_markup=nav_kb(bot_id, section="antispam"))
 
 
 @router.callback_query(F.data.startswith("profmutewords:"))
@@ -1038,7 +1130,7 @@ async def profmutewords_save(m: Message, state: FSMContext):
         await s.commit()
     await state.clear()
     msg = "очищен" if val is None else f"сохранён: <code>{val}</code>"
-    await m.answer(f"{em('check')} Список доп. слов {msg}.", reply_markup=nav_kb(bot_id))
+    await m.answer(f"{em('check')} Список доп. слов {msg}.", reply_markup=nav_kb(bot_id, section="antispam"))
 
 
 @router.callback_query(F.data.startswith("welcomefx:"))
@@ -1051,7 +1143,7 @@ async def welcomefx(c: CallbackQuery):
         return
     rows = [[(t, f"setwfx:{bot_id}:{v}")] for t, v in MESSAGE_EFFECTS]
     rows.append([("🚫 Без эффекта", f"setwfx:{bot_id}:off")])
-    rows.append([("⬅️ Назад", f"cfg:{bot_id}")])
+    rows.append([("⬅️ Назад", f"cfg_s:{bot_id}:welcome")])
     await c.message.edit_text(
         f"{em('sparkles')} Эффект на приветственном сообщении (анимация "
         "при получении в личке). Выберите или выключите:",
@@ -1138,7 +1230,7 @@ async def closenotify(c: CallbackQuery, state: FSMContext):
         "(отправьте текст с premium-эмодзи как обычно — они сохранятся).\n\n"
         f"Сейчас: {cur}\n\n"
         "Пришлите новый текст, или /off чтобы вообще отключить уведомление.",
-        reply_markup=kb([[("⬅️ Отмена", f"cfg:{bot_id}")]]))
+        reply_markup=kb([[("⬅️ Отмена", f"cfg_s:{bot_id}:tickets")]]))
     await c.answer()
 
 
@@ -1153,7 +1245,7 @@ async def closenotify_save(m: Message, state: FSMContext):
             await s.commit()
             await state.clear()
             await m.answer(f"{em('check')} Уведомление о закрытии отключено.",
-                           reply_markup=nav_kb(data["bot_id"]))
+                           reply_markup=nav_kb(data["bot_id"], section="tickets"))
             return
         if not m.html_text:
             msg = await m.answer(f"{em('cross')} Нужен текст (или /off). Попробуйте снова.")
@@ -1162,7 +1254,7 @@ async def closenotify_save(m: Message, state: FSMContext):
         obj.close_notify_text = m.html_text
         await s.commit()
     await state.clear()
-    await m.answer(f"{em('check')} Текст сохранён!", reply_markup=nav_kb(data["bot_id"]))
+    await m.answer(f"{em('check')} Текст сохранён!", reply_markup=nav_kb(data["bot_id"], section="tickets"))
 
 
 # ======= Настройка анонимной предложки =======
@@ -1182,7 +1274,7 @@ async def anonsuggbtn_start(c: CallbackQuery):
         [("Вопрос пользователю", f"anonsugg_ask_edit:{bot_id}")],
         [("✏️ Кнопка «Анонимно»", f"anonsugg_yes_edit:{bot_id}"),
          ("✏️ Кнопка «Не анонимно»", f"anonsugg_no_edit:{bot_id}")],
-        [("⬅️ Назад", f"cfg:{bot_id}")],
+        [("⬅️ Назад", f"cfg_s:{bot_id}:suggestions")],
     ]
     
     text = (f"{em('eyes')} <b>Кнопки анонимной предложки</b>\n\n"
@@ -1220,7 +1312,7 @@ async def anonsugg_ask_edit_save(m: Message, state: FSMContext):
         obj.anon_suggestion_ask_text = m.text.strip()
         await s.commit()
     await state.clear()
-    await m.answer(f"{em('check')} Сохранено!", reply_markup=nav_kb(data["bot_id"], f"anonsuggbtn:{data['bot_id']}"))
+    await m.answer(f"{em('check')} Сохранено!", reply_markup=nav_kb(data["bot_id"], f"anonsuggbtn:{data['bot_id']}", section="suggestions"))
 
 
 @router.callback_query(F.data.startswith("anonsugg_yes_edit:"))
@@ -1273,7 +1365,7 @@ async def anonsugg_yes_icon_save(m: Message, state: FSMContext):
         obj.anon_yes_button_style = data.get("style")
         obj.anon_yes_button_icon = icon
         await s.commit()
-    await m.answer(f"{em('check')} Кнопка сохранена!", reply_markup=nav_kb(data["bot_id"], f"anonsuggbtn:{data['bot_id']}"))
+    await m.answer(f"{em('check')} Кнопка сохранена!", reply_markup=nav_kb(data["bot_id"], f"anonsuggbtn:{data['bot_id']}", section="suggestions"))
 
 
 @router.callback_query(F.data.startswith("anonsugg_no_edit:"))
@@ -1326,7 +1418,7 @@ async def anonsugg_no_icon_save(m: Message, state: FSMContext):
         obj.anon_no_button_style = data.get("style")
         obj.anon_no_button_icon = icon
         await s.commit()
-    await m.answer(f"{em('check')} Кнопка сохранена!", reply_markup=nav_kb(data["bot_id"], f"anonsuggbtn:{data['bot_id']}"))
+    await m.answer(f"{em('check')} Кнопка сохранена!", reply_markup=nav_kb(data["bot_id"], f"anonsuggbtn:{data['bot_id']}", section="suggestions"))
 
 
 # ======= Тексты уведомлений предложки =======
@@ -1353,7 +1445,7 @@ async def suggapprovedtext_save(m: Message, state: FSMContext):
         obj.suggestion_approved_text = m.html_text or m.text or ""
         await s.commit()
     await state.clear()
-    await m.answer(f"{em('check')} Текст одобрения сохранён!", reply_markup=nav_kb(data["bot_id"]))
+    await m.answer(f"{em('check')} Текст одобрения сохранён!", reply_markup=nav_kb(data["bot_id"], section="suggestions"))
 
 
 @router.callback_query(F.data.startswith("suggrejectedtext:"))
@@ -1379,7 +1471,7 @@ async def suggrejectedtext_save(m: Message, state: FSMContext):
         obj.suggestion_rejected_text = m.html_text or m.text or ""
         await s.commit()
     await state.clear()
-    await m.answer(f"{em('check')} Текст отклонения сохранён!", reply_markup=nav_kb(data["bot_id"]))
+    await m.answer(f"{em('check')} Текст отклонения сохранён!", reply_markup=nav_kb(data["bot_id"], section="suggestions"))
 
 
 # --- п. "изменение кнопки закрыть обращение" (сама кнопка — текст/цвет/
@@ -1396,7 +1488,7 @@ async def closebtn_start(c: CallbackQuery, state: FSMContext):
     rows = [[("✏️ Изменить текст/цвет/эмодзи", f"closebtn_edit:{bot_id}")]]
     if cb.close_ticket_button_text:
         rows.append([("🗑 Убрать кнопку (останется только /close)", f"closebtn_del:{bot_id}")])
-    rows.append([("⬅️ Назад", f"cfg:{bot_id}")])
+    rows.append([("⬅️ Назад", f"cfg_s:{bot_id}:tickets")])
     await c.message.edit_text(f"Кнопка «Закрыть обращение»: {cur}", reply_markup=kb(rows))
     await c.answer()
 
@@ -1414,8 +1506,8 @@ async def closebtn_del(c: CallbackQuery):
         obj.close_ticket_button_icon = None
         await s.commit()
     await c.answer(f"{em('check')} Кнопка убрана, у пользователя останется только /close", show_alert=True)
-    c_new = c.model_copy(update={"data": f"cfg:{bot_id}"})
-    await cfg_menu(c_new)
+    c_new = c.model_copy(update={"data": f"cfg_s:{bot_id}:tickets"})
+    await cfg_section(c_new)
 
 
 @router.callback_query(F.data.startswith("closebtn_edit:"))
@@ -1474,7 +1566,7 @@ async def closebtn_icon(m: Message, state: FSMContext):
         obj.close_ticket_button_icon = icon_id
         await s.commit()
     await state.clear()
-    await m.answer(f"{em('check')} Кнопка «Закрыть обращение» обновлена!", reply_markup=nav_kb(bot_id))
+    await m.answer(f"{em('check')} Кнопка «Закрыть обращение» обновлена!", reply_markup=nav_kb(bot_id, section="tickets"))
 
 
 # --- кнопка «Закрыть обращение» в ADMIN-ЧАТЕ (inline под каждым сообщением) ---
@@ -1499,7 +1591,7 @@ async def admin_closebtn_start(c: CallbackQuery, state: FSMContext):
         rows.append([("🚫 Убрать кнопку из admin-чата", f"admin_closebtn_del:{bot_id}")])
     if acbt is not None:
         rows.append([("↩️ Вернуть дефолт", f"admin_closebtn_reset:{bot_id}")])
-    rows.append([("⬅️ Назад", f"cfg:{bot_id}")])
+    rows.append([("⬅️ Назад", f"cfg_s:{bot_id}:tickets")])
     await c.message.edit_text(
         f"Кнопка закрытия в <b>admin-чате</b>: {cur}\n\n"
         "Это inline-кнопка под каждым сообщением пользователя в чате с операторами.\n"
@@ -1600,7 +1692,7 @@ async def admin_closebtn_icon(m: Message, state: FSMContext):
     await state.clear()
     await m.answer(
         f"{em('check')} Кнопка закрытия в admin-чате обновлена!",
-        reply_markup=nav_kb(bot_id)
+        reply_markup=nav_kb(bot_id, section="tickets")
     )
 
 
@@ -1660,7 +1752,7 @@ async def donatebtn_icon(m: Message, state: FSMContext):
         obj.donate_button_icon = icon_id
         await s.commit()
     await state.clear()
-    await m.answer(f"{em('check')} Кнопка доната обновлена!", reply_markup=nav_kb(bot_id))
+    await m.answer(f"{em('check')} Кнопка доната обновлена!", reply_markup=nav_kb(bot_id, section="donate"))
 
 
 # --- п.6: реакция на сообщение админа (настраиваемая/отключаемая) ---
@@ -1678,7 +1770,7 @@ async def adminreaction(c: CallbackQuery):
     rows = [[(f"{e}" + (" ✓" if cb.admin_reply_reaction == e else ""), f"setreaction:{bot_id}:{e}")]
             for e in ALLOWED_ADMIN_REACTIONS]
     rows.append([("🚫 Выключить реакцию", f"setreaction:{bot_id}:off")])
-    rows.append([("⬅️ Назад", f"cfg:{bot_id}")])
+    rows.append([("⬅️ Назад", f"cfg_s:{bot_id}:tickets")])
     await c.message.edit_text(
         f"{em('pencil')} Реакция, которой бот отмечает сообщение админа, когда "
         "оно доставлено пользователю. Выберите новую или выключите совсем:",
@@ -1697,8 +1789,8 @@ async def setreaction(c: CallbackQuery):
         obj = await s.get(ChildBot, bot_id)
         obj.admin_reply_reaction = None if value == "off" else value
         await s.commit()
-    c_new = c.model_copy(update={"data": f"cfg:{bot_id}"})
-    await cfg_menu(c_new)
+    c_new = c.model_copy(update={"data": f"cfg_s:{bot_id}:tickets"})
+    await cfg_section(c_new)
 
 
 # --- боты-анкеты: список/CRUD анкет и их вопросов ---
@@ -1938,7 +2030,10 @@ async def set_chat_save(m: Message, state: FSMContext):
             obj.channel_id = chat_id
         await s.commit()
     await state.clear()
-    await m.answer(f"{em('check')} Сохранено!", reply_markup=nav_kb(data["bot_id"]))
+    await m.answer(f"{em('check')} Сохранено!", reply_markup=nav_kb(
+        data["bot_id"],
+        section="channel" if data.get("kind") == "channel" else "topics"
+    ))
 
 
 # --- шапка (шаблон текста) ---
@@ -1979,7 +2074,7 @@ async def header_save(m: Message, state: FSMContext):
         obj.copy_header = m.html_text
         await s.commit()
     await state.clear()
-    await m.answer(f"{em('check')} Шапка сохранена!", reply_markup=nav_kb(data["bot_id"]))
+    await m.answer(f"{em('check')} Шапка сохранена!", reply_markup=nav_kb(data["bot_id"], section="welcome"))
 
 
 # --- имя топика (шаблон) ---
@@ -2017,7 +2112,7 @@ async def topicname_save(m: Message, state: FSMContext):
         obj.topic_name_template = m.text.strip()
         await s.commit()
     await state.clear()
-    await m.answer(f"{em('check')} Имя топика сохранено!", reply_markup=nav_kb(data["bot_id"]))
+    await m.answer(f"{em('check')} Имя топика сохранено!", reply_markup=nav_kb(data["bot_id"], section="topics"))
 
 
 # --- НОВОЕ: иконка форум-топика (premium-эмодзи, create_forum_topic +
@@ -2030,7 +2125,7 @@ async def topicicon(c: CallbackQuery):
         await c.answer("Только владелец", show_alert=True); return
     rows = [[(label, f"settopiccolor:{bot_id}:{color}")] for label, color in TOPIC_COLORS]
     rows.append([("Без цвета (авто)", f"settopiccolor:{bot_id}:off")])
-    rows.append([("Назад", f"cfg:{bot_id}")])
+    rows.append([("⬅️ Назад", f"cfg_s:{bot_id}:topics")])
     cur_color = getattr(cb, "topic_color", None)
     cur_label = next((lbl for lbl, val in TOPIC_COLORS if val == cur_color), "авто")
     await c.message.edit_text(
@@ -2053,7 +2148,7 @@ async def settopiccolor(c: CallbackQuery):
         obj.topic_color = None if val == "off" else int(val)
         await s.commit()
     await c.answer(f"{em('check')} Цвет топика сохранён!")
-    await cfg_menu(c.model_copy(update={"data": f"cfg:{bot_id}"}))
+    await cfg_section(c.model_copy(update={"data": f"cfg_s:{bot_id}:topics"}))
 
 
 @router.callback_query(F.data.startswith("richwelcome:"))
@@ -2098,7 +2193,7 @@ async def template_save(m: Message, state: FSMContext):
         obj.post_template = m.html_text
         await s.commit()
     await state.clear()
-    await m.answer(f"{em('check')} Шаблон сохранён!", reply_markup=nav_kb(data["bot_id"]))
+    await m.answer(f"{em('check')} Шаблон сохранён!", reply_markup=nav_kb(data["bot_id"], section="channel"))
 
 
 @router.callback_query(F.data.startswith("warnlim:"))
@@ -2124,7 +2219,7 @@ async def warnlim_save(m: Message, state: FSMContext):
         obj.warn_limit = int(m.text)
         await s.commit()
     await state.clear()
-    await m.answer(f"{em('check')} Лимит варнов: {m.text}", reply_markup=nav_kb(data["bot_id"]))
+    await m.answer(f"{em('check')} Лимит варнов: {m.text}", reply_markup=nav_kb(data["bot_id"], section="antispam"))
 
 
 # ================== кнопки и команды ==================
@@ -2452,7 +2547,7 @@ async def ticketbtn_icon(m: Message, state: FSMContext):
         obj.ticket_button_icon = icon_id
         await s.commit()
     await state.clear()
-    await m.answer(f"{em('check')} Кнопка обращения обновлена!", reply_markup=nav_kb(bot_id))
+    await m.answer(f"{em('check')} Кнопка обращения обновлена!", reply_markup=nav_kb(bot_id, section="tickets"))
 
 
 # --- кнопки шаблона (появляются на КАЖДОМ посте постинг-бота) ---
@@ -2466,7 +2561,7 @@ async def tplbtn_menu(c: CallbackQuery):
     flat = [b for row in rows_data for b in row]
     rows = [[(f"🗑 {b['text']}", f"tpldel:{bot_id}:{i}")] for i, b in enumerate(flat)]
     rows.append([("➕ Добавить кнопку", f"tpladd:{bot_id}")])
-    rows.append([("⬅️ Назад", f"cfg:{bot_id}")])
+    rows.append([("⬅️ Назад", f"cfg_s:{bot_id}:channel")])
     await c.message.edit_text(
         f"{em('link')} Кнопки шаблона — добавляются к КАЖДОМУ посту "
         "автоматически (для конкретного поста источник кнопок можно "
@@ -2726,7 +2821,7 @@ async def antispamcfg_save(m: Message, state: FSMContext):
         obj.captcha_every = captcha_every  # 0 = выключить капчу
         await s.commit()
     await state.clear()
-    await m.answer(f"{em('check')} Пороги антиспама сохранены!", reply_markup=nav_kb(bot_id))
+    await m.answer(f"{em('check')} Пороги антиспама сохранены!", reply_markup=nav_kb(bot_id, section="antispam"))
 
 
 # ================== рассылка ==================
