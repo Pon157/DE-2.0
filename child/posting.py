@@ -11,7 +11,7 @@ from aiogram.types import (Message, CallbackQuery, InlineKeyboardMarkup,
 from sqlalchemy import select
 from sqlalchemy import update as sa_update
 from db.base import Session
-from db.models import ChildBot, Suggestion, Post, MessageLog
+from db.models import ChildBot, Suggestion, Post, MessageLog, Ticket
 from services import moderation as mod
 from services import antispam
 from child.common import (is_bot_admin, inject_extras, build_keyboards, send_with_keyboards,
@@ -818,13 +818,33 @@ def build_posting_router() -> Router:
         if not cfg.admin_chat_id:
             return
 
-        # Если включена анонимная предложка — сохраняем сообщение и спрашиваем
+        # ФИКС (баг 2а): если у пользователя открыт тикет через кнопку обращения —
+        # его сообщения должны идти как обычные тикет-сообщения, а не как предложка.
+        # Раньше проверки тикета не было: при anon_enabled=True любое сообщение
+        # после нажатия кнопки обращения вызывало вопрос «анонимно/не анонимно».
+        async with Session() as s:
+            open_ticket = await s.scalar(
+                select(Ticket).where(
+                    Ticket.bot_id == bot_db_id,
+                    Ticket.user_id == m.from_user.id,
+                    Ticket.is_open
+                )
+            )
+        has_open_ticket = open_ticket is not None
+
+        # Если у пользователя есть открытый тикет — релеим как обычное тикет-сообщение,
+        # анон-предложка не применяется.
+        if has_open_ticket:
+            async def _process_ticket(msgs: list[Message]):
+                await relay_to_admin_chat(msgs, bot, cfg)
+            await buffer_or_process(m, _process_ticket)
+            return
+
+        # ФИКС (баг 2б): пропускаем анон-блок для самих админов бота.
+        # Раньше проверки не было — владелец/админ получал вопрос анон/не анон.
         anon_enabled = getattr(cfg, "anon_suggestion_enabled", False)
-        if anon_enabled and cfg.accept_suggestions:
-            # ФИКС: buffer_or_process сначала собирает весь альбом, затем
-            # сохраняет полный список в _pending_anon_msgs и задаёт вопрос.
-            # Раньше сохранялся только [m] — альбомы из нескольких фото/видео
-            # терялись, в админ-чат приходило только первое вложение.
+        user_is_admin = await is_bot_admin(bot_db_id, m.from_user.id)
+        if anon_enabled and cfg.accept_suggestions and not user_is_admin:
             async def _ask_anon(msgs: list[Message]):
                 _pending_anon_msgs[m.from_user.id] = (msgs, bot_db_id)
                 ask_text = getattr(cfg, "anon_suggestion_ask_text", None)                     or "Как хотите отправить предложку?"
